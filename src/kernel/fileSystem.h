@@ -7,7 +7,12 @@
 #include "kernel/pthread.h"
 
 #include <cstddef>
+#include <condition_variable>
 #include <filesystem>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 namespace Libs::LibKernel::FileSystem {
 
@@ -41,6 +46,9 @@ struct KernelIovec {
 static_assert(sizeof(KernelIovec) == 16);
 static_assert(offsetof(KernelIovec, iov_len) == 8);
 
+// Per-guest fd table: RFCFDG starts with no inherited fds even with a shared VM. Owns only the
+// table.
+class FileDescriptors;
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();
@@ -53,6 +61,7 @@ struct Lifecycle {
 };
 
 void                  Mount(const std::filesystem::path& folder, const std::string& point);
+bool                  IsTmpfsDescriptor(int descriptor);
 void                  Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);

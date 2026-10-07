@@ -21,12 +21,20 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "loader/elf.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#ifdef DeleteFile
+#undef DeleteFile
+#endif
+#endif
 #include <thread>
 
 namespace Emulator {
@@ -55,6 +63,21 @@ static void PrintSystemInfo() {
 }
 
 static void KytyClose() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr) {
+		void*      trace[20] {};
+		const auto frames = CaptureStackBackTrace(0, 20, trace, nullptr);
+		std::printf("SYSCORE_EMULATOR_ATEXIT_ENTRY thread_id=%lu"
+		            " frame_count=%u guest_code_not_yet_cleared\n",
+		            static_cast<unsigned long>(GetCurrentThreadId()),
+		            static_cast<unsigned>(frames));
+		for (USHORT i = 0; i < frames; ++i) {
+			std::printf("SYSCORE_EMULATOR_ATEXIT_FRAME index=%u address=%p\n",
+			            static_cast<unsigned>(i), trace[i]);
+		}
+		std::fflush(stdout);
+	}
+#endif
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
 	rt->Clear();
@@ -151,8 +174,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::Graphics::Lifecycle>();
 }
 
-static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,
-                    const std::filesystem::path& save_name = {}) {
+static Loader::Program* LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,
+                                const std::filesystem::path& save_name = {}) {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
 	auto* program = rt->LoadProgram(
@@ -166,6 +189,7 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 		rt->SaveProgram(program, Libs::LibKernel::FileSystem::GetRealFilename(
 		                             Common::PathToGenericString(save_name)));
 	}
+	return program;
 }
 
 static void Execute(const std::filesystem::path& game_patch) {

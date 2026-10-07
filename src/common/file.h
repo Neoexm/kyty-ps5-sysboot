@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -69,8 +70,10 @@ public:
 
 	void GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write);
 
-	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr);
-	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr);
+	void Read(void* data, uint32_t size, uint32_t* bytes_read = nullptr,
+	          std::error_code* read_error = nullptr);
+	void Write(const void* data, uint32_t size, uint32_t* bytes_written = nullptr,
+	           std::error_code* write_error = nullptr);
 
 	void Printf(const char* format, ...) KYTY_FORMAT_PRINTF(2, 3);
 

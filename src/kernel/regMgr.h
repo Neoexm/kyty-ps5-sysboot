@@ -1,0 +1,8 @@
+#ifndef EMULATOR_INCLUDE_EMULATOR_KERNEL_REG_MGR_H_
+#define EMULATOR_INCLUDE_EMULATOR_KERNEL_REG_MGR_H_
+
+#include "common/common.h"
+
+#include <functional>
+
+#endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_REG_MGR_H_ */

@@ -21,11 +21,16 @@ std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
 	                   s.module_version_minor, magic_enum::enum_name(s.type));
 }
 
+std::string SymbolDatabase::GetNid(const std::string& name) {
+	return name.substr(0, name.find('['));
+}
+
 void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr) {
 	SymbolRecord r {};
 	r.name  = GenerateName(s);
 	r.vaddr = vaddr;
 	m_map.insert_or_assign(r.name, m_symbols.size());
+	m_nid_map[GetNid(r.name)].push_back(m_symbols.size());
 	m_symbols.push_back(r);
 }
 
@@ -35,6 +40,7 @@ void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr, const std::stri
 	r.vaddr    = vaddr;
 	r.dbg_name = dbg_name;
 	m_map.insert_or_assign(r.name, m_symbols.size());
+	m_nid_map[GetNid(r.name)].push_back(m_symbols.size());
 	m_symbols.push_back(r);
 }
 
@@ -67,6 +73,22 @@ const SymbolRecord* SymbolDatabase::Find(const SymbolResolve& s) const {
 
 const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType type,
                                                 uint64_t vaddr) const {
+	// a query containing '[' can match past the indexed part of the name, so it takes the full scan
+	if (nid.find('[') == std::string::npos) {
+		auto it = m_nid_map.find(nid);
+		if (it == m_nid_map.end()) {
+			return nullptr;
+		}
+		auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
+		for (auto index: it->second) {
+			const auto& symbol = m_symbols[index];
+			if ((vaddr == 0 || symbol.vaddr == vaddr) && symbol.name.ends_with(suffix)) {
+				return &symbol;
+			}
+		}
+		return nullptr;
+	}
+
 	auto prefix = nid + "[";
 	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
 
@@ -81,6 +103,22 @@ const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType
 }
 
 const SymbolRecord* SymbolDatabase::FindByName(const std::string& name, SymbolType type) const {
+	// a query containing '[' can match past the indexed part of the name, so it takes the full scan
+	if (name.find('[') == std::string::npos) {
+		auto it = m_nid_map.find(name);
+		if (it == m_nid_map.end()) {
+			return nullptr;
+		}
+		auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
+		for (auto index: it->second) {
+			const auto& symbol = m_symbols[index];
+			if (symbol.name.ends_with(suffix)) {
+				return &symbol;
+			}
+		}
+		return nullptr;
+	}
+
 	auto prefix = name + "[";
 	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
 

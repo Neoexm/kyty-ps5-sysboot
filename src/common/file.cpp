@@ -248,30 +248,44 @@ uint64_t File::Tell() const {
 	return SysFileTell(*m_p->f);
 }
 
-void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
+void File::Read(void* data, uint32_t size, uint32_t* bytes_read, std::error_code* read_error) {
 	EXIT_IF(IsInvalid());
+	if (read_error != nullptr) read_error->clear();
 
 	if (m_p->archive != nullptr) {
-		m_p->archive->Read(data, size, bytes_read);
+		const auto position = m_p->archive->Tell();
+		const auto length   = m_p->archive->Size();
+		const auto expected = std::min<uint64_t>(size, position < length ? length - position : 0);
+		uint32_t   actual   = 0;
+		m_p->archive->Read(data, size, &actual);
+		if (bytes_read != nullptr) *bytes_read = actual;
+		if (read_error != nullptr && actual < expected) {
+			*read_error = std::make_error_code(data == nullptr ? std::errc::bad_address
+			                                                   : std::errc::io_error);
+		}
 		return;
 	}
 
 	if (m_p->f != nullptr) {
-		SysFileRead(data, size, *m_p->f, bytes_read);
+		SysFileRead(data, size, *m_p->f, bytes_read, read_error);
 	}
 }
 
-void File::Write(const void* data, uint32_t size, uint32_t* bytes_written) {
+void File::Write(const void* data, uint32_t size, uint32_t* bytes_written,
+                 std::error_code* write_error) {
 	EXIT_IF(IsInvalid());
+	if (write_error != nullptr) write_error->clear();
 
 	if (m_p->archive != nullptr) {
 		if (bytes_written != nullptr) {
 			*bytes_written = 0;
 		}
+		if (write_error != nullptr)
+			*write_error = std::make_error_code(std::errc::read_only_file_system);
 		return;
 	}
 
-	SysFileWrite(data, size, *m_p->f, bytes_written);
+	SysFileWrite(data, size, *m_p->f, bytes_written, write_error);
 }
 
 static std::string FileVformat(const char* format, va_list args) {

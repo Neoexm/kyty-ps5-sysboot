@@ -16,6 +16,9 @@
 #include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
 
 using namespace Common;
 using namespace Emulator;
@@ -45,6 +48,8 @@ static void PrintUsage() {
 	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
+	::printf(
+	    "  --sysroot <dir>                      Mount a directory as the guest filesystem root.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
@@ -289,6 +294,23 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--exec-child") {
+			if (!options.exec_endpoint.empty() || value.empty()) {
+				::printf("invalid exec child endpoint\n");
+				return false;
+			}
+			options.exec_endpoint = value;
+		} else if (arg == "--sysroot") {
+			if (!options.sysroot_dir.empty()) {
+				::printf("--sysroot can only be specified once\n");
+				return false;
+			}
+			value               = Common::FixFilenameSlash(value);
+			options.sysroot_dir = Common::PathFromUtf8(value);
+			if (!Common::File::IsDirectoryExisting(options.sysroot_dir)) {
+				::printf("--sysroot must point to an existing directory: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");
@@ -478,7 +500,17 @@ static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 int wmain(int argc, wchar_t* argv[]) {
-    std::vector<std::string> utf8_args;
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_LOAD_ONLY") != nullptr) {
+		MEMORY_BASIC_INFORMATION info {};
+		VirtualQuery(reinterpret_cast<void*>(0x400000), &info, sizeof(info));
+		std::fprintf(stderr,
+		             "FIRST_FRAME_AUDIT EARLY_MAIN_REGION addr=0x400000"
+		             " base=%p alloc=%p size=0x%zx state=0x%x type=0x%x protect=0x%x\n",
+		             info.BaseAddress, info.AllocationBase, info.RegionSize,
+		             static_cast<unsigned>(info.State), static_cast<unsigned>(info.Type),
+		             static_cast<unsigned>(info.Protect));
+	}
+	std::vector<std::string> utf8_args;
     utf8_args.reserve(static_cast<size_t>(argc));
 
     for (int index = 0; index < argc; index++) {

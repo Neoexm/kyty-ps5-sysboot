@@ -3,14 +3,18 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/timer.h"
 
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <mutex>
 #include <spdlog/formatter.h>
 #include <spdlog/logger.h>
+#include <spdlog/details/periodic_worker.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/null_sink.h>
 #include <spdlog/sinks/stdout_sinks.h>
@@ -72,6 +76,10 @@ static Direction                       g_direction   = Direction::Console;
 static std::filesystem::path           g_output_file;
 static std::mutex                      g_logger_mutex;
 static std::shared_ptr<spdlog::logger> g_logger;
+static std::unique_ptr<spdlog::details::periodic_worker> g_flusher;
+static bool                                              g_time_marks = false;
+static Common::Timer                                     g_time_marks_timer;
+static std::atomic<uint64_t>                             g_time_marks_next = 0;
 
 void Flush() {
 	if (g_logger != nullptr) {
@@ -104,6 +112,19 @@ static std::shared_ptr<spdlog::logger> GetLogger() {
 	return g_logger;
 }
 
+static void StartFlusher() {
+	// exec children die with their job, so a fully buffered sink loses the tail
+	if (g_direction == Direction::File && g_flusher == nullptr) {
+		g_flusher = std::make_unique<spdlog::details::periodic_worker>(
+		    [] {
+			    if (auto logger = GetLogger()) {
+				    logger->flush();
+			    }
+		    },
+		    std::chrono::milliseconds(500));
+	}
+}
+
 static void WriteImpl(std::string_view text, fmt::text_style style = {}) {
 	if (text.empty()) {
 		return;
@@ -116,6 +137,18 @@ static void WriteImpl(std::string_view text, fmt::text_style style = {}) {
 
 	if (g_direction == Direction::Silent) {
 		return;
+	}
+
+	std::string marked;
+	if (g_time_marks && text.back() == '\n') {
+		const auto now  = static_cast<uint64_t>(g_time_marks_timer.GetTimeMs());
+		auto       next = g_time_marks_next.load();
+		if (now >= next && g_time_marks_next.compare_exchange_strong(next, now + 10)) {
+			// same write as the line it follows, so no other thread can split them
+			marked = fmt::format("{}FIRST_FRAME_AUDIT TIME_MARK t={}.{:03}\n", text, now / 1000,
+			                     now % 1000);
+			text   = marked;
+		}
 	}
 
 	if (auto logger = GetLogger()) {
@@ -166,9 +199,13 @@ void Initialize() {
 	g_output_file =
 	    (g_direction == Direction::File ? Config::GetPrintfOutputFile() : std::filesystem::path {});
 	SetupLogger();
+	StartFlusher();
+	g_time_marks = std::getenv("KYTY_DIAGNOSTIC_LOG_TIME_MARKS") != nullptr;
+	g_time_marks_timer.Start();
 }
 
 void Shutdown() {
+	g_flusher.reset();
 	Flush();
 	std::lock_guard lock(g_logger_mutex);
 	g_logger.reset();
@@ -182,6 +219,23 @@ Direction GetDirection() {
 bool IsSilent() {
 	// Before init LOGF must keep writing to stdout, so report non-silent.
 	return g_initialized && g_direction == Direction::Silent;
+}
+
+std::string EscapeField(std::string_view text) {
+	static constexpr char hex[] = "0123456789abcdef";
+	std::string           escaped;
+	escaped.reserve(text.size());
+	for (const unsigned char value: text) {
+		if (value >= 0x20 && value <= 0x7e && value != '\\') {
+			escaped.push_back(static_cast<char>(value));
+		} else {
+			escaped.push_back('\\');
+			escaped.push_back('x');
+			escaped.push_back(hex[value >> 4]);
+			escaped.push_back(hex[value & 0x0f]);
+		}
+	}
+	return escaped;
 }
 
 void Write(std::string_view text) {

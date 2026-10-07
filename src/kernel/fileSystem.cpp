@@ -11,20 +11,57 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/memory.h"
+#include "kernel/authInfo.h"
+#include "kernel/envelopeSecureProcessor.h"
+#include "kernel/eventQueue.h"
+#include "kernel/execProcess.h"
+#include "kernel/process.h"
+#include "kernel/pthread.h"
+#include "kernel/sectorBacking.h"
+#include "kernel/tmpfs.h"
+#include "kernel/nullfsMount.h"
+#include "kernel/directoryPassthrough.h"
+#include "kernel/exfatMount.h"
+#include "kernel/bfsMount.h"
+#include "kernel/bfsVolume.h"
+#include "kernel/capturedRootMetadata.h"
+#include "kernel/capturedDirectory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "graphics/presentation/videoOut.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <climits>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
+#include <deque>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <random>
+#include <sstream>
 #include <system_error>
+#include <unordered_map>
 #include <vector>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#include <bcrypt.h>
+#undef DeleteFile
+#undef CreateDirectory
+#else
+#include <sys/stat.h>
+#endif
 namespace Libs::LibKernel::FileSystem {
 
 LIB_NAME("libkernel", "libkernel");
@@ -74,6 +111,7 @@ struct File {
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
+	std::shared_ptr<Tmpfs::Handle>                 tmpfs;
 };
 
 class FileDescriptors {
@@ -95,7 +133,21 @@ private:
 };
 
 static MountPoints*     g_mount_points = nullptr;
-static FileDescriptors* g_files        = nullptr;
+static FileDescriptors*              g_primary_files        = nullptr;
+static thread_local FileDescriptors* g_guest_files_override = nullptr;
+struct ActiveDescriptorDispatch {
+	FileDescriptors* operator->() const {
+		return g_guest_files_override ? g_guest_files_override : g_primary_files;
+	}
+	operator FileDescriptors*() const {
+		return g_guest_files_override ? g_guest_files_override : g_primary_files;
+	}
+	ActiveDescriptorDispatch& operator=(FileDescriptors* table) {
+		g_primary_files = table;
+		return *this;
+	}
+};
+static ActiveDescriptorDispatch g_files {};
 
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
@@ -196,6 +248,11 @@ int FileDescriptors::CreateDescriptor() {
 	return static_cast<int>(m_files.size()) + DESCRIPTOR_MIN - 1;
 }
 
+bool IsTmpfsDescriptor(int descriptor) {
+	if (descriptor < DESCRIPTOR_MIN || g_files == nullptr) return false;
+	const auto* file = g_files->GetFile(descriptor);
+	return file != nullptr && file->opened && file->tmpfs != nullptr;
+}
 void FileDescriptors::DeleteDescriptor(int d) {
 	Common::LockGuard lock(m_mutex);
 

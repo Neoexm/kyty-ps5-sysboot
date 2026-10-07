@@ -5,6 +5,7 @@
 
 #include <fmt/color.h>
 #include <fmt/printf.h>
+#include <string>
 #include <string_view>
 
 namespace Log {
@@ -23,6 +24,7 @@ enum class Direction { Silent, Console, File };
 
 Direction GetDirection();
 bool      IsSilent();
+std::string EscapeField(std::string_view text);
 void      Write(std::string_view text);
 void      Write(fmt::text_style style, std::string_view text);
 void      WriteToConsoleAndLog(std::string_view text);

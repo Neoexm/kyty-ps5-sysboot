@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 // The native file representation is private to the platform implementation.
@@ -24,10 +25,10 @@ struct sys_dir_entry_t {
 	bool        is_file;
 };
 
-void        SysFileRead(void* data, uint32_t size, sys_file_t& f,
-                        uint32_t* bytes_read = nullptr); // NOLINT(google-runtime-references)
-void        SysFileWrite(const void* data, uint32_t size, sys_file_t& f,
-                         uint32_t* bytes_written = nullptr); // NOLINT(google-runtime-references)
+void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read = nullptr,
+                 std::error_code* read_error = nullptr); // NOLINT(google-runtime-references)
+void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written = nullptr,
+                  std::error_code* write_error = nullptr); // NOLINT(google-runtime-references)
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name);
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name,
                          sys_file_cache_type_t        cache_type = SYS_FILE_CACHE_AUTO);

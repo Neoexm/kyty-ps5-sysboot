@@ -169,6 +169,7 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 	add_int_param("userDefinedParam2", "USER_DEFINED_PARAM_2");
 	add_int_param("userDefinedParam3", "USER_DEFINED_PARAM_3");
 	add_int_param("userDefinedParam4", "USER_DEFINED_PARAM_4");
+	add_int_param("applicationCategoryType", "APPLICATION_CATEGORY_TYPE");
 
 	if (auto kernel = param_json.find("kernel");
 	    kernel != param_json.end() && kernel->is_object()) {

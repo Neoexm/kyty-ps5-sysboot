@@ -143,6 +143,7 @@ public:
 	void DbgDump(const std::string& folder);
 
 	Program* LoadProgram(const std::filesystem::path& elf_name);
+	void     LoadNeededModules(Program* program);
 	void     SaveMainProgram(const std::filesystem::path& elf_name);
 	void     SaveProgram(Program* program, const std::filesystem::path& elf_name);
 	void     UnloadProgram(Program* program);
@@ -151,6 +152,7 @@ public:
 	[[nodiscard]] uint64_t GetProcParam();
 
 	void RelocateAll();
+	void LogExecLoadPhases(const char* point);
 	void RelocateProgram(Program* program);
 
 	void  Execute(const std::filesystem::path& game_patch = {});

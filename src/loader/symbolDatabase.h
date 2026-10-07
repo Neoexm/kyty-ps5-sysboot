@@ -52,10 +52,13 @@ public:
 	KYTY_CLASS_NO_COPY(SymbolDatabase);
 
 	static std::string GenerateName(const SymbolResolve& s);
+	static std::string GetNid(const std::string& name);
 
 private:
 	std::vector<SymbolRecord>               m_symbols;
 	std::unordered_map<std::string, size_t> m_map;
+	// indices into m_symbols in insertion order, keyed by the record name up to its first '['
+	std::unordered_map<std::string, std::vector<size_t>> m_nid_map;
 };
 
 } // namespace Loader

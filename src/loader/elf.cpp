@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <memory>
+#include <utility>
 
 namespace Loader {
 
@@ -306,8 +307,25 @@ bool Elf64::IsShared() const {
 	return (m_ehdr->e_type == ET_DYNAMIC);
 }
 
+bool Elf64::IsStaticExec() const {
+	return m_ehdr != nullptr && m_ehdr->e_type == ET_EXEC && m_dynamic == nullptr;
+}
+
+uint64_t Elf64::GetStaticImageBase() const {
+	if (!IsStaticExec() || m_phdr == nullptr) {
+		return 0;
+	}
+	uint64_t base = UINT64_MAX;
+	for (uint16_t i = 0; i < m_ehdr->e_phnum; ++i) {
+		if (m_phdr[i].p_type == PT_LOAD && m_phdr[i].p_memsz != 0) {
+			base = std::min(base, m_phdr[i].p_vaddr);
+		}
+	}
+	return base == UINT64_MAX ? 0 : base;
+}
+
 bool Elf64::IsNextGen() const {
-	return (m_ehdr->e_ident[EI_ABIVERSION] == 2);
+	return (m_ehdr->e_ident[EI_ABIVERSION] >= 2);
 }
 
 const char* Elf64::GetSectionName(int index) const {
@@ -335,6 +353,7 @@ void Elf64::Clear() {
 	}
 
 	m_f.reset();
+	m_memory.clear();
 	m_self.reset();
 	m_ehdr.reset();
 	m_self_segments.reset();
@@ -496,13 +515,17 @@ bool Elf64::IsValid() const {
 		return false;
 	}
 
-	if (m_ehdr->e_ident[EI_ABIVERSION] != 0 && m_ehdr->e_ident[EI_ABIVERSION] != 2) {
-		LOGF("ehdr->e_ident[EI_ABIVERSION] (0x%x) != (0 or 2)\n", m_ehdr->e_ident[EI_ABIVERSION]);
+	// Firmware 13.60 has ABI-v1 shared modules (e.g. libSceMove). IsNewGeneration() keeps ABI
+	// versions below 2 on the legacy ELF path.
+	if (m_ehdr->e_ident[EI_ABIVERSION] != 0 && m_ehdr->e_ident[EI_ABIVERSION] != 1 &&
+	    m_ehdr->e_ident[EI_ABIVERSION] != 2 && m_ehdr->e_ident[EI_ABIVERSION] != 3) {
+		LOGF("ehdr->e_ident[EI_ABIVERSION] (0x%x) != (0, 1, 2, or 3)\n",
+		     m_ehdr->e_ident[EI_ABIVERSION]);
 		return false;
 	}
 
-	if (m_ehdr->e_type != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC) {
-		LOGF("ehdr->e_type (%04x) != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC\n", m_ehdr->e_type);
+	if (m_ehdr->e_type != ET_DYNEXEC && m_ehdr->e_type != ET_DYNAMIC && m_ehdr->e_type != ET_EXEC) {
+		LOGF("Unsupported ELF e_type (%04x)\n", m_ehdr->e_type);
 		return false;
 	}
 
@@ -538,6 +561,28 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 	if (m_f->IsInvalid()) {
 		EXIT("Can't open %s\n", Common::PathToString(file_name).c_str());
 	}
+
+	Load();
+}
+
+void Elf64::Open(const std::filesystem::path& file_name, std::vector<uint8_t> image) {
+	Clear();
+
+	if (image.empty() || image.size() > UINT32_MAX) {
+		EXIT("Can't open %s from memory\n", Common::PathToString(file_name).c_str());
+	}
+	m_memory = std::move(image);
+	m_f      = std::make_unique<Common::File>();
+	m_f->OpenInMem(m_memory.data(), static_cast<uint32_t>(m_memory.size()));
+
+	if (m_f->IsInvalid()) {
+		EXIT("Can't open %s from memory\n", Common::PathToString(file_name).c_str());
+	}
+
+	Load();
+}
+
+void Elf64::Load() {
 
 	m_self = LoadSelf(*m_f);
 

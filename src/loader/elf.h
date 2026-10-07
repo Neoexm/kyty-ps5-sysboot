@@ -47,6 +47,7 @@ constexpr char ELFOSABI_FREEBSD = 9; // FreeBSD operating system
 
 constexpr Elf64_Half ET_DYNEXEC = 0xfe10; // Executable file
 constexpr Elf64_Half ET_DYNAMIC = 0xfe18; // Shared
+constexpr Elf64_Half ET_EXEC    = 2;
 
 // #define SHT_PROGBITS 1
 
@@ -253,6 +254,7 @@ public:
 	virtual ~Elf64();
 
 	void Open(const std::filesystem::path& file_name);
+	void Open(const std::filesystem::path& file_name, std::vector<uint8_t> image);
 	void Save(const std::filesystem::path& file_name);
 
 	void DbgDump(const std::string& folder);
@@ -263,6 +265,8 @@ public:
 	[[nodiscard]] bool IsValid() const;
 	[[nodiscard]] bool IsShared() const;
 	[[nodiscard]] bool IsNextGen() const;
+	[[nodiscard]] bool     IsStaticExec() const;
+	[[nodiscard]] uint64_t GetStaticImageBase() const;
 
 	void LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size);
 
@@ -290,7 +294,9 @@ public:
 
 private:
 	void Clear();
+	void Load();
 
+	std::vector<uint8_t>           m_memory;
 	std::unique_ptr<Common::File>  m_f;
 	std::unique_ptr<SelfHeader>    m_self;
 	std::unique_ptr<SelfSegment[]> m_self_segments;

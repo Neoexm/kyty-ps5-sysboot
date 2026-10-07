@@ -13,6 +13,7 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -28,7 +29,7 @@ enum sys_file_type_t {
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_file_mem_buf_t {
 	uint8_t* base;
-	uint8_t* ptr;
+	uint64_t position;
 	uint32_t size;
 };
 
@@ -63,76 +64,81 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	return FILE_ATTRIBUTE_NORMAL;
 }
 
-void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
+void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read,
+                 std::error_code* read_error) {
+	if (bytes_read != nullptr) *bytes_read = 0;
+	if (read_error != nullptr) read_error->clear();
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		const BOOL  success = ReadFile(f.handle, data, size, &w, nullptr);
+		const DWORD error   = success ? ERROR_SUCCESS : GetLastError();
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}
-	} else if (f.type == SYS_FILE_MEMORY_STAT) {
-		uint32_t s = size;
-		if (f.buf->size != 0u) {
-			uint32_t l = f.buf->size - (f.buf->ptr - f.buf->base);
-			if (s > l) {
-				s = l;
-			}
+		if (read_error != nullptr && !success && error != ERROR_HANDLE_EOF) {
+			*read_error = std::error_code(static_cast<int>(error), std::system_category());
 		}
-		std::memcpy(data, f.buf->ptr, s);
-		f.buf->ptr += s;
-		if (bytes_read != nullptr) {
-			*bytes_read = s;
-		}
-	} else if (f.type == SYS_FILE_MEMORY_DYN) {
-		uint32_t s = size;
-		if (f.buf->size != 0u) {
-			uint32_t l = f.buf->size - (f.buf->ptr - f.buf->base);
-			if (s > l) {
-				s = l;
-			}
-		} else {
-			s = 0;
-		}
-		std::memcpy(data, f.buf->ptr, s);
-		f.buf->ptr += s;
-		if (bytes_read != nullptr) {
-			*bytes_read = s;
-		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		const uint64_t remaining =
+		    f.buf->position < f.buf->size ? f.buf->size - f.buf->position : 0;
+		const auto count = static_cast<uint32_t>(std::min<uint64_t>(size, remaining));
+		if (count != 0) std::memcpy(data, f.buf->base + f.buf->position, count);
+		f.buf->position += count;
+		if (bytes_read != nullptr) *bytes_read = count;
+	} else if (read_error != nullptr) {
+		*read_error = std::make_error_code(std::errc::bad_file_descriptor);
 	}
 }
 
-void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
+void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written,
+                  std::error_code* write_error) {
+	if (bytes_written != nullptr) *bytes_written = 0;
+	if (write_error != nullptr) write_error->clear();
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		WriteFile(f.handle, data, size, &w, nullptr);
+		const BOOL  success = WriteFile(f.handle, data, size, &w, nullptr);
+		const DWORD error   = success ? ERROR_SUCCESS : GetLastError();
 		if (bytes_written != nullptr) {
 			*bytes_written = w;
 		}
-	} else if (f.type == SYS_FILE_MEMORY_STAT) {
-		uint32_t s = size;
-		if (f.buf->size != 0u) {
-			uint32_t l = f.buf->size - (f.buf->ptr - f.buf->base);
-			if (s > l) {
-				s = l;
-			}
+		if (write_error != nullptr && !success) {
+			*write_error = std::error_code(static_cast<int>(error), std::system_category());
 		}
-		std::memcpy(f.buf->ptr, data, s);
-		f.buf->ptr += s;
-		if (bytes_written != nullptr) {
-			*bytes_written = s;
+	} else if (f.type == SYS_FILE_MEMORY_STAT) {
+		const uint64_t remaining =
+		    f.buf->position < f.buf->size ? f.buf->size - f.buf->position : 0;
+		const auto count = static_cast<uint32_t>(std::min<uint64_t>(size, remaining));
+		if (count != 0) std::memcpy(f.buf->base + f.buf->position, data, count);
+		f.buf->position += count;
+		if (bytes_written != nullptr) *bytes_written = count;
+		if (write_error != nullptr && count != size) {
+			*write_error = std::make_error_code(std::errc::no_space_on_device);
 		}
 	} else if (f.type == SYS_FILE_MEMORY_DYN) {
-		uint32_t pos = f.buf->ptr - f.buf->base;
-		if (f.buf->size < pos + size) {
-			f.buf->base = static_cast<uint8_t*>(std::realloc(f.buf->base, pos + size));
-			f.buf->ptr  = f.buf->base + pos;
-			f.buf->size = pos + size;
+		if (size == 0) return;
+		const auto position = f.buf->position;
+		if (position > UINT32_MAX || size > UINT32_MAX - position) {
+			if (write_error != nullptr)
+				*write_error = std::make_error_code(std::errc::file_too_large);
+			return;
 		}
-		std::memcpy(f.buf->ptr, data, size);
-		f.buf->ptr += size;
-		if (bytes_written != nullptr) {
-			*bytes_written = size;
+		const auto end = static_cast<uint32_t>(position + size);
+		if (f.buf->size < end) {
+			auto* allocation = static_cast<uint8_t*>(std::realloc(f.buf->base, end));
+			if (allocation == nullptr) {
+				if (write_error != nullptr)
+					*write_error = std::make_error_code(std::errc::not_enough_memory);
+				return;
+			}
+			std::memset(allocation + f.buf->size, 0, end - f.buf->size);
+			f.buf->base = allocation;
+			f.buf->size = end;
 		}
+		std::memcpy(f.buf->base + position, data, size);
+		f.buf->position = end;
+		if (bytes_written != nullptr) *bytes_written = size;
+	} else if (write_error != nullptr) {
+		*write_error = std::make_error_code(std::errc::bad_file_descriptor);
 	}
 }
 
@@ -177,7 +183,7 @@ sys_file_t* SysFileOpen(uint8_t* buf, uint32_t buf_size) {
 	ret->type      = SYS_FILE_MEMORY_STAT;
 	ret->buf       = new sys_file_mem_buf_t;
 	ret->buf->base = buf;
-	ret->buf->ptr  = buf;
+	ret->buf->position = 0;
 	ret->buf->size = buf_size;
 
 	return ret;
@@ -189,7 +195,7 @@ sys_file_t* SysFileCreate() {
 	ret->type      = SYS_FILE_MEMORY_DYN;
 	ret->buf       = new sys_file_mem_buf_t;
 	ret->buf->base = nullptr;
-	ret->buf->ptr  = nullptr;
+	ret->buf->position = 0;
 	ret->buf->size = 0;
 
 	return ret;
@@ -306,6 +312,12 @@ bool SysFileTruncate(sys_file_t& f, uint64_t size) {
 }
 
 bool SysFileUnlink(sys_file_t& f, const std::filesystem::path& name) {
+	// By name first: since 1809, DeleteFileW on NTFS frees the name at once. A disposition on f
+	// leaves it delete-pending until f closes.
+	if (SysFileDeleteFile(name)) {
+		return true;
+	}
+
 	if (f.type == SYS_FILE_FILE) {
 		FILE_DISPOSITION_INFO info {};
 		info.DeleteFile = TRUE;
@@ -314,7 +326,7 @@ bool SysFileUnlink(sys_file_t& f, const std::filesystem::path& name) {
 		}
 	}
 
-	return SysFileDeleteFile(name);
+	return false;
 }
 
 bool SysFileSeek(sys_file_t& f, uint64_t offset) {
@@ -325,7 +337,7 @@ bool SysFileSeek(sys_file_t& f, uint64_t offset) {
 		ok         = (SetFilePointerEx(f.handle, s, nullptr, FILE_BEGIN) != 0);
 		// printf("seek: %u\n", offset);
 	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
-		f.buf->ptr = f.buf->base + offset;
+		f.buf->position = offset;
 	}
 
 	return ok;
@@ -342,7 +354,7 @@ uint64_t SysFileTell(sys_file_t& f) {
 	}
 
 	if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
-		return f.buf->ptr - f.buf->base;
+		return f.buf->position;
 	}
 
 	return 0;

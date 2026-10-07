@@ -14,8 +14,14 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
+#include "kernel/eventQueue.h"
+#include "kernel/execProcess.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/errno.h"
+#include "libs/libMbus.h"
+#include "libs/nativeKernelBridge.h"
+#include "loader/decryptedModuleOverlay.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -24,13 +30,20 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -51,6 +64,8 @@
 namespace Libs::LibKernel {
 void SetProgName(const std::string& name);
 } // namespace Libs::LibKernel
+
+
 
 namespace Loader {
 
@@ -554,6 +569,39 @@ struct GuestStackFrame {
 };
 
 static bool IsReadableRange(uint64_t addr, uint64_t size);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct NativeLibkernelTrap {
+	Program* owner;
+	uint64_t site;
+	uint32_t number;
+};
+static std::mutex                       g_native_libkernel_trap_mutex;
+static std::vector<NativeLibkernelTrap> g_native_libkernel_traps;
+#endif
+static constexpr std::array<uint32_t, 116> g_mini_native_syscall_offsets {{
+    0x689EA, 0x68A33, 0x68A54, 0x68A7A, 0x68A9A, 0x68ABA, 0x68ADA, 0x68AFA, 0x68B1A, 0x68B3A,
+    0x68B5A, 0x68B7A, 0x68B9A, 0x68BBA, 0x68BDA, 0x68BFA, 0x68C1A, 0x68C3A, 0x68C5A, 0x68C7A,
+    0x68C9A, 0x68CBA, 0x68CDA, 0x68CFA, 0x68D1A, 0x68D3A, 0x68D5A, 0x68D7A, 0x68D9A, 0x68DBA,
+    0x68DDA, 0x68DFA, 0x68E1A, 0x68E3A, 0x68E5A, 0x68E7A, 0x68E9A, 0x68EBA, 0x68EDA, 0x68EFA,
+    0x68F1A, 0x68F3A, 0x68F5A, 0x68F7A, 0x68F9A, 0x68FBA, 0x68FDA, 0x68FFA, 0x6901A, 0x6903A,
+    0x6905A, 0x6907A, 0x6A0DA, 0x6A0EA, 0x6A10A, 0x6A12A, 0x6A72A, 0x6A74A, 0x6A8EA, 0x6AA4A,
+    0x6B35A, 0x6B37A, 0x6B74A, 0x6BB5A, 0x6C68A, 0x6C6AE, 0x6C6DA, 0x6C6FA, 0x6D29A, 0x6D2BA,
+    0x6D2DA, 0x6D2FA, 0x6D39A, 0x6D3FA, 0x6DD8A, 0x6DDBA, 0x6DDEA, 0x6DE1A, 0x6E11A, 0x6E13A,
+    0x6FE0A, 0x6FF8A, 0x700BA, 0x7066A, 0x7068A, 0x706AA, 0x7172A, 0x7192A, 0x7194A, 0x71CAA,
+    0x71E8A, 0x71EAA, 0x71ECA, 0x71EEA, 0x71F0A, 0x71F2A, 0x71F4A, 0x720BA, 0x720DA, 0x720FA,
+    0x7211A, 0x7213A, 0x7233A, 0x7235A, 0x7237A, 0x723BA, 0x7242A, 0x726FA, 0x7271A, 0x7273A,
+    0x7275A, 0x7277A, 0x72C8A, 0x72CAA, 0x74D2A, 0x8B2FA,
+}};
+static std::atomic<bool>                   g_mini_native_syscall_traps_installed {false};
+static std::atomic<uint64_t>               g_mini_updatemode_return_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_r14d_jle_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_mount_result_jz_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_global_flag_jz_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_local_var_jz_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_dword_4d7520_addr {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_ssd0_open_jnz_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_sub402340_ssd0_user_jnz_site {0};
+static std::atomic<uint64_t>               g_mini_cold_boot_progress_site {0};
 
 static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity) {
 	constexpr uintptr_t STACK_SIZE = 1024u * 1024u;
@@ -658,6 +706,150 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    info->native_context != nullptr) {
+		bool registered = false;
+		{
+			std::lock_guard lock(g_native_libkernel_trap_mutex);
+			registered = std::any_of(
+			    g_native_libkernel_traps.begin(), g_native_libkernel_traps.end(),
+			    [&](const NativeLibkernelTrap& trap) {
+				    return trap.site == info->exception_address && trap.number == info->rax;
+			    });
+		}
+		if (registered && IsReadableRange(info->exception_address, 2)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			if (code[0] == 0x0f && code[1] == 0x0b) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				int posix_errno = reply.posix_errno;
+				if (posix_errno == 0 && reply.value > Libs::LibKernel::KERNEL_ERROR_UNKNOWN &&
+				    reply.value <= Libs::LibKernel::KERNEL_ERROR_UNKNOWN + 101) {
+					posix_errno = Libs::LibKernel::KernelToPosix(static_cast<int>(reply.value));
+				}
+				auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+				if (posix_errno != 0) {
+					*Libs::Posix::GetErrorAddr() = posix_errno;
+					context->Rax                 = static_cast<uint64_t>(posix_errno);
+					context->EFlags |= uint32_t {1};
+				} else {
+					context->Rax = static_cast<uint64_t>(reply.value);
+					context->EFlags &= ~uint32_t {1};
+				}
+				context->Rip += 2;
+				LOGF("NATIVE_LIBKERNEL_SYSCALL pc=0x%016" PRIx64 " number=0x%" PRIx64
+				     " arg0=0x%" PRIx64 " value=%" PRId64 " errno=%d\n",
+				     info->exception_address, info->rax, info->rdi, reply.value, posix_errno);
+				return true;
+			}
+		}
+	}
+	const uint64_t r14d_jle = g_mini_safe_mode_r14d_jle_site.load(std::memory_order_acquire);
+	const uint64_t mount_result_jz =
+	    g_mini_safe_mode_mount_result_jz_site.load(std::memory_order_acquire);
+	const uint64_t global_flag_jz =
+	    g_mini_safe_mode_global_flag_jz_site.load(std::memory_order_acquire);
+	const uint64_t local_var_jz =
+	    g_mini_safe_mode_local_var_jz_site.load(std::memory_order_acquire);
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    info->exception_address != 0 &&
+	    (info->exception_address == r14d_jle || info->exception_address == mount_result_jz ||
+	     info->exception_address == global_flag_jz || info->exception_address == local_var_jz)) {
+		auto* ctx = reinterpret_cast<CONTEXT*>(info->native_context);
+		if (info->exception_address == r14d_jle && IsReadableRange(info->exception_address, 2)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			if (code[0] == 0x0f && code[1] == 0x0b) {
+				const int32_t  r14d       = static_cast<int32_t>(ctx->R14 & 0xFFFFFFFFULL);
+				const uint64_t taken      = info->exception_address + (0x4664 - 0x4636);
+				const uint64_t fall       = info->exception_address + 2;
+				const uint64_t resume_rip = (r14d <= 0) ? taken : fall;
+				const char*    label =
+				    (r14d <= 0) ? "jle_taken_mount_skipped" : "jle_not_taken_mount_attempted";
+				ctx->Rip = resume_rip;
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_R14D_PROBE"
+				     " site=0x%016" PRIx64 " r14d=%d resume_rip=0x%016" PRIx64
+				     " %s NON_AUTHENTIC\n",
+				     info->exception_address, r14d, resume_rip, label);
+				Log::Flush();
+				return true;
+			}
+		}
+		if (info->exception_address == mount_result_jz &&
+		    IsReadableRange(info->exception_address, 6)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			if (code[0] == 0x0f && code[1] == 0x0b && code[2] == 0x00 && code[3] == 0x00 &&
+			    code[4] == 0x00 && code[5] == 0x00) {
+				const int32_t  eax        = static_cast<int32_t>(ctx->Rax & 0xFFFFFFFFULL);
+				const uint64_t taken      = info->exception_address + (0x4EFC - 0x465E);
+				const uint64_t fall       = info->exception_address + 6;
+				const uint64_t resume_rip = (eax == 0) ? taken : fall;
+				const char*    label =
+				    (eax == 0) ? "jz_taken_mount_SUCCESS_normal_boot" : "jz_not_taken_mount_FAILED";
+				ctx->Rip = resume_rip;
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_MOUNT_RESULT_PROBE"
+				     " site=0x%016" PRIx64 " nmount_eax=0x%x nmount_eax_signed=%d"
+				     " dev=/dev/ssd0.update target=/update fstype=exfatfs"
+				     " resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
+				     info->exception_address, static_cast<unsigned>(eax), eax, resume_rip, label);
+				Log::Flush();
+				return true;
+			}
+		}
+		if (info->exception_address == global_flag_jz &&
+		    IsReadableRange(info->exception_address, 2)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			if (code[0] == 0x0f && code[1] == 0x0b) {
+				const uint64_t global_addr =
+				    g_mini_safe_mode_dword_4d7520_addr.load(std::memory_order_acquire);
+				uint32_t global_val = 0xDEADBEEF;
+				if (global_addr != 0 && IsReadableRange(global_addr, 4)) {
+					std::memcpy(&global_val, reinterpret_cast<const void*>(global_addr),
+					            sizeof(global_val));
+				}
+				const uint64_t taken      = info->exception_address + (0x46BE - 0x4680);
+				const uint64_t fall       = info->exception_address + 2;
+				const uint64_t resume_rip = (global_val == 0) ? taken : fall;
+				const char*    label =
+				    (global_val == 0) ? "jz_taken_rescue_decision" : "jz_not_taken_fsck_path";
+				ctx->Rip = resume_rip;
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_GLOBAL_FLAG_PROBE"
+				     " site=0x%016" PRIx64 " dword_4D7520_host=0x%016" PRIx64
+				     " dword_4D7520_val=0x%x fsck_mode_flag_meaning=%s"
+				     " resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
+				     info->exception_address, global_addr, global_val,
+				     (global_val == 0) ? "rescue" : "fsck_salvage", resume_rip, label);
+				Log::Flush();
+				return true;
+			}
+		}
+		if (info->exception_address == local_var_jz &&
+		    IsReadableRange(info->exception_address, 6)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			if (code[0] == 0x0f && code[1] == 0x0b && code[2] == 0x00 && code[3] == 0x00 &&
+			    code[4] == 0x00 && code[5] == 0x00) {
+				const uint64_t var_addr = ctx->Rbp - 0x30;
+				uint32_t       var_val  = 0xDEADBEEF;
+				if (IsReadableRange(var_addr, 4)) {
+					std::memcpy(&var_val, reinterpret_cast<const void*>(var_addr), sizeof(var_val));
+				}
+				const uint64_t taken      = info->exception_address + (0x4755 - 0x46C2);
+				const uint64_t fall       = info->exception_address + 6;
+				const uint64_t resume_rip = (var_val == 0) ? taken : fall;
+				const char*    label      = (var_val == 0) ? "jz_taken_RESCUE_entered"
+				                                           : "jz_not_taken_standby_shutdown_path";
+				ctx->Rip                  = resume_rip;
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_LOCAL_VAR_PROBE"
+				     " site=0x%016" PRIx64 " rbp=0x%016" PRIx64
+				     " v788_main_on_standby=0x%x resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
+				     info->exception_address, ctx->Rbp, var_val, resume_rip, label);
+				Log::Flush();
+				return true;
+			}
+		}
+	}
+#endif
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
@@ -1851,6 +2043,192 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		SetupTlsHandler(program);
 	}
 
+	if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr &&
+	    program->file_name.filename() == "mini-syscore.elf") {
+		EXIT_IF(program->base_vaddr != 0x400000);
+		for (const auto offset: g_mini_native_syscall_offsets) {
+			EXIT_IF(offset + 2 > program->base_size_aligned);
+			const auto* site = reinterpret_cast<const uint8_t*>(program->base_vaddr + offset);
+			EXIT_IF(site[0] != 0x0f || site[1] != 0x05);
+		}
+		for (const auto offset: g_mini_native_syscall_offsets) {
+			auto* site = reinterpret_cast<uint8_t*>(program->base_vaddr + offset);
+			site[1]    = 0x0b;
+		}
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_mini_native_syscall_traps_installed.store(true, std::memory_order_release);
+		LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_NATIVE_TRAPS"
+		     " count=%zu base=0x%016" PRIx64 " checked_elf_syscall_opcodes=1\n",
+		     g_mini_native_syscall_offsets.size(), program->base_vaddr);
+		if (std::getenv("KYTY_DIAGNOSTIC_MINI_UPDATEMODE_RETURN_AUDIT") != nullptr) {
+			constexpr uint32_t offset = 0x5036;
+			auto*              code   = reinterpret_cast<uint8_t*>(program->base_vaddr + offset);
+			EXIT_IF(code[0] != 0x85 || code[1] != 0xc0);
+			code[0] = 0x0f;
+			code[1] = 0x0b;
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr + offset, 2));
+			g_mini_updatemode_return_site.store(program->base_vaddr + offset,
+			                                    std::memory_order_release);
+			LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_UPDATEMODE_RETURN_PROBE"
+			     " site=0x%016" PRIx64 " test_eax_eax=1\n",
+			     program->base_vaddr + offset);
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SSD0_OPEN_RESULT_DISCRIMINATOR") != nullptr) {
+			constexpr uint32_t ssd0_open_jnz_offset = 0x438a;
+			constexpr uint8_t  ssd0_open_jnz_sig[]  = {0x0f, 0x85, 0x99, 0x00, 0x00, 0x00};
+			auto* site = reinterpret_cast<uint8_t*>(program->base_vaddr + ssd0_open_jnz_offset);
+			EXIT_IF(std::memcmp(site, ssd0_open_jnz_sig, sizeof(ssd0_open_jnz_sig)) != 0);
+			site[0] = 0x0f;
+			site[1] = 0x0b;
+			site[2] = 0x90;
+			site[3] = 0x90;
+			site[4] = 0x90;
+			site[5] = 0x90;
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+			    program->base_vaddr + ssd0_open_jnz_offset, sizeof(ssd0_open_jnz_sig)));
+			g_mini_safe_mode_ssd0_open_jnz_site.store(program->base_vaddr + ssd0_open_jnz_offset,
+			                                          std::memory_order_release);
+			LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_SSD0_OPEN_RESULT_PROBE_INSTALLED"
+			     " jnz=0x%016" PRIx64 " branch_signature\n",
+			     program->base_vaddr + ssd0_open_jnz_offset);
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SUB402340_SSD0_USER_RESULT_PROBE") != nullptr) {
+			constexpr uint32_t sub402340_ssd0_user_jnz_offset = 0x4ca6;
+			constexpr uint8_t  sub402340_ssd0_user_jnz_sig[]  = {0x75, 0x24};
+			auto*              site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + sub402340_ssd0_user_jnz_offset);
+			EXIT_IF(std::memcmp(site, sub402340_ssd0_user_jnz_sig,
+			                    sizeof(sub402340_ssd0_user_jnz_sig)) != 0);
+			site[0] = 0x0f;
+			site[1] = 0x0b;
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+			    program->base_vaddr + sub402340_ssd0_user_jnz_offset,
+			    sizeof(sub402340_ssd0_user_jnz_sig)));
+			g_mini_safe_mode_sub402340_ssd0_user_jnz_site.store(
+			    program->base_vaddr + sub402340_ssd0_user_jnz_offset, std::memory_order_release);
+			LOGF("FIRST_FRAME_AUDIT "
+			     "MINI_SYSCORE_SAFE_MODE_SUB402340_SSD0_USER_RESULT_PROBE_INSTALLED"
+			     " jnz=0x%016" PRIx64 " dev=ssd0.user target=/user fstype=bfs"
+			     " branch_signature\n",
+			     program->base_vaddr + sub402340_ssd0_user_jnz_offset);
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_COLD_BOOT_PROGRESS_PROBE") != nullptr) {
+			// mov edi, 1 is at 0x5095, before call sub_471070 at 0x509a: 5 bytes off from the
+			// dep-map
+			constexpr uint32_t cold_boot_progress_offset = 0x5095;
+			constexpr uint8_t  cold_boot_progress_sig[]  = {0xbf, 0x01, 0x00, 0x00, 0x00};
+			auto*              site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + cold_boot_progress_offset);
+			const uint64_t base       = program->base_vaddr;
+			const uint64_t size       = program->base_size;
+			const uint64_t target_off = static_cast<uint64_t>(cold_boot_progress_offset);
+			if (size > 6 && base != 0) {
+				const auto* bytes      = reinterpret_cast<const uint8_t*>(base);
+				uint32_t    short_cond = 0, short_uncond = 0, near_cond = 0, near_uncond = 0,
+				            near_call = 0;
+				for (uint64_t off = 0; off + 2 <= size; ++off) {
+					const uint8_t b0 = bytes[off];
+					if ((b0 & 0xf0) == 0x70 || b0 == 0xeb) {
+						const int32_t disp = static_cast<int8_t>(bytes[off + 1]);
+						const int64_t tgt  = static_cast<int64_t>(off) + 2 + disp;
+						if (tgt >= 0 && static_cast<uint64_t>(tgt) == target_off) {
+							if (b0 == 0xeb) {
+								++short_uncond;
+								LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_XREF"
+								     " kind=short_jmp site=0x%016" PRIx64
+								     " disp=%d target=0x%016" PRIx64 "\n",
+								     base + off, disp, base + target_off);
+							} else {
+								++short_cond;
+								LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_XREF"
+								     " kind=short_cc_%02x site=0x%016" PRIx64
+								     " disp=%d target=0x%016" PRIx64 "\n",
+								     b0, base + off, disp, base + target_off);
+							}
+						}
+					}
+					if (off + 5 <= size && (b0 == 0xe9 || b0 == 0xe8)) {
+						const int32_t disp = *reinterpret_cast<const int32_t*>(bytes + off + 1);
+						const int64_t tgt  = static_cast<int64_t>(off) + 5 + disp;
+						if (tgt >= 0 && static_cast<uint64_t>(tgt) == target_off) {
+							if (b0 == 0xe9) {
+								++near_uncond;
+								LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_XREF"
+								     " kind=near_jmp site=0x%016" PRIx64
+								     " disp=%d target=0x%016" PRIx64 "\n",
+								     base + off, disp, base + target_off);
+							} else {
+								++near_call;
+								LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_XREF"
+								     " kind=near_call site=0x%016" PRIx64
+								     " disp=%d target=0x%016" PRIx64 "\n",
+								     base + off, disp, base + target_off);
+							}
+						}
+					}
+					if (off + 6 <= size && b0 == 0x0f && bytes[off + 1] >= 0x80 &&
+					    bytes[off + 1] <= 0x8f) {
+						const int32_t disp = *reinterpret_cast<const int32_t*>(bytes + off + 2);
+						const int64_t tgt  = static_cast<int64_t>(off) + 6 + disp;
+						if (tgt >= 0 && static_cast<uint64_t>(tgt) == target_off) {
+							++near_cond;
+							LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_XREF"
+							     " kind=near_cc_%02x site=0x%016" PRIx64
+							     " disp=%d target=0x%016" PRIx64 "\n",
+							     bytes[off + 1], base + off, disp, base + target_off);
+						}
+					}
+				}
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_XREF_SUMMARY"
+				     " target=0x%016" PRIx64 " short_cc=%u short_jmp=%u near_cc=%u"
+				     " near_jmp=%u near_call=%u scanned_bytes=%" PRIu64 "\n",
+				     base + target_off, short_cond, short_uncond, near_cond, near_uncond, near_call,
+				     size);
+			}
+			if (std::memcmp(site, cold_boot_progress_sig, sizeof(cold_boot_progress_sig)) != 0) {
+				uint8_t pre[16] {};
+				uint8_t post[16] {};
+				std::memcpy(pre, site - 16, 16);
+				std::memcpy(post, site, 16);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_SIG_MISMATCH"
+				     " offset=0x%016" PRIx64 " expected=bf_01_00_00_00"
+				     " pre16=%02x_%02x_%02x_%02x_%02x_%02x_%02x_%02x"
+				     "_%02x_%02x_%02x_%02x_%02x_%02x_%02x_%02x"
+				     " post16=%02x_%02x_%02x_%02x_%02x_%02x_%02x_%02x"
+				     "_%02x_%02x_%02x_%02x_%02x_%02x_%02x_%02x"
+				     " ud2_not_installed NON_AUTHENTIC\n",
+				     program->base_vaddr + cold_boot_progress_offset, pre[0], pre[1], pre[2],
+				     pre[3], pre[4], pre[5], pre[6], pre[7], pre[8], pre[9], pre[10], pre[11],
+				     pre[12], pre[13], pre[14], pre[15], post[0], post[1], post[2], post[3],
+				     post[4], post[5], post[6], post[7], post[8], post[9], post[10], post[11],
+				     post[12], post[13], post[14], post[15]);
+				for (int32_t pre_off = -16; pre_off <= 0; ++pre_off) {
+					if (std::memcmp(site + pre_off, cold_boot_progress_sig,
+					                sizeof(cold_boot_progress_sig)) == 0) {
+						LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_MOV_EDI_1_FOUND"
+						     " at=0x%016" PRIx64 " relative_to_probe=%+d\n",
+						     program->base_vaddr + cold_boot_progress_offset + pre_off, pre_off);
+					}
+				}
+			} else {
+				site[0] = 0x0f;
+				site[1] = 0x0b;
+				site[2] = 0x90;
+				site[3] = 0x90;
+				site[4] = 0x90;
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + cold_boot_progress_offset,
+				    sizeof(cold_boot_progress_sig)));
+				g_mini_cold_boot_progress_site.store(
+				    program->base_vaddr + cold_boot_progress_offset, std::memory_order_release);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_PROBE_INSTALLED"
+				     " cold_boot_progress=0x%016" PRIx64 " mov_edi_1_signature\n",
+				     program->base_vaddr + cold_boot_progress_offset);
+			}
+		}
+	}
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);
 }
 

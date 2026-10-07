@@ -22,6 +22,7 @@ target_link_libraries(common
 	PUBLIC
 		fmt::fmt
 		Tracy::TracyClient
+		bcrypt
 	PRIVATE
 		cpuinfo
 		kyty_git_version

@@ -19,6 +19,8 @@ public:
 		return g_m_instance;
 	}
 
+	static T* ExistingInstance() { return g_m_instance; }
+
 	KYTY_CLASS_NO_COPY(Singleton);
 
 protected:
