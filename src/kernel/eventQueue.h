@@ -8,6 +8,10 @@
 #include <deque>
 #include <memory>
 
+namespace Libs::LibKernel::FileSystem {
+struct NativeMbusReceiveQueue;
+struct GuestSocketReadSource;
+} // namespace Libs::LibKernel::FileSystem
 namespace Libs::LibKernel::EventQueue {
 
 constexpr int16_t KERNEL_EVFILT_TIMER     = -7;

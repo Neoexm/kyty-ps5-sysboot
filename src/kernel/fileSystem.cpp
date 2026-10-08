@@ -27,6 +27,7 @@
 #include "kernel/capturedRootMetadata.h"
 #include "kernel/capturedDirectory.h"
 #include "libs/errno.h"
+#include "libs/hostInputShared.h"
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "graphics/presentation/videoOut.h"
@@ -72,8 +73,157 @@ constexpr uint64_t DIR_BLOCK_SIZE = 512;
 enum class SpecialFile {
 	None,
 	Random,
+	Dipsw,
+	Console,
+	DeciStdin,
+	DeciStdout,
+	DeciStderr,
+	Npdrm,
+	SharedMemory,
+	GcDiagnostic,
+	NativeSshot,
+	PipeRead,
+	PipeWrite,
+	NativeKqueue,
+	NativeEqueueDescriptor,
+	GuestSocketPair,
+	NativeDce,
+	NativeDmem,
+	NativeMbus,
+	NativeSystemMbus,
+	NativeAvDevice,
+	NativeAvProbe,
+	NativeS3daProbe,
+	NativeS3da,
+	NativeMetadbg,
+	NativeA53Io,
+	NativeNsidCtl,
+	NativeSsd,
+	BfsCtl,
+	Temporary,
+	Devctl,
+	Envelope,
+	Rnps,
+	Hid,
+	LvdCtl,
+	LvdDevice,
+	M2Ctl,
 };
 
+struct LvdDevice;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct SharedGuestPipe {
+	static constexpr uint32_t capacity = 1024 * 1024;
+	static constexpr uint32_t magic    = 0x4b475031;
+	struct Owner {
+		DWORD    pid;
+		uint64_t created;
+		uint32_t readers;
+		uint32_t writers;
+	};
+	struct State {
+		uint32_t signature;
+		uint32_t version;
+		uint32_t head;
+		uint32_t size;
+		Owner    owners[64];
+		uint8_t  bytes[capacity];
+	};
+	std::string name;
+	HANDLE      mapping  = nullptr;
+	HANDLE      mutex    = nullptr;
+	HANDLE      readable = nullptr;
+	HANDLE      writable = nullptr;
+	State*      state    = nullptr;
+	static uint64_t Created(HANDLE process) {
+		FILETIME start {}, end {}, kernel {}, user {};
+		if (!GetProcessTimes(process, &start, &end, &kernel, &user)) {
+			return 0;
+		}
+		return (static_cast<uint64_t>(start.dwHighDateTime) << 32) | start.dwLowDateTime;
+	}
+
+	bool Lock() {
+		const auto result = WaitForSingleObject(mutex, INFINITE);
+		return result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+	}
+
+	bool Valid() const {
+		return state->signature == magic && state->version == 1 && state->head < capacity &&
+		       state->size <= capacity;
+	}
+	static std::shared_ptr<SharedGuestPipe> Open(const std::string& name, bool create) {
+		if (!name.starts_with("Local\\KytyGuestPipe.") || name.size() > 160 ||
+		    name.find_first_not_of(
+		        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._\\") !=
+		        std::string::npos) {
+			return {};
+		}
+		auto pipe  = std::make_shared<SharedGuestPipe>();
+		pipe->name = name;
+		if (create) {
+			pipe->mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+			                                   sizeof(State), name.c_str());
+			if (pipe->mapping == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+				return {};
+			}
+			pipe->mutex    = CreateMutexA(nullptr, FALSE, (name + ".mutex").c_str());
+			pipe->readable = CreateEventA(nullptr, TRUE, FALSE, (name + ".read").c_str());
+			pipe->writable = CreateEventA(nullptr, TRUE, TRUE, (name + ".write").c_str());
+		} else {
+			pipe->mapping = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
+			pipe->mutex =
+			    OpenMutexA(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, (name + ".mutex").c_str());
+			pipe->readable =
+			    OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, (name + ".read").c_str());
+			pipe->writable =
+			    OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, (name + ".write").c_str());
+		}
+		if (pipe->mapping == nullptr || pipe->mutex == nullptr || pipe->readable == nullptr ||
+		    pipe->writable == nullptr) {
+			return {};
+		}
+		pipe->state = static_cast<State*>(
+		    MapViewOfFile(pipe->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(State)));
+		if (pipe->state == nullptr || !pipe->Lock()) {
+			return {};
+		}
+		if (create) {
+			std::memset(pipe->state, 0, sizeof(State));
+			pipe->state->signature = magic;
+			pipe->state->version   = 1;
+			pipe->state->owners[0] = {GetCurrentProcessId(), Created(GetCurrentProcess()), 1, 1};
+		}
+		const bool valid = pipe->Valid();
+		ReleaseMutex(pipe->mutex);
+		return valid ? pipe : nullptr;
+	}
+	static std::shared_ptr<SharedGuestPipe> Create() {
+		static std::atomic_uint64_t sequence {0};
+		const auto                  name = std::string("Local\\KytyGuestPipe.") +
+		                                   std::to_string(GetCurrentProcessId()) + "." +
+		                                   std::to_string(Created(GetCurrentProcess())) + "." +
+		                                   std::to_string(sequence.fetch_add(1));
+		return Open(name, true);
+	}
+};
+#endif
+struct GuestPipe {
+	std::mutex              mutex;
+	std::condition_variable cv;
+	std::deque<uint8_t>     data;
+	uint32_t                readers = 1;
+	uint32_t                writers = 1;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::shared_ptr<SharedGuestPipe> shared;
+#endif
+};
+struct GuestSocketReadSource {
+	explicit GuestSocketReadSource(std::shared_ptr<GuestPipe> queue): pipe(std::move(queue)) {}
+	std::mutex                 mutex;
+	bool                       closed = false;
+	std::shared_ptr<GuestPipe> pipe;
+};
 class MountPoints {
 public:
 	struct MountPair {
@@ -97,6 +247,166 @@ private:
 	Common::Mutex          m_mutex;
 };
 
+struct NativeDceLeaseIdentity {
+	uint64_t generation                                      = 0;
+	uint64_t host_created                                    = 0;
+	uint32_t host_pid                                        = 0;
+	int32_t  guest_pid                                       = 0;
+	uint32_t cookie                                          = 0;
+	uint32_t port                                            = 0;
+	uint32_t bus                                             = 0;
+	uint32_t reserved                                        = 0;
+	bool     operator==(const NativeDceLeaseIdentity&) const = default;
+};
+struct NativeDceScope {
+#if defined(_WIN32)
+	static constexpr uint64_t magic = 0x314543445954594bULL;
+	struct State {
+		uint64_t               magic;
+		uint32_t               version;
+		uint32_t               bytes;
+		uint64_t               next_generation;
+		uint64_t               next_cookie_sequence;
+		NativeDceLeaseIdentity ports[7];
+	};
+	static_assert(sizeof(State) == 312);
+	HANDLE mutex   = nullptr;
+	HANDLE file    = INVALID_HANDLE_VALUE;
+	HANDLE mapping = nullptr;
+	State* state   = nullptr;
+	~NativeDceScope() {
+		if (state != nullptr) UnmapViewOfFile(state);
+		if (mapping != nullptr) CloseHandle(mapping);
+		if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+		if (mutex != nullptr) CloseHandle(mutex);
+	}
+	bool Valid() const {
+		if (state == nullptr || state->magic != magic || state->version != 1 ||
+		    state->bytes != sizeof(State) || state->next_generation == 0 ||
+		    state->next_generation != state->next_cookie_sequence)
+			return false;
+		for (size_t i = 0; i < std::size(state->ports); ++i) {
+			const auto& owner = state->ports[i];
+			if (owner == NativeDceLeaseIdentity {}) continue;
+			if (owner.generation == 0 || owner.host_created == 0 || owner.host_pid == 0 ||
+			    owner.guest_pid <= 0 || owner.port != i || owner.bus != 0 || owner.reserved != 0 ||
+			    owner.generation >= state->next_generation ||
+			    owner.cookie !=
+			        (static_cast<uint32_t>(owner.generation & 0x7fffffffu) ^ 0x2babcdcdu))
+				return false;
+		}
+		return true;
+	}
+	static bool CreatedAt(HANDLE process, uint64_t* created) {
+		FILETIME creation {}, exit {}, kernel {}, user {};
+		if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) return false;
+		*created = (uint64_t {creation.dwHighDateTime} << 32) | creation.dwLowDateTime;
+		return *created != 0;
+	}
+	static bool ProvenDead(const NativeDceLeaseIdentity& owner) {
+		HANDLE process =
+		    OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner.host_pid);
+		if (process == nullptr) return GetLastError() == ERROR_INVALID_PARAMETER;
+		uint64_t   created = 0;
+		const bool dead    = WaitForSingleObject(process, 0) == WAIT_OBJECT_0 ||
+		                     (CreatedAt(process, &created) && created != owner.host_created);
+		CloseHandle(process);
+		return dead;
+	}
+#else
+	static std::shared_ptr<NativeDceScope> Open(const std::string&) { return nullptr; }
+#endif
+};
+// devsoftc of /dev/devctl (subr_bus.c, K+0x2d58170) is one per kernel, so the single-open lease is
+// shared by the whole scope
+struct DevctlSoftc {
+#if defined(_WIN32)
+	struct State {
+		uint32_t inuse;
+		uint32_t nonblock;
+		uint32_t async;
+		int32_t  owner_guest_pid;
+		uint64_t owner_host_created;
+		uint32_t owner_host_pid;
+		uint32_t reserved;
+	};
+	HANDLE mutex   = nullptr;
+	HANDLE mapping = nullptr;
+	State* state   = nullptr;
+	~DevctlSoftc() {
+		if (state != nullptr) UnmapViewOfFile(state);
+		if (mapping != nullptr) CloseHandle(mapping);
+		if (mutex != nullptr) CloseHandle(mutex);
+	}
+	static std::shared_ptr<DevctlSoftc> Open(const std::string& scope) {
+		auto              softc = std::make_shared<DevctlSoftc>();
+		const std::string name  = "Local\\kyty_ps5_" + scope + "_devctl_v1";
+		softc->mutex            = CreateMutexA(nullptr, FALSE, (name + "_lock").c_str());
+		softc->mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+		                                    sizeof(State), name.c_str());
+		if (softc->mutex == nullptr || softc->mapping == nullptr) return nullptr;
+		softc->state = static_cast<State*>(
+		    MapViewOfFile(softc->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(State)));
+		return softc->state != nullptr ? softc : nullptr;
+	}
+	bool Lock() const {
+		const DWORD waited = WaitForSingleObject(mutex, 20000);
+		return waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED;
+	}
+	// devopen ignores the open flags, so O_NONBLOCK at open does not set nonblock.
+	int Acquire(int guest_pid) {
+		uint64_t created = 0;
+		if (!NativeDceScope::CreatedAt(GetCurrentProcess(), &created) || !Lock())
+			return KERNEL_ERROR_EIO;
+		int result = OK;
+		if (state->inuse != 0) {
+			NativeDceLeaseIdentity owner;
+			owner.host_created = state->owner_host_created;
+			owner.host_pid     = state->owner_host_pid;
+			if (!NativeDceScope::ProvenDead(owner)) {
+				LOGF("DEVCTL_OPEN_BUSY guest_pid=%d owner_pid=%d\n", guest_pid,
+				     state->owner_guest_pid);
+				result = KERNEL_ERROR_EBUSY;
+			} else {
+				LOGF("DEVCTL_OWNER_DEAD_RELEASE owner_pid=%d\n", state->owner_guest_pid);
+				state->nonblock = 0;
+				state->async    = 0;
+			}
+		}
+		if (result == OK) {
+			state->inuse              = 1;
+			state->owner_guest_pid    = guest_pid;
+			state->owner_host_created = created;
+			state->owner_host_pid     = GetCurrentProcessId();
+		}
+		ReleaseMutex(mutex);
+		return result;
+	}
+	void Close() {
+		if (!Lock()) return;
+		if (state->inuse != 0 && state->owner_host_pid == GetCurrentProcessId()) *state = State {};
+		ReleaseMutex(mutex);
+	}
+	int Nonblock() const {
+		if (!Lock()) return -1;
+		const int nonblock = state->nonblock != 0 ? 1 : 0;
+		ReleaseMutex(mutex);
+		return nonblock;
+	}
+	bool Set(bool nonblock, bool on) {
+		if (!Lock()) return false;
+		(nonblock ? state->nonblock : state->async) = on ? 1 : 0;
+		ReleaseMutex(mutex);
+		return true;
+	}
+#else
+	static std::shared_ptr<DevctlSoftc> Open(const std::string&) { return nullptr; }
+	int                                 Acquire(int) { return KERNEL_ERROR_ENOSYS; }
+	void                                Close() {}
+	int                                 Nonblock() const { return -1; }
+	bool                                Set(bool, bool) { return false; }
+#endif
+};
 struct File {
 	Common::File                        f;
 	std::string                         name;
@@ -111,6 +421,9 @@ struct File {
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
+	std::shared_ptr<GuestPipe>                     pipe;
+	std::shared_ptr<GuestPipe>                     socket_send;
+	std::shared_ptr<GuestSocketReadSource>         socket_read_source;
 	std::shared_ptr<Tmpfs::Handle>                 tmpfs;
 };
 
@@ -642,6 +955,54 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	return OK;
 }
 
+int CreateGuestSocketPair(int* fds) {
+	if (fds == nullptr || g_files == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	const int first          = g_files->CreateDescriptor();
+	const int second         = g_files->CreateDescriptor();
+	auto      inbound_first  = std::make_shared<GuestPipe>();
+	auto      inbound_second = std::make_shared<GuestPipe>();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const char* exec_enabled = std::getenv("KYTY_DIAGNOSTIC_GUEST_EXECVE");
+	if (exec_enabled != nullptr && std::strcmp(exec_enabled, "1") == 0) {
+		inbound_first->shared  = SharedGuestPipe::Create();
+		inbound_second->shared = SharedGuestPipe::Create();
+		if (!inbound_first->shared || !inbound_second->shared) {
+			g_files->DeleteDescriptor(first);
+			g_files->DeleteDescriptor(second);
+			return KERNEL_ERROR_ENOMEM;
+		}
+	}
+#endif
+	auto* left  = g_files->GetFile(first);
+	auto* right = g_files->GetFile(second);
+	EXIT_IF(left == nullptr || right == nullptr);
+	left->name                = "guest-socketpair-0";
+	left->real_name           = "/dev/socketpair";
+	left->special             = SpecialFile::GuestSocketPair;
+	left->pipe                = inbound_first;
+	left->socket_send         = inbound_second;
+	left->socket_read_source  = std::make_shared<GuestSocketReadSource>(left->pipe);
+	left->readable            = true;
+	left->writable            = true;
+	left->opened              = true;
+	right->name               = "guest-socketpair-1";
+	right->real_name          = "/dev/socketpair";
+	right->special            = SpecialFile::GuestSocketPair;
+	right->pipe               = inbound_second;
+	right->socket_send        = inbound_first;
+	right->socket_read_source = std::make_shared<GuestSocketReadSource>(right->pipe);
+	right->readable           = true;
+	right->writable           = true;
+	right->opened             = true;
+	fds[0]                    = first;
+	fds[1]                    = second;
+	LOGF("SYSCORE_SOCKETPAIR_CREATE fd0=%d fd1=%d"
+	     " family=AF_UNIX type=SOCK_STREAM\n",
+	     first, second);
+	return OK;
+}
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 

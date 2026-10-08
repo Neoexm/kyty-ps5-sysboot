@@ -49,6 +49,7 @@ static_assert(offsetof(KernelIovec, iov_len) == 8);
 // Per-guest fd table: RFCFDG starts with no inherited fds even with a shared VM. Owns only the
 // table.
 class FileDescriptors;
+struct GuestSocketReadSource;
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();
@@ -68,6 +69,7 @@ std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);
+int                   CreateGuestSocketPair(int* fds);
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset);

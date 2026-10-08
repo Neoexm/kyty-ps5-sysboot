@@ -8,6 +8,17 @@ namespace Libs::LibKernel::EventQueue {
 }
 
 namespace Libs::NativeKernelBridge {
+// Native libkernel export contracts, not a SYSCALL trap. NIDs dYK287SsmDs, mkawd0NA9ts, pd02UI9TbOA
+// (13.60).
+enum class Service : uint32_t {
+	FlexibleMapExport = 1, // native helper, reaches guest syscall 0x2D5
+	SysconfExport     = 2, // sysconf(47), native query uses MIB {9, 20}
+	ReadlinkExport    = 3, // native libkernel_sys reaches syscall 0x3A
+};
+struct Request {
+	Service                 service;
+	std::array<uint64_t, 6> args {};
+};
 struct Reply {
 	int64_t value       = -1; // native export's return register (RAX)
 	int     posix_errno = 0;  // set by the export adapter if value == -1

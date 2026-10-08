@@ -11,6 +11,8 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
+#include "kernel/process.h"
+#include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -22,12 +24,15 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1066,6 +1071,15 @@ void* PthreadCreateMainGuestStack() {
 	return stack_top;
 }
 
+uint64_t PthreadGetMainGuestStackTop() {
+	uint64_t stack_addr = 0;
+	uint64_t stack_size = 0;
+	if (!PthreadGetGuestStack(g_pthread_main, &stack_addr, &stack_size) ||
+	    stack_addr > UINT64_MAX - stack_size) {
+		return 0;
+	}
+	return (stack_addr + stack_size) & ~uint64_t {0xf};
+}
 void Initialize() {
 	PRINT_NAME_ENABLE(false);
 

@@ -26,13 +26,20 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <limits>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1417,6 +1424,158 @@ static int KYTY_SYSV_ABI close(int d) {
 	return POSIX_CALL(FileSystem::KernelClose(d));
 }
 
+static int KYTY_SYSV_ABI sysctlbyname(const char* name, void* oldp, size_t* oldlenp,
+                                      const void* newp, size_t newlen) {
+	if (name == nullptr || oldlenp == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+
+	LOGF("\t sysctlbyname = %s\n", name);
+
+	if (std::strcmp(name, "kern.rng_pseudo") == 0) {
+		if (newp != nullptr || newlen != 0) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+			return -1;
+		}
+
+		if (oldp == nullptr) {
+			*oldlenp = 64;
+			return 0;
+		}
+
+		const auto size = *oldlenp;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(oldp), size);
+		auto*              out = static_cast<uint8_t*>(oldp);
+		std::random_device random;
+		for (size_t i = 0; i < size; i++) {
+			out[i] = static_cast<uint8_t>(random());
+		}
+		return 0;
+	}
+
+	*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+	return -1;
+}
+int KYTY_SYSV_ABI KernelSysctl(const uint32_t* mib, uint32_t mib_count, void* oldp, size_t* oldlenp,
+                               const void* newp, size_t newlen) {
+	if (mib == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+	// The kernel takes a missing oldlenp as a length of 0, which is how libkernel sets a value or
+	// pokes a node.
+	size_t no_oldlen = 0;
+	if (oldlenp == nullptr) {
+		oldlenp = &no_oldlen;
+	}
+	if (mib_count == 2 && mib[0] == 1 && mib[1] == 33) {
+		if (newp != nullptr || newlen != 0) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+			return -1;
+		}
+		const auto stack_top = PthreadGetMainGuestStackTop();
+		if (stack_top == 0) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+			return -1;
+		}
+		const size_t output_size    = sizeof(stack_top);
+		const auto   requested_size = *oldlenp;
+		*oldlenp                    = output_size;
+		if (oldp == nullptr) {
+			return 0;
+		}
+		if (requested_size < output_size) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+			return -1;
+		}
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(oldp), output_size);
+		std::memcpy(oldp, &stack_top, output_size);
+		LOGF("KERNEL_SYSCTL kern.usrstack=0x%016" PRIx64 "\n", stack_top);
+		return 0;
+	}
+	// sysctlnametomib (+0x115f0): name as the new value of {0, 3}. Kernel oids start at 0x100,
+	// clear of libkernel's MIBs
+	uint32_t    oid[2]      = {0, 0x100};
+	uint64_t    value       = 0;
+	const void* output      = &value;
+	size_t      output_size = 0;
+	std::string unknown;
+	if (mib_count == 2 && mib[0] == 0 && mib[1] == 3 && newp != nullptr) {
+		const std::string name(static_cast<const char*>(newp), newlen);
+		if (name == "kern.rng_pseudo") {
+			oid[0] = 1;
+		} else if (name == "machdep.tsc_freq") {
+			oid[0] = 7;
+		}
+		if (oid[0] != 0) {
+			output      = oid;
+			output_size = sizeof(oid);
+		} else {
+			unknown = "name=" + name;
+		}
+	} else if (mib_count == 2 && mib[0] == 1 && mib[1] == 0x100) {
+		return sysctlbyname("kern.rng_pseudo", oldp, oldlenp, newp, newlen);
+	} else if (mib_count == 4 && mib[0] == 1 && mib[1] == 14 && (mib[2] == 36 || mib[2] == 68) &&
+	           newp == nullptr) {
+		// 36: compiled SDK version (+0x1c860); 68 high half: Prospero SDK (+0x1c9c0). mib[3] is a
+		// pid, not compared
+		auto*       rt         = Common::Singleton<Loader::RuntimeLinker>::Instance(); // NOLINT
+		const auto* proc_param = reinterpret_cast<const uint64_t*>(rt->GetProcParam());
+		if (proc_param != nullptr && proc_param[0] > 0x17) {
+			value       = proc_param[2];
+			output_size = mib[2] == 68 ? sizeof(value) : sizeof(uint32_t);
+		}
+	} else if (mib_count == 2 && newp == nullptr) {
+		if (mib[0] == 7 && mib[1] == 0x100) {
+			value       = KernelGetTscFrequency();
+			output_size = sizeof(value);
+		} else if ((mib[0] == 6 && mib[1] == 7) || (mib[0] == 9 && mib[1] == 20)) {
+			// hw.pagesize and p1003_1b.pagesize are ints; sysconf(_SC_PAGESIZE) prefers a non-zero
+			// second over getpagesize
+			value       = 0x4000;
+			output_size = sizeof(int32_t);
+		}
+	}
+	if (output_size != 0) {
+		const auto requested_size = *oldlenp;
+		*oldlenp                  = output_size;
+		if (oldp == nullptr) {
+			return 0;
+		}
+		if (requested_size < output_size) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+			return -1;
+		}
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(oldp), output_size);
+		std::memcpy(oldp, output, output_size);
+		return 0;
+	}
+	if (unknown.empty()) {
+		char text[64];
+		std::snprintf(text, sizeof(text), "mib=%u.%u.%u count=%u%s", mib_count > 0 ? mib[0] : 0,
+		              mib_count > 1 ? mib[1] : 0, mib_count > 2 ? mib[2] : 0, mib_count,
+		              newp != nullptr ? " set" : "");
+		unknown = text;
+	}
+	static std::mutex               unknown_mutex;
+	static std::vector<std::string> unknown_logged;
+	{
+		std::lock_guard lock(unknown_mutex);
+		if (std::find(unknown_logged.begin(), unknown_logged.end(), unknown) ==
+		    unknown_logged.end()) {
+			unknown_logged.push_back(unknown);
+			LOGF("KERNEL_SYSCTL unsupported %s\n", unknown.c_str());
+		}
+	}
+	*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+	return -1;
+}
+int KYTY_SYSV_ABI KernelSysctlStub(const uint32_t* mib, uint32_t mib_count, void* oldp,
+                                   size_t* oldlenp, const void* newp, size_t newlen) {
+	return KernelSysctl(mib, mib_count, oldp, oldlenp, newp, newlen) == 0 ? 0
+	                                                                      : *Posix::GetErrorAddr();
+}
 static int64_t KYTY_SYSV_ABI read(int d, void* buf, uint64_t nbytes) {
 	// PRINT_NAME();
 
@@ -1761,6 +1920,24 @@ static KYTY_SYSV_ABI int KernelGetOpenPsId(void* open_ps_id) {
 	return OK;
 }
 
+// libkernel reads machdep.openpsid_for_sys with a raw sysctl and hands back its result unconverted,
+// so the null case is the plain errno
+static KYTY_SYSV_ABI int KernelGetOpenPsIdForSystem(void* open_ps_id) {
+	PRINT_NAME();
+
+	if (open_ps_id == nullptr) {
+		return Posix::POSIX_EINVAL;
+	}
+
+	static constexpr uint8_t id[16] = {
+	    0x4b, 0x79, 0x74, 0x79, 0x4f, 0x70, 0x65, 0x6e,
+	    0x50, 0x73, 0x49, 0x64, 0x00, 0x00, 0x00, 0x02,
+	};
+
+	std::memcpy(open_ps_id, id, sizeof(id));
+
+	return OK;
+}
 static KYTY_SYSV_ABI void pthread_cxa_finalize(void* /*p*/) {
 	PRINT_NAME();
 }
