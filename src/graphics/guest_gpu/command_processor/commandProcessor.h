@@ -23,6 +23,11 @@ enum class ContextStateOperation : uint32_t {
 	PushClear = 3,
 };
 
+enum class GfxPipeLockMode : uint32_t {
+	Disabled           = 0,
+	ContextManagerOnly = 1,
+	Enabled            = 3,
+};
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }

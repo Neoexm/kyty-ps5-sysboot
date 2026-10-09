@@ -937,6 +937,19 @@ private:
 };
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static MemoryOperationMutex g_memory_operation_mutex;
+class AnonymousSharedMemory {
+public:
+	explicit AnonymousSharedMemory(uint16_t object_mode, uint64_t object_id)
+	    : mode(object_mode), id(object_id) {}
+	~AnonymousSharedMemory();
+
+	uint64_t              size            = 0;
+	uint64_t              capacity        = 0;
+	uint64_t              physical_offset = 0;
+	uint16_t              mode            = 0;
+	uint64_t              id              = 0;
+	std::atomic<uint64_t> mappings {0};
+};
 
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
 // assume mappings it did not place explicitly are at or above this (Sony's libc rejects a
@@ -3550,6 +3563,13 @@ static int MapDirectMemoryInternal(void** addr, size_t len, int prot, int flags,
 	return OK;
 }
 
+uint64_t GetAnonymousSharedMemorySize(const std::shared_ptr<AnonymousSharedMemory>& object) {
+	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+	return object ? object->size : 0;
+}
+uint16_t GetAnonymousSharedMemoryMode(const std::shared_ptr<AnonymousSharedMemory>& object) {
+	return object ? object->mode : 0;
+}
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();

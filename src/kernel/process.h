@@ -29,6 +29,19 @@ struct PeerProcess {
 		has_filtered_auth_info = false;
 	}
 };
+// RFPROC child pid while RF_MEM shares the parent's VM. Thread-local, nests.
+class ScopedGuestProcessPid {
+public:
+	explicit ScopedGuestProcessPid(int pid);
+	~ScopedGuestProcessPid();
+	ScopedGuestProcessPid(const ScopedGuestProcessPid&)            = delete;
+	ScopedGuestProcessPid& operator=(const ScopedGuestProcessPid&) = delete;
+
+private:
+	int previous_pid = 0;
+};
 int GetPid();
+bool GetScope(std::string* scope);
+AuthInfo::AuthorizationFacts GetCurrentAuthorizationFacts();
 } // namespace Libs::LibKernel::Process
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_PROCESS_H_ */

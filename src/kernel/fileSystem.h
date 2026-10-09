@@ -14,6 +14,9 @@
 #include <mutex>
 #include <vector>
 
+namespace Common {
+class File;
+}
 namespace Libs::LibKernel::FileSystem {
 
 struct FileStat {

@@ -56,6 +56,9 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <bcrypt.h>
 #undef DeleteFile
@@ -63,6 +66,8 @@
 #else
 #include <sys/stat.h>
 #endif
+
+
 namespace Libs::LibKernel::FileSystem {
 
 LIB_NAME("libkernel", "libkernel");
@@ -446,6 +451,19 @@ private:
 };
 
 static MountPoints*     g_mount_points = nullptr;
+static bool A53StorageEnabled() {
+	return std::getenv("KYTY_DIAGNOSTIC_A53_STORAGE") != nullptr;
+}
+static bool IsA53SsdDevice(const std::string& path) {
+	return path == "/dev/ssd0" || path == "/dev/ssd0.preinst" || path == "/dev/ssd0.system" ||
+	       path == "/dev/ssd0.system_b" || path == "/dev/ssd0.system_ex" ||
+	       path == "/dev/ssd0.system_ex_b" || path == "/dev/ssd0.swap" ||
+	       path == "/dev/ssd0.system_data" || path == "/dev/ssd0.update" ||
+	       path == "/dev/ssd0.user" || path == "/dev/ssd0.app_temp0" ||
+	       path == "/dev/ssd0.app_swap" || path == "/dev/ssd0.hibernation" ||
+	       path == "/dev/ssd0.bd_rvlist" || path == "/dev/ssd0.swapx0" ||
+	       path == "/dev/ssd0.swapx1" || path == "/dev/ssd0.swapx2";
+}
 static FileDescriptors*              g_primary_files        = nullptr;
 static thread_local FileDescriptors* g_guest_files_override = nullptr;
 struct ActiveDescriptorDispatch {
@@ -1492,6 +1510,14 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
 
+	const char* iccnvs4_image    = std::getenv("KYTY_PS5_ICCNVS4_IMAGE");
+	const bool  original_iccnvs4 = std::strcmp(path, "/dev/iccnvs4") == 0 &&
+	                               iccnvs4_image != nullptr && iccnvs4_image[0] != '\0';
+	const auto  real_file_name =
+	    original_iccnvs4 ? std::filesystem::path(iccnvs4_image) : g_mount_points->ResolvePath(path);
+	if (original_iccnvs4 && !real_file_name.is_absolute()) {
+		return KERNEL_ERROR_ENOENT;
+	}
 	const auto info = Common::File::GetInfo(real_file_name);
 	if (!info) {
 		LOGF("\t file not found\n");

@@ -664,6 +664,86 @@ Reply SysctlPageSize(const SyscallRequest& request) {
 		return {LibKernel::KERNEL_ERROR_EFAULT, 0};
 	}
 }
+Reply RegMgrCall(const SyscallRequest& request) {
+	// 0x214 (op, key, int* status, void* value, size); *status is the answer when the call returns
+	// 0. Only what the guest stored this run reads back
+	static const bool store = std::getenv("KYTY_DIAGNOSTIC_REGMGR_SESSION_STORE") != nullptr;
+	static std::mutex mutex;
+	static std::unordered_map<uint32_t, int32_t>              ints;
+	static std::unordered_map<uint32_t, std::vector<uint8_t>> bins;
+	const auto                                                op = request.args[0];
+	const auto  key    = static_cast<uint32_t>(request.args[1]);
+	auto*       status = reinterpret_cast<int32_t*>(request.args[2]);
+	auto*       value  = reinterpret_cast<int32_t*>(request.args[3]);
+	const auto  size   = request.args[4];
+	Reply       reply {-1, Libs::Posix::POSIX_ENOSYS};
+	const char* source   = "unanswered";
+	int32_t     answered = 0;
+	// one line per distinct (op, key, size, outcome) - op 7 polls constantly
+	auto audit = [&] {
+		static std::mutex                                log_mutex;
+		static std::unordered_map<std::string, uint32_t> seen;
+		const bool kernel = std::strcmp(source, "kernel_13.60_snapshot") == 0;
+		// Ops 0 and 0x12 return the registry value itself (version dword, region id) as the status.
+		char status_text[16] = "withheld";
+		if (!kernel || (op != 0 && op != 0x12) || answered < 0)
+			std::snprintf(status_text, sizeof(status_text), "0x%08x",
+			              static_cast<uint32_t>(answered));
+		char line[192];
+		std::snprintf(line, sizeof(line),
+		              "op=%" PRIu64 " key=0x%08x size=%" PRIu64 " rc=%" PRId64
+		              " errno=%d status=%s source=%s store=%d%s",
+		              op, key, size, reply.value, reply.posix_errno, status_text, source,
+		              store ? 1 : 0, kernel ? "" : " NON_AUTHENTIC");
+		std::lock_guard lock(log_mutex);
+		if (seen[line]++ == 0)
+			LOGF("FIRST_FRAME_AUDIT REGMGR %s pid=%d\n", line, LibKernel::Process::GetPid());
+	};
+}
+struct NativeNamedObject {
+	std::string name;
+	uint64_t    object;
+	uint32_t    type;
+};
+struct NativeNamedRegistry {
+	uint32_t                                        next = 0;
+	std::unordered_map<uint32_t, NativeNamedObject> objects;
+};
+std::mutex                                   g_native_named_lock;
+std::unordered_map<int, NativeNamedRegistry> g_native_named_objects;
+Reply NativeNamedObjectOperation(const SyscallRequest& request) {
+	const uint32_t type = static_cast<uint16_t>(
+	    (request.number == 0x22d ? request.args[2] : request.args[1]) | 0x1000u);
+	const int       owner = LibKernel::Process::GetPid();
+	std::lock_guard lock(g_native_named_lock);
+	if (request.number == 0x22e) {
+		if (request.args[0] > 0xfffe) return {-1, Libs::Posix::POSIX_ESRCH};
+		const auto registry = g_native_named_objects.find(owner);
+		if (registry == g_native_named_objects.end()) return {-1, Libs::Posix::POSIX_ESRCH};
+		const auto found = registry->second.objects.find(static_cast<uint32_t>(request.args[0]));
+		if (found == registry->second.objects.end() || found->second.type != type) {
+			return {-1, Libs::Posix::POSIX_ESRCH};
+		}
+		registry->second.objects.erase(found);
+		return {0, 0};
+	}
+	if (request.args[0] == 0) return {-1, Libs::Posix::POSIX_EINVAL};
+	std::string name;
+	const int   rc =
+	    ReadExecveGuestString(request.args[0], 32, LibKernel::KERNEL_ERROR_ENAMETOOLONG, &name);
+	if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+	auto& registry = g_native_named_objects[owner];
+	if (registry.objects.size() >= 0xfffe) return {-1, Libs::Posix::POSIX_EAGAIN};
+	do {
+		registry.next = registry.next % 0xfffe + 1;
+	} while (registry.objects.contains(registry.next));
+	registry.objects.emplace(registry.next, NativeNamedObject {name, request.args[1], type});
+	LOGF("NATIVE_NAMED_OBJECT_REGISTERED pid=%d name=%s id=%u object=0x%llx type=0x%x "
+	     "opaque_object_word=1\n",
+	     owner, name.c_str(), registry.next, static_cast<unsigned long long>(request.args[1]),
+	     type);
+	return {registry.next, 0};
+}
 } // namespace
 bool ShouldLogMiniSyscallTrace(uint64_t ordinal) {
 	return ordinal != 0 && (ordinal <= 64 || (ordinal & (ordinal - 1)) == 0);

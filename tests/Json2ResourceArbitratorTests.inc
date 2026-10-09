@@ -1,0 +1,22 @@
+struct Json2ContractApi {
+  using Iterator = const void *const *;
+  using ValueCtor = void *(KYTY_SYSV_ABI *)(void *);
+  using ValueCopyCtor = void *(KYTY_SYSV_ABI *)(void *, const void *);
+  using ValueDtor = void (KYTY_SYSV_ABI *)(void *);
+  using Parse = int32_t (KYTY_SYSV_ABI *)(void *, const char *, size_t);
+  using IndexString = const void *(KYTY_SYSV_ABI *)(const void *, const char *);
+  using IndexUInt = const void *(KYTY_SYSV_ABI *)(const void *, uint64_t);
+  using GetArray = const void *(KYTY_SYSV_ABI *)(const void *);
+  using ArraySize = size_t (KYTY_SYSV_ABI *)(const void *);
+  using ArrayBound = Iterator *(KYTY_SYSV_ABI *)(Iterator *, const void *);
+  using IteratorNotEqual = bool (KYTY_SYSV_ABI *)(const Iterator *, const Iterator *);
+  using IteratorDeref = const void *(KYTY_SYSV_ABI *)(const Iterator *);
+  using IteratorIncrement = Iterator *(KYTY_SYSV_ABI *)(Iterator *);
+  using StringCtor = void *(KYTY_SYSV_ABI *)(void *, const char *);
+  using StringCopyCtor = void *(KYTY_SYSV_ABI *)(void *, const void *);
+  using StringDtor = void (KYTY_SYSV_ABI *)(void *);
+  using GetValue = const void *(KYTY_SYSV_ABI *)(const void *, const void *);
+  using ReferValue = const void *(KYTY_SYSV_ABI *)(void *, const void *);
+  using GetType = uint32_t (KYTY_SYSV_ABI *)(const void *);
+  ArrayBound end;
+};

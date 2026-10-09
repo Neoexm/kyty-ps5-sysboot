@@ -14,6 +14,7 @@ enum class PageFaultAccess;
 
 namespace Libs::LibKernel::Memory {
 
+class AnonymousSharedMemory;
 void Initialize();
 void Shutdown();
 
