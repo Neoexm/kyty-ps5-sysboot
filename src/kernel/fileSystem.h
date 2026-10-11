@@ -74,6 +74,7 @@ void                  Mount(const std::filesystem::path& folder, const std::stri
 int KYTY_SYSV_ABI     KernelUmask(int mask);
 bool                  IsTmpfsDescriptor(int descriptor);
 int  MountTmpfs(const std::string& point, uint32_t mode, uint64_t byte_limit, uint32_t inode_limit);
+int  MountExfatReadOnly(const std::string& point, std::shared_ptr<ExfatVolume> volume);
 int  MountRegisteredExfatReadOnly(const std::string& device, const std::string& point);
 int  MountRegisteredBfs(const std::string& device, const std::string& point);
 int  MountNullfs(const std::string& source, const std::string& point, uint64_t flags = 0);

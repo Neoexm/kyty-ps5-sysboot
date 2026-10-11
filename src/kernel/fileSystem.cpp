@@ -538,6 +538,7 @@ struct NativeDceLeaseIdentity {
 	uint32_t reserved                                        = 0;
 	bool     operator==(const NativeDceLeaseIdentity&) const = default;
 };
+static_assert(sizeof(NativeDceLeaseIdentity) == 40);
 
 struct NativeDceScope {
 #if defined(_WIN32)
@@ -561,6 +562,10 @@ struct NativeDceScope {
 		if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
 		if (mutex != nullptr) CloseHandle(mutex);
 	}
+	bool Lock() const {
+		const DWORD waited = WaitForSingleObject(mutex, 20000);
+		return waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED;
+	}
 	bool Valid() const {
 		if (state == nullptr || state->magic != magic || state->version != 1 ||
 		    state->bytes != sizeof(State) || state->next_generation == 0 ||
@@ -578,6 +583,7 @@ struct NativeDceScope {
 		}
 		return true;
 	}
+	bool Flush() const { return FlushViewOfFile(state, sizeof(State)) && FlushFileBuffers(file); }
 	static bool CreatedAt(HANDLE process, uint64_t* created) {
 		FILETIME creation {}, exit {}, kernel {}, user {};
 		if (!GetProcessTimes(process, &creation, &exit, &kernel, &user)) return false;
@@ -594,8 +600,81 @@ struct NativeDceScope {
 		CloseHandle(process);
 		return dead;
 	}
+	static std::shared_ptr<NativeDceScope> Open(const std::string& scope) {
+		auto              view = std::make_shared<NativeDceScope>();
+		const std::string name = "Local\\kyty_ps5_" + scope + "_dce_leases_v1";
+		std::error_code   error;
+		const auto        temporary = std::filesystem::temp_directory_path(error);
+		if (error) return nullptr;
+		const auto path = temporary / ("kyty_ps5_" + scope + "_dce_leases_v1.bin");
+		view->mutex     = CreateMutexA(nullptr, FALSE, (name + "_lock").c_str());
+		if (view->mutex == nullptr || !view->Lock()) return nullptr;
+		view->file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+		                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+		                         FILE_ATTRIBUTE_NORMAL, nullptr);
+		const bool created =
+		    view->file != INVALID_HANDLE_VALUE && GetLastError() != ERROR_ALREADY_EXISTS;
+		LARGE_INTEGER length {};
+		bool valid = view->file != INVALID_HANDLE_VALUE && GetFileSizeEx(view->file, &length);
+		if (valid && created) {
+			length.QuadPart = sizeof(State);
+			valid           = SetFilePointerEx(view->file, length, nullptr, FILE_BEGIN) &&
+			                  SetEndOfFile(view->file);
+		}
+		if (valid && length.QuadPart == sizeof(State)) {
+			view->mapping = CreateFileMappingA(view->file, nullptr, PAGE_READWRITE, 0,
+			                                   sizeof(State), name.c_str());
+			if (view->mapping != nullptr && created && GetLastError() == ERROR_ALREADY_EXISTS)
+				valid = false;
+			if (valid && view->mapping != nullptr)
+				view->state = static_cast<State*>(
+				    MapViewOfFile(view->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(State)));
+		}
+		if (created && view->state != nullptr) {
+			*view->state                      = State {};
+			view->state->version              = 1;
+			view->state->bytes                = sizeof(State);
+			view->state->next_generation      = 1;
+			view->state->next_cookie_sequence = 1;
+			view->state->magic                = magic;
+			valid                             = view->Flush();
+		}
+		valid = valid && view->Valid();
+		ReleaseMutex(view->mutex);
+		return valid ? view : nullptr;
+	}
+	int Validate(const NativeDceLeaseIdentity& identity) const {
+		if (identity.generation == 0 || identity.port >= 7 || !Lock()) return KERNEL_ERROR_EIO;
+		const int result = !Valid()                                  ? KERNEL_ERROR_EIO
+		                   : state->ports[identity.port] == identity ? OK
+		                                                             : KERNEL_ERROR_EINVAL;
+		ReleaseMutex(mutex);
+		return result;
+	}
+	int Release(const NativeDceLeaseIdentity& identity) const {
+		if (identity.generation == 0 || identity.port >= 7 || !Lock()) return KERNEL_ERROR_EIO;
+		int result = KERNEL_ERROR_EIO;
+		if (Valid()) {
+			auto& owner = state->ports[identity.port];
+			result      = KERNEL_ERROR_EINVAL;
+			if (owner == identity) {
+				owner  = {};
+				result = Flush() ? OK : KERNEL_ERROR_EIO;
+				if (result != OK) {
+					owner = identity;
+					static_cast<void>(Flush());
+					LOGF("NATIVE_DCE_SCOPE_RELEASE_PERSIST_FAILED occupied_owner_preserved=1 "
+					     "generation=%" PRIu64 "\n",
+					     identity.generation);
+				}
+			}
+		}
+		ReleaseMutex(mutex);
+		return result;
+	}
 #else
 	static std::shared_ptr<NativeDceScope> Open(const std::string&) { return nullptr; }
+	int Release(const NativeDceLeaseIdentity&) const { return KERNEL_ERROR_ENOSYS; }
 #endif
 };
 
@@ -705,6 +784,62 @@ static bool EnvelopeDigestMatches(std::span<const uint8_t> plaintext, const uint
 
 struct NativeDceEnvelope;
 
+struct NativeDceClient {
+	Common::Mutex                             mutex;
+	int                                       pid    = 0;
+	uint32_t                                  port   = 0;
+	uint32_t                                  bus    = 0;
+	uint32_t                                  cookie = 0;
+	std::shared_ptr<NativeDceScope>           scope;
+	NativeDceLeaseIdentity                    lease;
+	void*                                     shared             = nullptr;
+	uint64_t                                  memory_token       = 0;
+	bool                                      live               = true;
+	int                                       display_handle     = -1;
+	uint64_t                                  display_generation = 0;
+	bool                                      attributes         = false;
+	std::array<uint64_t, 4>                   buffers {};
+	bool                                      has_flip_sequence  = false;
+	uint64_t                                  last_flip_sequence = 0;
+	std::vector<std::pair<int64_t, uint64_t>> flip_events;
+	int                                       Ioctl(const NativeDceEnvelope& envelope);
+	int                                       Close() {
+		Common::LockGuard lock(mutex);
+		if (live) {
+			live = false;
+			for (const auto& [queue, ident]: flip_events) {
+				const int rc = EventQueue::KernelDeleteEvent(queue, ident,
+				                                             EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+				if (rc != OK && rc != KERNEL_ERROR_EBADF && rc != KERNEL_ERROR_ENOENT)
+					LOGF("NATIVE_DCE_CLIENT_EVENT_REMOVE_FAILED cookie=0x%x result=0x%x\n", cookie,
+					     rc);
+			}
+			flip_events.clear();
+			VideoOut::VideoOutNativeReleaseClientHandle(&display_handle, display_generation);
+			if (shared != nullptr && memory_token != 0) {
+				const int rc = Memory::UnmapOwnedFlexibleMemory(reinterpret_cast<uint64_t>(shared),
+				                                                0x4000, memory_token);
+				if (rc != OK && rc != KERNEL_ERROR_ENOENT)
+					LOGF("NATIVE_DCE_CLIENT_UNMAP_FAILED cookie=0x%x result=0x%x\n", cookie, rc);
+			}
+			shared       = nullptr;
+			memory_token = 0;
+		}
+		if (scope != nullptr && lease.generation != 0) {
+			const int rc = scope->Release(lease);
+			if (rc != OK) {
+				LOGF("NATIVE_DCE_SCOPE_RELEASE_PRESERVED cookie=0x%x generation=%" PRIu64
+				     " result=0x%x retryable=1\n",
+				     cookie, lease.generation, rc);
+				return rc;
+			}
+			lease = {};
+		}
+		return OK;
+	}
+
+	~NativeDceClient() { static_cast<void>(Close()); }
+};
 
 static std::mutex g_native_dce_client_mutex;
 static uint64_t g_native_dce_client_sequence = 1;
@@ -737,6 +872,7 @@ struct File {
 	std::shared_ptr<ExfatMount::Handle>            exfat;
 	std::shared_ptr<BfsMount::Handle>              bfs;
 	std::shared_ptr<DirectoryPassthrough::Handle>  passthrough;
+	std::shared_ptr<LvdDevice>                     lvd;
 	int32_t                                        hid_next_pad_handle   = 1;
 	uint32_t                                       hid_unknown_log_count = 0;
 	bool                                           data_topology          = false;
@@ -833,6 +969,9 @@ static std::mutex                                          g_lvd_mutex;
 static std::unordered_map<int, std::shared_ptr<LvdDevice>> g_lvd_devices;
 
 
+// 0x40086481 whole-media capacity. Minus the 0x4c9710 partition sum (0xab15c0000) this leaves the
+// user partition.
+static constexpr uint64_t A53_WHOLE_MEDIA_CAPACITY = 681405841408ull;
 static constexpr uint64_t A53_BD_RVLIST_CAPACITY   = 0x100000ull;
 static constexpr uint64_t A53_SWAP_CAPACITY        = 0x200000000ull;
 static constexpr uint64_t A53_SWAPX0_CAPACITY      = 0x1fff00000ull;
@@ -848,6 +987,7 @@ static constexpr uint64_t A53_SYSTEM_DATA_CAPACITY = 0x200000000ull;
 static constexpr uint64_t A53_UPDATE_CAPACITY      = 0x100000000ull;
 static constexpr uint64_t A53_APP_SWAP_CAPACITY    = 0x380000000ull;
 static constexpr uint64_t A53_HIBERNATION_CAPACITY = 0xd8000000ull;
+static constexpr uint64_t A53_USER_CAPACITY        = A53_WHOLE_MEDIA_CAPACITY - 0xab15c0000ull;
 
 static bool A53StorageEnabled() {
 	return std::getenv("KYTY_DIAGNOSTIC_A53_STORAGE") != nullptr;
@@ -1009,6 +1149,24 @@ static int RefreshTmpfsDirectory(File* file) {
 }
 
 
+static int RefreshExfatDirectory(File* file) {
+	std::vector<ExfatMount::DirectoryEntry> entries;
+	const int                               result = ExfatMount::Entries(file->exfat, &entries);
+	if (result != OK) return result;
+	std::vector<Common::File::DirEntry> directory;
+	for (const auto& entry: entries)
+		directory.push_back({entry.name, !entry.directory});
+	auto   packed = PackDirents(directory);
+	size_t offset = 0;
+	for (const auto& entry: entries) {
+		std::memcpy(packed.data() + offset, &entry.inode, sizeof(entry.inode));
+		uint16_t length = 0;
+		std::memcpy(&length, packed.data() + offset + 4, sizeof(length));
+		offset += length;
+	}
+	file->dirents = std::move(packed);
+	return OK;
+}
 
 
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
@@ -1209,7 +1367,24 @@ static void FillLvdStat(FileStat* stat, bool block_device) {
 	stat->st_blksize = 0x4000;
 }
 
+static void LogLvdAttach(const LvdDevice& device, const std::string& image) noexcept {
+	try {
+		LOGF("LVD_ATTACH guest_pid=%d unit=%d image=%s capacity=0x%016" PRIx64
+		     " sector=0x%x granularity=0x%x layers=1 retained_backing=1\n",
+		     device.owner_pid, device.unit, image.c_str(), device.capacity, device.sector_size,
+		     device.granularity);
+	} catch (...) {
+	}
+}
 
+static void LogLvdDetach(int guest_pid, int owner_pid, int unit) noexcept {
+	try {
+		LOGF("LVD_DETACH guest_pid=%d creator_pid=%d unit=%d namespace_removed=1 "
+		     "open_descriptors_retain_backing=1\n",
+		     guest_pid, owner_pid, unit);
+	} catch (...) {
+	}
+}
 
 static int CopyLvdGuestPath(uint64_t address, std::string* path) try {
 	if (address == 0 || path == nullptr) return KERNEL_ERROR_EFAULT;
@@ -1230,8 +1405,100 @@ static int CopyLvdGuestPath(uint64_t address, std::string* path) try {
 }
 
 
+static int AttachLvd(void* arg) try {
+	LvdAttachRequest request {};
+	if (!Memory::CopyFromGuest(&request, arg, sizeof(request)) ||
+	    !GuestSocketBufferAccessible(static_cast<uint8_t*>(arg) + offsetof(LvdAttachRequest, unit),
+	                                 sizeof(request.unit), true)) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (request.version != 0 || request.unit != 0 || request.sector_size != 0x200 ||
+	    request.granularity != 0x10000 || request.flags != 0x14 || request.image_type != 0 ||
+	    request.layer_count != 1 || request.device_size == 0 ||
+	    request.device_size > static_cast<uint64_t>(INT64_MAX) ||
+	    request.device_size % request.sector_size != 0 || request.layers == 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	LvdLayer layer {};
+	if (!Memory::CopyFromGuest(&layer, reinterpret_cast<const void*>(request.layers),
+	                           sizeof(layer))) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (layer.source_type != 1 || layer.flags != 1 || layer.reserved != 0 || layer.path == 0 ||
+	    layer.offset != 0 || layer.end != request.device_size || layer.bitmap_path != 0 ||
+	    layer.bitmap_offset != 0 || layer.bitmap_size != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	std::string image_path;
+	const int   copied = CopyLvdGuestPath(layer.path, &image_path);
+	if (copied != OK) return copied;
+	if (!DirectoryPassthrough::Contains(image_path)) return KERNEL_ERROR_ENOTSUP;
+	std::shared_ptr<DirectoryPassthrough::Handle> backing;
+	int result = DirectoryPassthrough::Open(image_path, 2, &backing);
+	if (result != OK) return result;
+	DirectoryPassthrough::NodeStat stat {};
+	result = DirectoryPassthrough::Fstat(backing, &stat);
+	if (result != OK) return result;
+	if ((stat.mode & 0170000u) != 0100000u || stat.size < request.device_size)
+		return KERNEL_ERROR_EINVAL;
 
+	auto device             = std::make_shared<LvdDevice>();
+	device->owner_pid       = Process::GetPid();
+	device->sector_size     = request.sector_size;
+	device->granularity     = request.granularity;
+	device->capacity        = request.device_size;
+	device->image_path      = std::move(image_path);
+	device->backing         = std::move(backing);
+	const auto logged_image = Log::EscapeField(device->image_path);
 
+	std::lock_guard lock(g_lvd_mutex);
+	int             unit = 0;
+	while (unit < 256 && g_lvd_devices.contains(unit))
+		++unit;
+	if (unit == 256) return KERNEL_ERROR_ENOSPC;
+	device->unit = unit;
+	g_lvd_devices.emplace(unit, device);
+	if (!Memory::CopyToGuest(static_cast<uint8_t*>(arg) + offsetof(LvdAttachRequest, unit), &unit,
+	                         sizeof(unit))) {
+		g_lvd_devices.erase(unit);
+		return KERNEL_ERROR_EFAULT;
+	}
+	LogLvdAttach(*device, logged_image);
+	return OK;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
+
+static int DetachLvd(void* arg) try {
+	LvdAttachRequest request {};
+	if (!Memory::CopyFromGuest(&request, arg, sizeof(request))) return KERNEL_ERROR_EFAULT;
+	if (request.version != 0 || request.unit < 0 || request.sector_size != 0 ||
+	    request.granularity != 0 || request.flags != 0 || request.image_type != 0 ||
+	    request.layer_count != 0 || request.device_size != 0 || request.layers != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	const std::string name = "/dev/lvd" + std::to_string(request.unit);
+	std::lock_guard   publication(g_mount_publication_mutex);
+	if (std::any_of(g_published_read_only_providers.begin(), g_published_read_only_providers.end(),
+	                [&](const auto& binding) { return binding.device == name; })) {
+		return KERNEL_ERROR_EBUSY;
+	}
+	std::lock_guard lock(g_lvd_mutex);
+	const auto      found = g_lvd_devices.find(request.unit);
+	if (found == g_lvd_devices.end()) return KERNEL_ERROR_ENOENT;
+	const int owner = found->second->owner_pid;
+	g_lvd_devices.erase(found);
+	LogLvdDetach(Process::GetPid(), owner, request.unit);
+	return OK;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
+
+static int LvdIoctl(uint64_t request, void* arg) {
+	if (request == 0xc0286d00u) return AttachLvd(arg);
+	if (request == 0xc0286d01u) return DetachLvd(arg);
+	return KERNEL_ERROR_ENOTTY;
+}
 
 static int ValidateLvdUfsPassthrough(const std::string& device) {
 	const auto lvd = FindLvdDevice(device);
@@ -1286,6 +1553,16 @@ static void FillExfatStat(const ExfatMount::NodeStat& node, FileStat* stat) {
 	stat->st_blksize = 512;
 }
 
+static int64_t TransferExfat(File* file, void* bytes, size_t length, uint64_t offset,
+                             bool sequential) {
+	if (!file->readable) return KERNEL_ERROR_EBADF;
+	if (file->directory) return KERNEL_ERROR_EISDIR;
+	if (length > 16 * 1024 * 1024) return KERNEL_ERROR_EINVAL;
+	if (!GuestSocketBufferAccessible(bytes, length, true)) return KERNEL_ERROR_EFAULT;
+	if (length) Memory::InvalidateMemory(reinterpret_cast<uint64_t>(bytes), length);
+	return sequential ? ExfatMount::Read(file->exfat, bytes, length)
+	                  : ExfatMount::Pread(file->exfat, bytes, length, offset);
+}
 
 static void FillBfsStat(const BfsMount::NodeStat& node, FileStat* stat) {
 	*stat            = {};
@@ -1317,8 +1594,18 @@ static void FillPassthroughStat(const DirectoryPassthrough::NodeStat& node, File
 	}
 }
 
+static bool IsExfatDescriptor(int descriptor) {
+	if (descriptor < DESCRIPTOR_MIN || g_files == nullptr) return false;
+	const auto* file = g_files->GetFile(descriptor);
+	return file != nullptr && file->opened && file->exfat != nullptr;
+}
 
 
+static bool IsLvdDescriptor(int descriptor) {
+	if (descriptor < DESCRIPTOR_MIN || g_files == nullptr) return false;
+	const auto* file = g_files->GetFile(descriptor);
+	return file != nullptr && file->opened && file->lvd != nullptr;
+}
 
 bool IsTmpfsDescriptor(int descriptor) {
 	if (descriptor < DESCRIPTOR_MIN || g_files == nullptr) return false;
@@ -1326,6 +1613,29 @@ bool IsTmpfsDescriptor(int descriptor) {
 	return file != nullptr && file->opened && file->tmpfs != nullptr;
 }
 
+static int64_t TransferSectorPayload(File* file, uint64_t offset, void* bytes, size_t length,
+                                     bool write) {
+	if (write ? !file->writable : !file->readable) return KERNEL_ERROR_EBADF;
+	if (length > 16 * 1024 * 1024) return KERNEL_ERROR_EINVAL;
+	const auto capacity    = file->sector_backing->Capacity();
+	const auto sector_size = file->sector_backing->SectorSize();
+	if (offset % sector_size || length % sector_size) return KERNEL_ERROR_EINVAL;
+	if (offset > capacity) return KERNEL_ERROR_EIO;
+	length = static_cast<size_t>(std::min<uint64_t>(length, capacity - offset));
+	if (!length) return 0;
+	if (!GuestSocketBufferAccessible(bytes, length, !write)) return KERNEL_ERROR_EFAULT;
+	if (!write) Memory::InvalidateMemory(reinterpret_cast<uint64_t>(bytes), length);
+	const auto result = write ? file->sector_backing->Write(offset, bytes, length)
+	                          : file->sector_backing->Read(offset, bytes, length);
+	switch (result) {
+		case SectorBacking::Result::Ok: return static_cast<int64_t>(length);
+		case SectorBacking::Result::Invalid: return KERNEL_ERROR_EINVAL;
+		case SectorBacking::Result::ReadOnly: return KERNEL_ERROR_EROFS;
+		case SectorBacking::Result::NoSpace: return KERNEL_ERROR_ENOSPC;
+		case SectorBacking::Result::Unsupported: return KERNEL_ERROR_ENOTSUP;
+		default: return KERNEL_ERROR_EIO;
+	}
+}
 
 static void ApplyIccnvs4NodeStat(FileStat* stat) {
 	stat->st_mode   = 0020000u | 0000640u;
@@ -2923,6 +3233,38 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		file->opened           = true;
 		return descriptor;
 	}
+	if (ExfatMount::Contains(path)) {
+		const int descriptor = g_files->CreateDescriptor();
+		auto*     file       = g_files->GetFile(descriptor);
+		const int result     = ExfatMount::Open(path, flags, &file->exfat);
+		if (result != OK) {
+			g_files->DeleteDescriptor(descriptor);
+			return result;
+		}
+		ExfatMount::NodeStat stat {};
+		const int            metadata = ExfatMount::Fstat(file->exfat, &stat);
+		if (metadata != OK) {
+			file->exfat.reset();
+			g_files->DeleteDescriptor(descriptor);
+			return metadata;
+		}
+		file->name             = path;
+		file->real_name        = Common::PathFromUtf8(path);
+		file->directory        = (stat.mode & 0170000u) == 0040000u;
+		file->readable         = true;
+		file->writable         = false;
+		file->descriptor_flags = (flags & 0x00100000) != 0 ? 1 : 0;
+		if (file->directory) {
+			const int entries = RefreshExfatDirectory(file);
+			if (entries != OK) {
+				file->exfat.reset();
+				g_files->DeleteDescriptor(descriptor);
+				return entries;
+			}
+		}
+		file->opened = true;
+		return descriptor;
+	}
 	if (Tmpfs::Contains(path)) {
 		const int descriptor = g_files->CreateDescriptor();
 		auto*     file       = g_files->GetFile(descriptor);
@@ -3041,11 +3383,42 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
-	file->name        = path;
-	file->readable    = rw_mode != Common::File::Mode::Write;
-	file->writable    = rw_mode != Common::File::Mode::Read;
-	file->append      = append;
-	file->sync_writes = fsync || sync || dsync;
+	file->name             = path;
+	file->readable         = rw_mode != Common::File::Mode::Write;
+	file->writable         = rw_mode != Common::File::Mode::Read;
+	file->append           = append;
+	file->sync_writes      = fsync || sync || dsync;
+	file->descriptor_flags = descriptor_flags;
+
+	if (!directory && file->name == "/dev/lvdctl") {
+		if (flags != 2 || mode != 0 || append || creat || trunc || excl || direct) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::LvdCtl;
+		file->opened    = true;
+		LOGF("LVD_CTL_OPEN guest_pid=%d fd=%d flags=0x%x\n", Process::GetPid(), descriptor, flags);
+		return descriptor;
+	}
+	if (!directory) {
+		if (auto lvd = FindLvdDevice(file->name)) {
+			if ((flags != 0 && flags != 2) || mode != 0 || append || creat || trunc || excl ||
+			    direct) {
+				g_files->DeleteDescriptor(descriptor);
+				return KERNEL_ERROR_EINVAL;
+			}
+			file->real_name       = file->name;
+			file->special         = SpecialFile::LvdDevice;
+			file->special_size    = lvd->capacity;
+			file->lvd             = std::move(lvd);
+			file->sector_position = 0;
+			file->opened          = true;
+			LOGF("LVD_DEVICE_OPEN guest_pid=%d fd=%d unit=%d access=%u capacity=0x%016" PRIx64 "\n",
+			     Process::GetPid(), descriptor, file->lvd->unit, flags_u, file->lvd->capacity);
+			return descriptor;
+		}
+	}
 
 	if (!directory && IsRandomDevice(file->name)) {
 		file->real_name = file->name;
@@ -3339,6 +3712,44 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	}
 
 	EXIT_IF(!file->opened);
+	if (file->exfat) {
+		const int result = ExfatMount::Close(file->exfat);
+		if (result != OK) return result;
+		file->opened = false;
+		g_files->DeleteDescriptor(d);
+		return OK;
+	}
+	if (file->bfs) {
+		const int result = BfsMount::Close(file->bfs);
+		if (result != OK) return result;
+		file->opened = false;
+		g_files->DeleteDescriptor(d);
+		return OK;
+	}
+	if (file->passthrough) {
+		const int result = DirectoryPassthrough::Close(file->passthrough);
+		if (result != OK) return result;
+		file->opened = false;
+		g_files->DeleteDescriptor(d);
+		return OK;
+	}
+	if (file->tmpfs) {
+		const int result = Tmpfs::Close(file->tmpfs);
+		if (result != OK) return result;
+		file->opened = false;
+		g_files->DeleteDescriptor(d);
+		return OK;
+	}
+
+	if (file->pipe != nullptr) {
+		std::lock_guard pipe_lock(file->pipe->mutex);
+		if (file->special == SpecialFile::PipeRead && file->pipe->readers != 0) {
+			--file->pipe->readers;
+		} else if (file->special == SpecialFile::PipeWrite && file->pipe->writers != 0) {
+			--file->pipe->writers;
+		}
+		file->pipe->cv.notify_all();
+	}
 
 	if (!file->directory && file->special == SpecialFile::None) {
 		file->f.Close();
@@ -3588,7 +3999,133 @@ struct NativeDceRegisterPayload {
 static_assert(sizeof(NativeDceRegisterPayload) == 0x30);
 static_assert(offsetof(NativeDceRegisterPayload, guest_data) == 0x10);
 
+// built at SysAv 0x464BE4..0x464C27; the returned 8-byte status doesn't depend on it
+struct NativeDceFlipPayload {
+	uint64_t zero0;
+	int64_t  buffer_index;
+	uint32_t flip_mode;
+	uint32_t shifted_flags;
+	int64_t  flip_arg;
+	uint64_t sequence;
+	uint32_t extended_flag;
+	uint32_t zero2c;
+	uint64_t extended_ptr;
+	uint64_t zero38;
+	uint64_t zero40;
+};
 
+int NativeDceClient::Ioctl(const NativeDceEnvelope& envelope) {
+	Common::LockGuard lock(mutex);
+	if (!live || pid != Process::GetPid() || cookie != envelope.display_id || display_handle < 0 ||
+	    display_generation == 0 ||
+	    VideoOut::VideoOutNativeGetHandleGeneration(display_handle) != display_generation) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (scope != nullptr) {
+		const int rc = scope->Validate(lease);
+		if (rc != OK) return rc;
+	}
+	if (envelope.command == 0x38) {
+		if (envelope.payload_size != 0x60 || envelope.index_or_zero != 0 ||
+		    envelope.result_addr != 0 || envelope.result_size != 0)
+			return KERNEL_ERROR_EINVAL;
+		if (!NativeDceReadable(envelope.payload_addr, 0x60) ||
+		    !NativeDceGuestFrameMapped(envelope.payload_addr, 0x60, false))
+			return KERNEL_ERROR_EFAULT;
+		if (attributes) return KERNEL_ERROR_EBUSY;
+		uint64_t original[12];
+		std::memcpy(original, reinterpret_cast<const void*>(envelope.payload_addr),
+		            sizeof(original));
+		const int rc = VideoOut::VideoOutNativeConfigureSplashAttributes(
+		    original, std::size(original), display_handle, display_generation);
+		if (rc != OK) return KERNEL_ERROR_EINVAL;
+		attributes = true;
+		LOGF("NATIVE_DCE_CLIENT_ATTRIBUTES_REGISTERED pid=%d cookie=0x%x group=0"
+		     " layout=linear format=0x8000000000000000 width=1920 height=1080 pitch=1920 "
+		     "bytes=0x7e9000\n",
+		     pid, cookie);
+		return OK;
+	}
+	if (envelope.command == 0x37) {
+		if (!attributes || envelope.payload_size != 0x30 ||
+		    envelope.index_or_zero >= buffers.size() || envelope.result_addr != 0 ||
+		    envelope.result_size != 0)
+			return KERNEL_ERROR_EINVAL;
+		if (!NativeDceReadable(envelope.payload_addr, sizeof(NativeDceRegisterPayload)) ||
+		    !NativeDceGuestFrameMapped(envelope.payload_addr, sizeof(NativeDceRegisterPayload),
+		                               false))
+			return KERNEL_ERROR_EFAULT;
+		NativeDceRegisterPayload payload;
+		std::memcpy(&payload, reinterpret_cast<const void*>(envelope.payload_addr),
+		            sizeof(payload));
+		if (payload.zero0 != 0 || payload.zero8 != 0 || payload.register_base_index != 0 ||
+		    payload.zero18 != 0 || payload.metadata != 0 || payload.zero28 != 0)
+			return KERNEL_ERROR_EINVAL;
+		if ((payload.guest_data & 0xffu) != 0 ||
+		    !NativeDceReadable(payload.guest_data, 0x7e9000, true) ||
+		    !NativeDceGuestFrameMapped(payload.guest_data, 0x7e9000))
+			return KERNEL_ERROR_EFAULT;
+		if (buffers[envelope.index_or_zero] != 0) return KERNEL_ERROR_EBUSY;
+		const int rc = VideoOut::VideoOutNativeRegisterSplashBuffer(
+		    &display_handle, static_cast<int>(envelope.index_or_zero), payload.guest_data,
+		    &display_generation);
+		if (rc != OK) return KERNEL_ERROR_EINVAL;
+		buffers[envelope.index_or_zero] = payload.guest_data;
+		LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_REGISTER_CONFIRMED cookie=0x%x index=%" PRIu64
+		     " guest_addr=0x%016" PRIx64 "\n",
+		     cookie, envelope.index_or_zero, payload.guest_data);
+		return OK;
+	}
+	if (envelope.command == 0x0a) {
+		if (envelope.payload_size != 0x80 || envelope.index_or_zero != 0 ||
+		    envelope.result_addr != 0 || envelope.result_size != 0)
+			return KERNEL_ERROR_EINVAL;
+		if (!NativeDceReadable(envelope.payload_addr, 0x80, true) ||
+		    !NativeDceGuestFrameMapped(envelope.payload_addr, 0x80))
+			return KERNEL_ERROR_EFAULT;
+		uint64_t status[16] {};
+		if (VideoOut::VideoOutNativeGetFlipStatus(display_handle, status, std::size(status),
+		                                          display_generation) != OK)
+			return KERNEL_ERROR_EINVAL;
+		Memory::InvalidateMemory(envelope.payload_addr, sizeof(status));
+		std::memcpy(reinterpret_cast<void*>(envelope.payload_addr), status, sizeof(status));
+		return OK;
+	}
+	if (envelope.command != 0x36 || !attributes || envelope.payload_size != 0x48 ||
+	    envelope.index_or_zero != 0 || envelope.result_size != 8)
+		return KERNEL_ERROR_EINVAL;
+	if (!NativeDceReadable(envelope.payload_addr, sizeof(NativeDceFlipPayload)) ||
+	    !NativeDceGuestFrameMapped(envelope.payload_addr, sizeof(NativeDceFlipPayload), false) ||
+	    !NativeDceReadable(envelope.result_addr, 8, true) ||
+	    !NativeDceGuestFrameMapped(envelope.result_addr, 8))
+		return KERNEL_ERROR_EFAULT;
+	NativeDceFlipPayload flip;
+	std::memcpy(&flip, reinterpret_cast<const void*>(envelope.payload_addr), sizeof(flip));
+	if (flip.zero0 != 0 || flip.buffer_index < 0 || flip.buffer_index >= 4 || flip.flip_mode != 1 ||
+	    flip.shifted_flags != 0 || flip.extended_flag != 0 || flip.zero2c != 0 ||
+	    flip.extended_ptr != 0 || flip.zero38 != 0 || flip.zero40 != 0 ||
+	    buffers[flip.buffer_index] == 0 ||
+	    (has_flip_sequence && flip.sequence <= last_flip_sequence))
+		return KERNEL_ERROR_EINVAL;
+	if (!NativeDceReadable(buffers[flip.buffer_index], 0x7e9000, true) ||
+	    !NativeDceGuestFrameMapped(buffers[flip.buffer_index], 0x7e9000))
+		return KERNEL_ERROR_EFAULT;
+	const int rc = VideoOut::VideoOutNativeSubmitSplashFlip(
+	    display_handle, static_cast<int>(flip.buffer_index), static_cast<int>(flip.flip_mode),
+	    flip.flip_arg, buffers[flip.buffer_index], display_generation);
+	if (rc != OK)
+		return rc == VideoOut::VIDEO_OUT_ERROR_INVALID_VALUE ? KERNEL_ERROR_EINVAL
+		                                                     : KERNEL_ERROR_EBUSY;
+	last_flip_sequence    = flip.sequence;
+	has_flip_sequence     = true;
+	const uint64_t result = 0;
+	Memory::InvalidateMemory(envelope.result_addr, sizeof(result));
+	std::memcpy(reinterpret_cast<void*>(envelope.result_addr), &result, sizeof(result));
+	LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_FLIP_ACCEPTED cookie=0x%x index=%" PRId64
+	     " guest_addr=0x%016" PRIx64 " sequence=%" PRIu64 " presentation=async\n",
+	     cookie, flip.buffer_index, buffers[flip.buffer_index], flip.sequence);
+	return OK;
+}
 
 // SysAv 0x476A4F..0x476A86: 0x28-byte in/out for /dev/dmem[0..2] ioctl 0xC0288001, qword 0 returns
 // the address
@@ -3647,6 +4184,98 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		const auto result = ::Libs::Network::Net::Ioctl(d, request, arg);
+		return (result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr()));
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (file->special == SpecialFile::LvdCtl) return LvdIoctl(request, arg);
+	if (file->special == SpecialFile::LvdDevice) {
+		if (!file->lvd) return KERNEL_ERROR_ENXIO;
+		if (request == 0x40046480u) {
+			return Memory::CopyToGuest(arg, &file->lvd->sector_size, sizeof(file->lvd->sector_size))
+			           ? OK
+					   : KERNEL_ERROR_EFAULT;
+		}
+		if (request == 0x40086481u) {
+			return Memory::CopyToGuest(arg, &file->lvd->capacity, sizeof(file->lvd->capacity))
+			           ? OK
+					   : KERNEL_ERROR_EFAULT;
+		}
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->sector_backing) {
+		const size_t size = request == 0x40046480u   ? sizeof(uint32_t)
+		                    : request == 0x40086481u ? sizeof(uint64_t)
+		                                             : 0;
+		if (!size) return KERNEL_ERROR_ENOTTY;
+		if (!GuestSocketBufferAccessible(arg, size, true)) return KERNEL_ERROR_EFAULT;
+		const uint64_t value =
+		    size == 4 ? file->sector_backing->SectorSize() : file->sector_backing->Capacity();
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), size);
+		std::memcpy(arg, &value, size);
+		return OK;
+	}
+
+	// runs on the small guest stack, fmt::sprintf can overflow it
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
+	    std::getenv("KYTY_DIAGNOSTIC_VERBOSE_KERNEL_IOCTL_LOG") != nullptr) {
+		LOGF("\t device = %s\n\t request = 0x%08" PRIx64 "\n\t arg = 0x%016" PRIx64 "\n",
+		     file->name.c_str(), request, reinterpret_cast<uint64_t>(arg));
+	}
+	if (file->special == SpecialFile::NativeS3da) {
+		LOGF("S3DA_DEVICE_IOCTL_UNSUPPORTED guest_pid=%d fd=%d request=0x%08" PRIx64
+		     " arg=0x%016" PRIx64 " error=ENOTTY\n",
+		     Process::GetPid(), d, request, reinterpret_cast<uint64_t>(arg));
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::GcDiagnostic) {
+		if (request != 0xc0048118u && request != 0xc004812eu) {
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_GC_UNKNOWN_IOCTL request=0x%08" PRIx64 "\n",
+			     request);
+			return KERNEL_ERROR_ENOTTY;
+		}
+		if (arg == nullptr) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		auto* value = static_cast<uint32_t*>(arg);
+		if (*value != 0) {
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_GC_STATUS_NONZERO value=0x%08" PRIx32 "\n", *value);
+			return KERNEL_ERROR_EINVAL;
+		}
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(uint32_t));
+		*value = 0;
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_GC_STATUS_IOCTL request=0x%08" PRIx64
+		     " input=0 output=0\n",
+		     request);
+		return OK;
+	}
+
+	if (file->special == SpecialFile::Npdrm) {
+		if (request == 0xc0044e05u) {
+			if (arg == nullptr) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(uint32_t));
+			*static_cast<uint32_t*>(arg) = 0;
+			return OK;
+		}
+		return KERNEL_ERROR_ENOTTY;
+	}
+
+	if (file->special != SpecialFile::Dipsw) {
+		return KERNEL_ERROR_ENOTTY;
+	}
+
+	if (request == 0x20008800u) {
+		return OK;
+	}
+
 	if (request == 0xc0088803u) {
 		if (arg == nullptr) {
 			return KERNEL_ERROR_EFAULT;
@@ -4173,6 +4802,33 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	if (file->iccnvs4_snapshot && whence == 2) return KERNEL_ERROR_ENOTSUP;
 
 	EXIT_IF(!file->opened);
+	if (file->sector_backing) {
+		Common::LockGuard lock(file->mutex);
+		const auto        base = whence == 0   ? 0
+		                         : whence == 1 ? file->sector_position
+		                                       : file->sector_backing->Capacity();
+		if (whence < 0 || whence > 2 ||
+		    (offset >= 0 &&
+		     static_cast<uint64_t>(offset) > file->sector_backing->Capacity() - base))
+			return KERNEL_ERROR_EINVAL;
+		const uint64_t distance = uint64_t {0} - static_cast<uint64_t>(offset);
+		if (offset < 0 && distance > base) return KERNEL_ERROR_EINVAL;
+		file->sector_position = offset < 0 ? base - distance : base + static_cast<uint64_t>(offset);
+		return static_cast<int64_t>(file->sector_position);
+	}
+	if (file->lvd) {
+		Common::LockGuard lock(file->mutex);
+		const auto        base = whence == 0   ? 0
+		                         : whence == 1 ? file->sector_position
+		                                       : file->lvd->capacity;
+		if (whence < 0 || whence > 2 || base > file->lvd->capacity ||
+		    (offset >= 0 && static_cast<uint64_t>(offset) > file->lvd->capacity - base))
+			return KERNEL_ERROR_EINVAL;
+		const uint64_t distance = uint64_t {0} - static_cast<uint64_t>(offset);
+		if (offset < 0 && distance > base) return KERNEL_ERROR_EINVAL;
+		file->sector_position = offset < 0 ? base - distance : base + static_cast<uint64_t>(offset);
+		return static_cast<int64_t>(file->sector_position);
+	}
 
 	if (file->special != SpecialFile::None && !file->tmpfs) {
 		return KERNEL_ERROR_ESPIPE;
@@ -4390,6 +5046,65 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	LOGF("\tKernelFstat: %s\n", EscapeLogPath(file->real_name).c_str());
 
+	if (file->tmpfs) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Tmpfs::NodeStat stat {};
+		const int       result = Tmpfs::Fstat(file->tmpfs, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillTmpfsStat(stat, sb);
+		return OK;
+	}
+	if (file->exfat) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		ExfatMount::NodeStat stat {};
+		const int            result = ExfatMount::Fstat(file->exfat, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillExfatStat(stat, sb);
+		return OK;
+	}
+	if (file->bfs) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		BfsMount::NodeStat stat {};
+		const int          result = BfsMount::Fstat(file->bfs, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillBfsStat(stat, sb);
+		return OK;
+	}
+	if (file->passthrough) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		DirectoryPassthrough::NodeStat stat {};
+		const int result = DirectoryPassthrough::Fstat(file->passthrough, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillPassthroughStat(stat, sb);
+		return OK;
+	}
+	if (file->sector_backing) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillSectorPayloadStat(sb);
+		return OK;
+	}
+	if (file->special == SpecialFile::LvdCtl || file->special == SpecialFile::LvdDevice) {
+		FileStat stat {};
+		FillLvdStat(&stat, file->special == SpecialFile::LvdDevice);
+		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
+	}
+	if (file->data_topology) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillDataTopologyStat(sb);
+		return OK;
+	}
+	if (file->devfs_root) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillDevfsRootStat(sb);
+		return OK;
+	}
 	FileStat stat {};
 	const bool original_iccnvs4 = file->iccnvs4_snapshot;
 	if (file->special == SpecialFile::SharedMemory && file->anonymous_shared) {

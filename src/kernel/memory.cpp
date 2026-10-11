@@ -220,6 +220,7 @@ public:
 		int              memory_type    = 0;
 		VirtualRangeType type           = VirtualRangeType::Reserved;
 		bool             disallow_merge = false;
+		uint64_t              owner_token    = 0;
 		char             name[KERNEL_MAXIMUM_NAME_LENGTH];
 	};
 
@@ -2649,6 +2650,19 @@ int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int pr
 	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
+bool OwnsFlexibleMemory(uint64_t address, size_t len, uint64_t token) {
+	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+	std::vector<VirtualRanges::Range>     ranges;
+	return token != 0 && g_virtual_ranges->QuerySpan(address, len, &ranges) &&
+	       std::all_of(ranges.begin(), ranges.end(), [token](const auto& range) {
+		       return range.type == VirtualRangeType::Flexible && range.owner_token == token;
+	       });
+}
+int UnmapOwnedFlexibleMemory(uint64_t address, size_t len, uint64_t token) {
+	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+	return OwnsFlexibleMemory(address, len, token) ? KernelMunmap(address, len)
+	                                               : KERNEL_ERROR_ENOENT;
+}
 static ScopeMemory::SharedObject* FindScopeSharedMemory(const char* name) {
 	for (uint32_t i = 0; i < g_scope_memory->shared_count; i++) {
 		auto& shared = g_scope_memory->shared[i];

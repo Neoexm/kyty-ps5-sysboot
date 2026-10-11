@@ -8,6 +8,7 @@
 #include <string>
 
 namespace Libs::LibKernel {
+
 class SectorBacking {
 public:
 	enum class Result { Ok, Invalid, Io, MissingData, ReadOnly, NoSpace, Unsupported };
@@ -43,5 +44,6 @@ private:
 	explicit SectorBacking(std::unique_ptr<State> state);
 	std::unique_ptr<State> m_state;
 };
+
 } // namespace Libs::LibKernel
 #endif

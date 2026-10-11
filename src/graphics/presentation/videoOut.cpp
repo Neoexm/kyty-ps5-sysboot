@@ -18,6 +18,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
@@ -25,8 +26,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <fmt/format.h>
+#include <limits>
 #include <list>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -191,6 +195,9 @@ struct VideoOutConfig {
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
+	bool                                native_signal_active            = false;
+	std::array<uint64_t, 12>            native_splash_attribute_record {};
+	bool                                native_splash_attributes_programmed = false;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
 	VideoOutVblankStatus                pre_vblank_status;
@@ -199,6 +206,8 @@ struct VideoOutConfig {
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
 };
 
+
+enum class VideoOutCloseMode { Direct, User, Native, NativeClient };
 class FlipQueue {
 public:
 	explicit FlipQueue(Graphics::Presenter& presenter): m_presenter(presenter) {
@@ -215,7 +224,7 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	void Wait(VideoOutConfig& cfg, int index);
+	void Wait(VideoOutConfig& cfg, int index, uint64_t generation = 0);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -262,8 +271,9 @@ public:
 	~Impl();
 	KYTY_CLASS_NO_COPY(Impl);
 
-	int             Open(int bus_type, int index);
-	bool            Close(int handle);
+	int  Open(int bus_type, int index, bool native_adapter = false, uint64_t* generation = nullptr);
+	bool Close(int handle, uint64_t expected_generation = 0,
+	           VideoOutCloseMode mode = VideoOutCloseMode::Direct);
 	VideoOutConfig* Get(int handle);
 	VideoOutConfig* Get(int handle, uint64_t& generation);
 	bool            IsOpened(int handle);
@@ -287,6 +297,11 @@ private:
 };
 
 static std::unique_ptr<VideoOutDriver> g_video_out_driver;
+static std::atomic_bool                                g_video_out_ready {false};
+
+bool VideoOutIsInitialized() noexcept {
+	return g_video_out_ready.load(std::memory_order_acquire);
+}
 
 static VideoOutDriver::Impl& DriverState() {
 	EXIT_IF(g_video_out_driver == nullptr);
@@ -648,7 +663,7 @@ void VideoOutDriver::Impl::Init(uint32_t width, uint32_t height) {
 	}
 }
 
-int VideoOutDriver::Impl::Open(int bus_type, int index) {
+int VideoOutDriver::Impl::Open(int bus_type, int index, bool native_adapter, uint64_t* generation) {
 	const auto bus = std::find(VIDEO_OUT_BUSES.begin(), VIDEO_OUT_BUSES.end(), bus_type);
 	if (bus == VIDEO_OUT_BUSES.end()) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
@@ -695,7 +710,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	return handle;
 }
 
-bool VideoOutDriver::Impl::Close(int handle) {
+bool VideoOutDriver::Impl::Close(int handle, uint64_t expected_generation, VideoOutCloseMode mode) {
 	Common::LockGuard lock(m_mutex);
 
 	if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !m_video_out_ctx[handle].opened) {
@@ -1185,7 +1200,7 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
-void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
+void FlipQueue::Wait(VideoOutConfig& cfg, int index, uint64_t generation) {
 	Common::LockGuard lock(m_mutex);
 
 	auto has_request = [this, &cfg, index] {
@@ -1311,10 +1326,13 @@ KYTY_SYSV_ABI void VideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* at
 KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
 	PRINT_NAME();
 
+static int OpenVideoOut(int user_id, int bus_type, int index, const void* param,
+                        uint64_t* generation, bool native_client = false) {
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
 	return DriverState().Open(bus_type, index);
+}
 }
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {
@@ -1355,6 +1373,188 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
 	attribute->dcc_control                 = dcc_control;
 }
 
+static int RegisterBuffersWithGeneration(int handle, int set_index, int buffer_index_start,
+                                         const VideoOutBuffers* buffers, int buffer_num,
+                                         const VideoOutBufferAttribute2* attribute, int category,
+                                         void* option, uint64_t expected_generation);
+static int SubmitFlipWithGeneration(int handle, int index, int flip_mode, int64_t flip_arg,
+                                    uint64_t expected_generation);
+uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle) {
+	if (!VideoOutIsInitialized()) return 0;
+	uint64_t generation = 0;
+	return DriverState().Get(native_display_handle, generation) != nullptr ? generation : 0;
+}
+int VideoOutNativeConfigureSplashAttributes(const uint64_t* original_words,
+                                            size_t original_word_count, int handle,
+                                            uint64_t expected_generation) {
+	// DCE cmd 0x38 from sceVideoOutRegisterBuffers2, layout only; backing comes in a later command
+	static constexpr uint64_t exact_original[12] = {0x0000000000000000ull,
+	                                                0x8000000000000000ull,
+	                                                0x0000078000000000ull,
+	                                                0x0000043800000780ull,
+	                                                0xffffffff00000000ull,
+	                                                0x00000000ffffffffull,
+	                                                0x8000000000000000ull,
+	                                                0,
+	                                                0,
+	                                                0,
+	                                                0,
+	                                                0};
+	if (!VideoOutIsInitialized() || original_words == nullptr ||
+	    original_word_count != std::size(exact_original) ||
+	    std::memcmp(original_words, exact_original, sizeof(exact_original)) != 0) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	uint64_t generation = 0;
+	auto*    ctx        = DriverState().Get(handle, generation);
+	if (ctx == nullptr || (expected_generation != 0 && generation != expected_generation))
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	Common::LockGuard lock(ctx->mutex);
+	if (!ctx->opened || ctx->closing || !ctx->native_signal_active ||
+	    ctx->generation != generation || ctx->native_splash_attributes_programmed) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	std::copy_n(original_words, original_word_count, ctx->native_splash_attribute_record.begin());
+	ctx->native_splash_attributes_programmed = true;
+	LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_ATTRIBUTES_PROGRAMMED"
+	     " handle=%d generation=%" PRIu64 " source=DCE_command0x38"
+	     " width=1920 height=1080 format=0x8000000000000000 record_bytes=96\n",
+	     handle, generation);
+	return OK;
+}
+int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_index,
+                                       uint64_t  original_guest_address,
+                                       uint64_t* native_display_generation) {
+	constexpr uint64_t format = 0x8000000000000000ull;
+	if (native_display_handle == nullptr || !VideoOutIsInitialized() || buffer_index < 0 ||
+	    buffer_index >= 4 || original_guest_address == 0 || (original_guest_address & 0xffu) != 0) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	bool     opened_here = false;
+	int      handle      = *native_display_handle;
+	uint64_t generation  = handle < 0 ? 0 : VideoOutNativeGetHandleGeneration(handle);
+	if (handle >= 0 && (generation == 0 || (native_display_generation != nullptr &&
+	                                        *native_display_generation != generation))) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_NATIVE_SPLASH_ATTR_96") != nullptr) {
+		auto* ctx = DriverState().Get(1);
+		if (ctx == nullptr) return VIDEO_OUT_ERROR_INVALID_HANDLE;
+		Common::LockGuard lock(ctx->mutex);
+		if (!ctx->native_splash_attributes_programmed) {
+			return VIDEO_OUT_ERROR_INVALID_VALUE;
+		}
+	}
+	if (handle < 0) {
+		handle = OpenVideoOut(0, VIDEO_OUT_BUS_TYPE_MAIN, 0, nullptr, &generation);
+		if (handle < 0) {
+			return handle;
+		}
+		opened_here = true;
+	}
+	VideoOutBufferAttribute2 attr {};
+	VideoOutSetBufferAttribute2(&attr, format, 1, 1920, 1080, 0, 0, 0);
+	VideoOutBuffers buffer {};
+	buffer.data = reinterpret_cast<const void*>(original_guest_address);
+	// one index at a time, so one attribute group each
+	const int rc = RegisterBuffersWithGeneration(
+	    handle, buffer_index, buffer_index, &buffer, 1, &attr,
+	    VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED, nullptr, generation);
+	if (rc != OK) {
+		if (opened_here) {
+			(void)DriverState().Close(handle, generation, VideoOutCloseMode::User);
+		}
+		return rc;
+	}
+	*native_display_handle = handle;
+	if (native_display_generation != nullptr) *native_display_generation = generation;
+	LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_BUFFER_REGISTER"
+	     " local_handle=%d index=%d guest_addr=0x%016" PRIx64 "\n",
+	     handle, buffer_index, original_guest_address);
+	return OK;
+}
+void VideoOutNativeReleaseClientHandle(int* handle, uint64_t expected_generation) {
+	if (handle == nullptr || *handle < 0) return;
+	if (VideoOutIsInitialized() && expected_generation != 0)
+		(void)DriverState().Close(*handle, expected_generation, VideoOutCloseMode::NativeClient);
+	*handle = -1;
+}
+int VideoOutNativeSubmitSplashFlip(int native_display_handle, int buffer_index, int flip_mode,
+                                   int64_t flip_arg, uint64_t original_guest_address,
+                                   uint64_t expected_generation) {
+	if (!VideoOutIsInitialized() || native_display_handle < 0 || buffer_index < 0 ||
+	    buffer_index >= 4 || flip_mode != VIDEO_OUT_FLIP_MODE_VSYNC ||
+	    original_guest_address == 0 || (original_guest_address & 0xffu) != 0) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	// splash cycles 0..3; wait out a flip of the same index still in flight
+	uint64_t generation = 0;
+	auto*    ctx        = DriverState().Get(native_display_handle, generation);
+	if (ctx == nullptr || (expected_generation != 0 && expected_generation != generation)) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	DriverState().GetFlipQueue().Wait(*ctx, buffer_index, generation);
+	if (VideoOutNativeGetHandleGeneration(native_display_handle) != generation) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	// fade renderer writes from the CPU and CLFLUSHes before the flip. The range may be untracked
+	// (uploads can stage straight from guest memory), so then invalidate both caches directly
+	auto& renderer = g_video_out_driver->State().Renderer();
+	if (!renderer.InvalidateMemory(original_guest_address, 0x7e9000)) {
+		renderer.GetBufferCache().InvalidateMemory(original_guest_address, 0x7e9000);
+		renderer.GetTextureCache().InvalidateMemory(original_guest_address, 0x7e9000);
+		LOGF("FIRST_FRAME_AUDIT SYSAV_GUEST_FLIP_UNTRACKED_GPU_RANGE"
+		     " index=%d guest_addr=0x%016" PRIx64 " bytes=0x7e9000 cache_aliases_invalidated\n",
+		     buffer_index, original_guest_address);
+	}
+	const int rc = SubmitFlipWithGeneration(native_display_handle, buffer_index, flip_mode,
+	                                        flip_arg, generation);
+	if (rc == OK) {
+		LOGF("FIRST_FRAME_AUDIT SYSAV_GUEST_FLIP_QUEUED"
+		     " local_handle=%d index=%d mode=%d arg=%" PRId64 "\n",
+		     native_display_handle, buffer_index, flip_mode, flip_arg);
+	}
+	return rc;
+}
+int VideoOutNativeGetFlipStatus(int native_display_handle, uint64_t* original_words,
+                                size_t original_word_count, uint64_t expected_generation) {
+	if (!VideoOutIsInitialized() || original_words == nullptr || original_word_count != 16) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	uint64_t generation = 0;
+	auto*    ctx        = DriverState().Get(native_display_handle, generation);
+	if (ctx == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	Common::LockGuard lock(ctx->mutex);
+	if (!ctx->opened || ctx->closing || ctx->bus != VIDEO_OUT_BUS_TYPE_MAIN ||
+	    ctx->generation != generation ||
+	    (expected_generation != 0 && expected_generation != generation)) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	const auto& status = ctx->flip_status;
+	if (status.gcQueueNum < 0 || status.flipPendingNum < status.gcQueueNum) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	std::array<uint64_t, 16> words {};
+	words[0] = static_cast<uint64_t>(status.flipArg);
+	words[2] = status.count;
+	words[3] = status.processTime;
+	words[4] = status.reserved0;
+	words[5] = static_cast<uint32_t>(status.currentBuffer) |
+	           (static_cast<uint64_t>(status.flipPendingNum - status.gcQueueNum) << 32);
+	words[6] = static_cast<uint32_t>(status.gcQueueNum);
+	words[7] = status.reserved1;
+	words[8] = status.processTimeCounter;
+	words[9] = status.submitProcessTimeCounter;
+	std::copy(words.begin(), words.end(), original_words);
+	LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_FLIP_STATUS"
+	     " local_handle=%d completed=%" PRIu64 " flip_arg=%" PRId64
+	     " current_buffer=%d pending=%d gpu_pending=%d wire_layout=0x462f80\n",
+	     native_display_handle, status.count, status.flipArg, status.currentBuffer,
+	     status.flipPendingNum, status.gcQueueNum);
+	return OK;
+}
 KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
@@ -1418,9 +1618,15 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
                                            const VideoOutBufferAttribute2* attribute, int category,
                                            void* option) {
 	PRINT_NAME();
+}
 
-	auto* ctx = DriverState().Get(handle);
-	if (ctx == nullptr) {
+static int RegisterBuffersWithGeneration(int handle, int set_index, int buffer_index_start,
+                                         const VideoOutBuffers* buffers, int buffer_num,
+                                         const VideoOutBufferAttribute2* attribute, int category,
+                                         void* option, uint64_t expected_generation) {
+	uint64_t generation = 0;
+	auto*    ctx        = DriverState().Get(handle, generation);
+	if (ctx == nullptr || (expected_generation != 0 && generation != expected_generation)) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
@@ -1583,7 +1789,10 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+}
 
+static int SubmitFlipWithGeneration(int handle, int index, int flip_mode, int64_t flip_arg,
+                                    uint64_t expected_generation) {
 	uint64_t  request_id = 0;
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
 	                                          FlipRequestSource::Cpu, request_id);

@@ -56,6 +56,7 @@ bool Overlaps(const std::string& path);
 int  ValidateTraversal(const std::string& path);
 int  Close(std::shared_ptr<Handle>& handle);
 int  Stat(const std::string& path, NodeStat* stat);
+int  Fstat(const std::shared_ptr<Handle>& handle, NodeStat* stat);
 int64_t Pread(const std::shared_ptr<Handle>& handle, void* data, size_t length, uint64_t offset);
 int64_t Seek(const std::shared_ptr<Handle>& handle, int64_t offset, int whence);
 int     Truncate(const std::shared_ptr<Handle>& handle, uint64_t length);

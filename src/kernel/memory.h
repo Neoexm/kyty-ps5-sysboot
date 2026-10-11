@@ -18,6 +18,7 @@ class AnonymousSharedMemory;
 void Initialize();
 void Shutdown();
 
+int  UnmapOwnedFlexibleMemory(uint64_t address, size_t len, uint64_t token);
 struct Lifecycle {
 	static constexpr const char* name       = "Memory";
 	static constexpr auto        initialize = Libs::LibKernel::Memory::Initialize;

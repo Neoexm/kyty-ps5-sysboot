@@ -368,7 +368,7 @@ function(add_kyty_full_emulator_test target source)
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
-		target_link_libraries(${target} iphlpapi)
+		target_link_libraries(${target} iphlpapi advapi32 bcrypt)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
@@ -390,6 +390,49 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_executable(auth_info_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AuthInfoTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/authInfo.cpp")
+target_include_directories(auth_info_tests PRIVATE ${inc_headers})
+
+add_executable(auth_info_capture_tool EXCLUDE_FROM_ALL
+	"${KYTY_SOURCE_DIR}/tools/authInfoCaptureTool.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/authInfo.cpp")
+target_include_directories(auth_info_capture_tool PRIVATE ${inc_headers})
+if(WIN32)
+	target_link_libraries(auth_info_capture_tool advapi32 bcrypt)
+endif()
+add_dependencies(auth_info_tests auth_info_capture_tool)
+if(BUILD_TESTING)
+	add_test(NAME auth_info COMMAND $<TARGET_FILE:auth_info_tests>
+		$<TARGET_FILE:auth_info_capture_tool>)
+endif()
+
+add_executable(reboot_dispatch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RebootDispatchTests.cpp")
+target_include_directories(reboot_dispatch_tests PRIVATE ${inc_headers})
+if(BUILD_TESTING)
+	add_test(NAME reboot_dispatch COMMAND $<TARGET_FILE:reboot_dispatch_tests>)
+endif()
+
+add_executable(ox_partition_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/OxPartitionTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/oxPartition.cpp")
+target_include_directories(ox_partition_tests PRIVATE ${inc_headers})
+if(BUILD_TESTING)
+	add_test(NAME ox_partition COMMAND $<TARGET_FILE:ox_partition_tests>)
+endif()
+
+add_executable(ipmi_manager_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/IpmiManagerTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/authInfo.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/ipmiManager.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/ipmiScope.cpp")
+target_link_libraries(ipmi_manager_tests fmt::fmt)
+target_include_directories(ipmi_manager_tests PRIVATE ${inc_headers})
+if(BUILD_TESTING)
+	add_test(NAME ipmi_manager COMMAND $<TARGET_FILE:ipmi_manager_tests>)
+endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -534,17 +577,55 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
-add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
-	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
-)
-target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
-target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
+add_kyty_full_emulator_test(event_queue_lifetime_tests
+	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp")
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
 target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
+if (WIN32)
+	target_link_libraries(kernel_file_system_tests ws2_32)
+endif()
+target_compile_definitions(kernel_file_system_tests PRIVATE
+	KYTY_SHM_ANON_TESTS=1
+	KYTY_ENVELOPE_SECURE_PROCESSOR_TESTS=1
+	KYTY_PSM_SHELLUI_APPLICATION_ROUTE_TESTS=1)
+
+add_executable(sector_backing_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SectorBackingTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/sectorBacking.cpp")
+target_include_directories(sector_backing_tests PRIVATE ${inc_headers})
+target_compile_definitions(sector_backing_tests PRIVATE KYTY_SECTOR_BACKING_TESTING)
+if(WIN32)
+	target_link_libraries(sector_backing_tests bcrypt)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME sector_backing COMMAND $<TARGET_FILE:sector_backing_tests>)
+endif()
+
+add_executable(exfat_volume_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExfatVolumeTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/exfatVolume.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/sectorBacking.cpp")
+target_include_directories(exfat_volume_tests PRIVATE ${inc_headers})
+if(WIN32)
+	target_link_libraries(exfat_volume_tests bcrypt)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME exfat_volume COMMAND $<TARGET_FILE:exfat_volume_tests>)
+endif()
+
+add_executable(bfs_volume_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BfsVolumeTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/bfsVolume.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/sectorBacking.cpp")
+target_include_directories(bfs_volume_tests PRIVATE ${inc_headers})
+if(WIN32)
+	target_link_libraries(bfs_volume_tests bcrypt)
+endif()
+if(BUILD_TESTING)
+	add_test(NAME bfs_volume COMMAND $<TARGET_FILE:bfs_volume_tests>)
+endif()
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
@@ -697,6 +778,8 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		sector_backing_tests
+		exfat_volume_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
@@ -711,6 +794,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	if(WIN32)
+		add_dependencies(kyty_tests host_input_shared_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
@@ -746,10 +832,14 @@ if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)
 	target_link_libraries(kyty_emulator setupapi)
+	target_link_libraries(kyty_emulator advapi32)
+	target_link_libraries(kyty_emulator bcrypt)
 	target_link_libraries(kyty_emulator ws2_32)
 endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)
+	# Exec children append ".exec-<pid>-<token>.log" to the parent's log path per generation, which passes MAX_PATH and makes spdlog abort before the child can report anything.
+	target_sources(kyty_emulator PRIVATE "${KYTY_SOURCE_DIR}/kyty_emulator.manifest")
 endif()
 if (CLANG AND NOT KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator pthread)

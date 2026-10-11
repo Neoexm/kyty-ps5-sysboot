@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace Libs::LibKernel {
+
 class ExfatVolume {
 public:
 	enum class Result {
@@ -48,5 +49,6 @@ private:
 	explicit ExfatVolume(std::unique_ptr<State> state);
 	std::unique_ptr<State> m_state;
 };
+
 } // namespace Libs::LibKernel
 #endif

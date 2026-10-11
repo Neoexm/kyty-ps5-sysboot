@@ -7,6 +7,7 @@
 #include "common/abi.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <memory>
 
 namespace Libs::Graphics {
@@ -49,7 +50,24 @@ private:
 [[nodiscard]] VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height,
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
+bool                          VideoOutIsInitialized() noexcept;
+void VideoOutNativeReleaseClientHandle(int* handle, uint64_t expected_generation);
 
+uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle);
+// Backend 0, only for the linear 1920x1080 SceSysAvControlSplash buffers.
+int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_index,
+                                       uint64_t  original_guest_address,
+                                       uint64_t* native_display_generation = nullptr);
+// 96-byte command 0x38 format record, MAIN head
+int VideoOutNativeConfigureSplashAttributes(const uint64_t* original_words,
+                                            size_t original_word_count, int handle = 1,
+                                            uint64_t expected_generation = 0);
+// OK means queued, not presented.
+int  VideoOutNativeSubmitSplashFlip(int native_display_handle, int buffer_index, int flip_mode,
+                                    int64_t flip_arg, uint64_t original_guest_address,
+                                    uint64_t expected_generation = 0);
+int  VideoOutNativeGetFlipStatus(int native_display_handle, uint64_t* original_words,
+                                 size_t original_word_count, uint64_t expected_generation = 0);
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
 KYTY_SYSV_ABI int  VideoOutSetFlipMaster(int slave_handle, int master_handle);

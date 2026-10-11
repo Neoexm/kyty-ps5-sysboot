@@ -15,6 +15,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kernel/sectorBacking.h"
 #include "kytyGitVersion.h"
 #include "libs/agc.h"
 #include "libs/audio.h"
