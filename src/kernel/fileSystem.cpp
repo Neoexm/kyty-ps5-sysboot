@@ -67,8 +67,232 @@
 #include <sys/stat.h>
 #endif
 
+namespace Libs::Posix {
+int64_t KYTY_SYSV_ABI send(int s, const void* buf, uint64_t len, int flags);
+int64_t KYTY_SYSV_ABI recv(int s, void* buf, uint64_t len, int flags);
+int KYTY_SYSV_ABI     select(int nfds, void* readfds, void* writefds, void* exceptfds,
+                             const void* timeout);
+} // namespace Libs::Posix
 
 namespace Libs::LibKernel::FileSystem {
+
+static std::recursive_mutex g_mount_publication_mutex;
+
+
+static std::string EscapeLogPath(const char* path) {
+	return path != nullptr ? Log::EscapeField(path) : "(null)";
+}
+
+static std::string EscapeLogPath(const std::filesystem::path& path) {
+	return Log::EscapeField(Common::PathToString(path));
+}
+
+static int ValidateMountedTraversal(const std::string& path) {
+	NullfsMount::Resolution resolution;
+	const int               resolved = NullfsMount::Resolve(path, &resolution);
+	if (resolved != OK) return resolved;
+	const auto& actual    = resolution.mounted ? resolution.path : path;
+	const int   temporary = Tmpfs::ValidateTraversal(actual);
+	if (temporary != OK) return temporary;
+	const int exfat = ExfatMount::ValidateTraversal(actual);
+	if (exfat != OK) return exfat;
+	const int bfs = BfsMount::ValidateTraversal(actual);
+	return bfs != OK ? bfs : DirectoryPassthrough::ValidateTraversal(actual);
+}
+
+static int ValidateNullfsTraversal(const std::string& path) {
+	if (path.empty() || path[0] != '/') return OK;
+	if (path == "/") return OK;
+	if (path.back() != '/' && path.find("/.") == path.npos) return OK;
+	bool alias      = NullfsMount::Contains(path);
+	bool needs_walk = path.back() == '/';
+	for (size_t start = 1; start <= path.size();) {
+		const auto end  = path.find('/', start);
+		const auto part = path.substr(start, end == path.npos ? path.npos : end - start);
+		needs_walk |= part == "." || part == "..";
+		alias |= NullfsMount::Contains(path.substr(0, end));
+		if (end == path.npos) break;
+		start = end + 1;
+	}
+	if ((!alias && !CapturedRootMetadata::Enabled() &&
+	     !DirectoryPassthrough::Contains(path, true)) ||
+	    !needs_walk)
+		return OK;
+	const auto directory = [](const std::string& name) {
+		FileStat  stat {};
+		const int result = KernelStat(name.c_str(), &stat);
+		if (result != OK) return result;
+		return (stat.st_mode & 0170000u) == 0040000u ? OK : KERNEL_ERROR_ENOTDIR;
+	};
+	std::string walked = "/";
+	for (size_t start = 1; start <= path.size();) {
+		const auto end  = path.find('/', start);
+		const auto part = path.substr(start, end == path.npos ? path.npos : end - start);
+		if (!part.empty()) {
+			if (walked != "/") {
+				const int result = directory(walked);
+				if (result != OK) return result;
+			}
+			if (part == "..") {
+				const auto slash = walked.rfind('/');
+				walked.resize(slash == 0 ? 1 : slash);
+			} else if (part != ".") {
+				if (walked.size() > 1) walked += '/';
+				walked += part;
+			}
+		}
+		if (end == path.npos) break;
+		start = end + 1;
+	}
+	if (path.back() == '/' || path.ends_with("/.") || path.ends_with("/.."))
+		return directory(walked);
+	return OK;
+}
+
+static bool SpecialFinalComponent(const std::string& path) {
+	std::string_view value(path);
+	while (!value.empty() && value.back() == '/')
+		value.remove_suffix(1);
+	const auto slash = value.rfind('/');
+	if (slash != std::string_view::npos) value.remove_prefix(slash + 1);
+	return value == "." || value == "..";
+}
+
+struct DevfsInstance {
+	std::string point;
+	// inodes of the root listing's directories, in listing order
+	std::vector<uint32_t> directories;
+};
+
+static std::mutex                 g_devfs_instances_mutex;
+static std::vector<DevfsInstance> g_devfs_instances;
+
+static bool DevfsInstanceAt(const std::string& path, std::vector<uint32_t>* directories = nullptr) {
+	std::string normalized;
+	if (path.empty() || path[0] != '/' || Tmpfs::NormalizePath(path, &normalized) != OK)
+		return false;
+	std::lock_guard lock(g_devfs_instances_mutex);
+	for (const auto& instance: g_devfs_instances) {
+		if (instance.point != normalized) continue;
+		if (directories != nullptr) *directories = instance.directories;
+		return true;
+	}
+	return false;
+}
+
+static bool DevfsInstanceOverlaps(const std::string& normalized) {
+	std::lock_guard lock(g_devfs_instances_mutex);
+	return std::any_of(
+	    g_devfs_instances.begin(), g_devfs_instances.end(), [&](const auto& instance) {
+		    const auto& a =
+		        instance.point.size() <= normalized.size() ? instance.point : normalized;
+		    const auto& b =
+		        instance.point.size() <= normalized.size() ? normalized : instance.point;
+		    return b.starts_with(a) && (b.size() == a.size() || a == "/" || b[a.size()] == '/');
+	    });
+}
+
+// every devfs mount serves the same cdev set as /dev
+static void ResolveDevfsInstancePath(const char** path, std::string* storage) {
+	std::lock_guard lock(g_devfs_instances_mutex);
+	if (g_devfs_instances.empty()) return;
+	std::string normalized;
+	if (Tmpfs::NormalizePath(*path, &normalized) != OK) return;
+	for (const auto& instance: g_devfs_instances) {
+		const auto& point = instance.point;
+		if (normalized.size() > point.size() + 1 && normalized.starts_with(point) &&
+		    normalized[point.size()] == '/') {
+			*storage = "/dev" + normalized.substr(point.size());
+			*path    = storage->c_str();
+			return;
+		}
+	}
+}
+
+// PSM stand-ins in MountPoints::ResolvePath expect the empty-word namespace, so the word is dropped
+// only for their names
+static void StripPsmSandboxWord(const char** path, std::string* storage) {
+	const bool pe  = std::getenv("KYTY_DIAGNOSTIC_SONY_MSCORLIB_PE") != nullptr ||
+	                 std::getenv("KYTY_DIAGNOSTIC_SONY_MANAGED_PE_DIR") != nullptr;
+	const bool aot = std::getenv("KYTY_DIAGNOSTIC_PSM_NATIVE_AOT_MOUNT") != nullptr;
+	if (!pe && !aot) return;
+	const auto word = Process::GetExecChildSandboxWord();
+	if (word.empty()) return;
+	const std::string_view value(*path);
+	const auto             prefix = "/" + word + "/common_ex/lib/";
+	if (!value.starts_with(prefix)) return;
+	const auto rest = value.substr(prefix.size());
+	const bool mono = rest.starts_with("mono/2.1/") && rest.find('/', 9) == std::string_view::npos;
+	if (!((pe && rest.ends_with(".dll") && (mono || rest.find('/') == std::string_view::npos)) ||
+	      (aot && mono && rest.ends_with(".sprx"))))
+		return;
+	*storage = std::string(value.substr(word.size() + 1));
+	static std::atomic_uint32_t count {0};
+	if (count.fetch_add(1) < 24) {
+		LOGF("FIRST_FRAME_AUDIT PSM_SANDBOX_WORD_STRIP guest=%s diagnostic=%s NON_AUTHENTIC\n",
+		     Log::EscapeField(*path).c_str(), Log::EscapeField(*storage).c_str());
+	}
+	*path = storage->c_str();
+}
+
+static int ResolveNullfsPath(const char** path, std::string* storage,
+                             uint64_t* generation = nullptr, bool* mounted = nullptr,
+                             bool* read_only = nullptr) {
+	if (path == nullptr || *path == nullptr || storage == nullptr) return KERNEL_ERROR_EINVAL;
+	if (read_only != nullptr) *read_only = false;
+	StripPsmSandboxWord(path, storage);
+	if ((*path)[0] != '/') {
+		if (generation != nullptr) *generation = 0;
+		if (mounted != nullptr) *mounted = false;
+		return OK;
+	}
+	const int traversal = ValidateNullfsTraversal(*path);
+	if (traversal != OK) return traversal;
+	NullfsMount::Resolution resolution;
+	const int               result = NullfsMount::Resolve(*path, &resolution);
+	if (result != OK) return result;
+	if (generation != nullptr) *generation = resolution.generation;
+	if (mounted != nullptr) *mounted = resolution.mounted;
+	if (read_only != nullptr) *read_only = resolution.read_only;
+	if (resolution.mounted) {
+		*storage = std::move(resolution.path);
+		*path    = storage->c_str();
+	}
+	ResolveDevfsInstancePath(path, storage);
+	return OK;
+}
+
+// lookup() on an MNT_RDONLY mount: an existing last component fails DELETE/RENAME with EROFS and
+// CREATE with EEXIST, a missing one fails CREATE with EROFS only once its parent resolves to a
+// directory.
+static int NullfsReadOnlyLookup(const char* path, bool create) try {
+	FileStat  stat {};
+	const int found = KernelStat(path, &stat);
+	if (found == OK) return create ? KERNEL_ERROR_EEXIST : KERNEL_ERROR_EROFS;
+	if (found != KERNEL_ERROR_ENOENT || !create) return found;
+	std::string parent(path);
+	while (parent.size() > 1 && parent.back() == '/')
+		parent.pop_back();
+	const auto slash = parent.find_last_of('/');
+	if (slash == parent.npos) return KERNEL_ERROR_EROFS;
+	parent.resize(slash == 0 ? 1 : slash);
+	const int parent_found = KernelStat(parent.c_str(), &stat);
+	if (parent_found != OK) return parent_found;
+	return (stat.st_mode & 0170000u) == 0040000u ? KERNEL_ERROR_EROFS : KERNEL_ERROR_ENOTDIR;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
+
+static int ResolveInitialWorkingDirectoryPath(const char** path, std::string* storage) try {
+	if (path == nullptr || *path == nullptr || storage == nullptr) return KERNEL_ERROR_EINVAL;
+	if ((*path)[0] == '/' || (*path)[0] == '\0') return OK;
+	storage->assign(1, '/');
+	storage->append(*path);
+	*path = storage->c_str();
+	return OK;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
 
 LIB_NAME("libkernel", "libkernel");
 
@@ -116,6 +340,10 @@ enum class SpecialFile {
 };
 
 struct LvdDevice;
+
+
+// Shared by descriptor aliases. Bounded, writers block when full.
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 struct SharedGuestPipe {
 	static constexpr uint32_t capacity = 1024 * 1024;
@@ -140,6 +368,25 @@ struct SharedGuestPipe {
 	HANDLE      readable = nullptr;
 	HANDLE      writable = nullptr;
 	State*      state    = nullptr;
+
+	~SharedGuestPipe() {
+		if (state != nullptr) {
+			UnmapViewOfFile(state);
+		}
+		if (writable != nullptr) {
+			CloseHandle(writable);
+		}
+		if (readable != nullptr) {
+			CloseHandle(readable);
+		}
+		if (mutex != nullptr) {
+			CloseHandle(mutex);
+		}
+		if (mapping != nullptr) {
+			CloseHandle(mapping);
+		}
+	}
+
 	static uint64_t Created(HANDLE process) {
 		FILETIME start {}, end {}, kernel {}, user {};
 		if (!GetProcessTimes(process, &start, &end, &kernel, &user)) {
@@ -157,6 +404,8 @@ struct SharedGuestPipe {
 		return state->signature == magic && state->version == 1 && state->head < capacity &&
 		       state->size <= capacity;
 	}
+
+
 	static std::shared_ptr<SharedGuestPipe> Open(const std::string& name, bool create) {
 		if (!name.starts_with("Local\\KytyGuestPipe.") || name.size() > 160 ||
 		    name.find_first_not_of(
@@ -203,6 +452,7 @@ struct SharedGuestPipe {
 		ReleaseMutex(pipe->mutex);
 		return valid ? pipe : nullptr;
 	}
+
 	static std::shared_ptr<SharedGuestPipe> Create() {
 		static std::atomic_uint64_t sequence {0};
 		const auto                  name = std::string("Local\\KytyGuestPipe.") +
@@ -211,8 +461,10 @@ struct SharedGuestPipe {
 		                                   std::to_string(sequence.fetch_add(1));
 		return Open(name, true);
 	}
+
 };
 #endif
+
 struct GuestPipe {
 	std::mutex              mutex;
 	std::condition_variable cv;
@@ -223,18 +475,32 @@ struct GuestPipe {
 	std::shared_ptr<SharedGuestPipe> shared;
 #endif
 };
+
 struct GuestSocketReadSource {
 	explicit GuestSocketReadSource(std::shared_ptr<GuestPipe> queue): pipe(std::move(queue)) {}
 	std::mutex                 mutex;
 	bool                       closed = false;
 	std::shared_ptr<GuestPipe> pipe;
 };
+
+struct NativeMetadbgStream {
+	std::mutex              mutex;
+	std::condition_variable cv;
+	std::deque<uint8_t>     received;
+	bool                    shutting_down = false;
+};
+
+
+static std::shared_ptr<NativeMetadbgStream>   g_native_metadbg_stream;
+static std::shared_ptr<NativeSystemMbusState> g_native_system_mbus;
+
 class MountPoints {
 public:
 	struct MountPair {
 		std::filesystem::path dir;
 		std::string           point;
 		std::shared_ptr<Common::ArchiveReader> archive;
+		bool                                   read_only = false;
 	};
 
 	MountPoints() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -242,13 +508,22 @@ public:
 
 	KYTY_CLASS_NO_COPY(MountPoints);
 
-	void Mount(const std::filesystem::path& folder, const std::string& point);
+	void Mount(const std::filesystem::path& folder, const std::string& point,
+	           bool read_only = false);
+	bool IsReadOnly(const std::filesystem::path& path);
+	bool HasReadOnlyRoot();
+	bool HasNonRootMountForPath(const std::string& path);
+	bool GetMountDirectory(const std::string& point, std::filesystem::path* directory);
+	bool HasSubmount(const std::string& point);
 	void Umount(const std::string& folder_or_point);
 
 	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
+	std::vector<Common::File::DirEntry> DirectoryEntries(const std::string&           mounted_name,
+	                                                     const std::filesystem::path& directory);
 
 private:
 	std::vector<MountPair> m_mount_pairs;
+	std::vector<std::filesystem::path> m_read_only_roots;
 	Common::Mutex          m_mutex;
 };
 
@@ -263,6 +538,7 @@ struct NativeDceLeaseIdentity {
 	uint32_t reserved                                        = 0;
 	bool     operator==(const NativeDceLeaseIdentity&) const = default;
 };
+
 struct NativeDceScope {
 #if defined(_WIN32)
 	static constexpr uint64_t magic = 0x314543445954594bULL;
@@ -322,6 +598,7 @@ struct NativeDceScope {
 	static std::shared_ptr<NativeDceScope> Open(const std::string&) { return nullptr; }
 #endif
 };
+
 // devsoftc of /dev/devctl (subr_bus.c, K+0x2d58170) is one per kernel, so the single-open lease is
 // shared by the whole scope
 struct DevctlSoftc {
@@ -412,6 +689,27 @@ struct DevctlSoftc {
 	bool                                Set(bool, bool) { return false; }
 #endif
 };
+
+
+
+
+static bool EnvelopeDigestMatches(std::span<const uint8_t> plaintext, const uint8_t* expected) {
+	const auto digest    = AuthInfo::Sha256(plaintext.data(), plaintext.size());
+	uint8_t    different = 0;
+	for (size_t i = 0; i < digest.size(); i++)
+		different |= digest[i] ^ expected[i];
+	return different == 0;
+}
+
+
+
+struct NativeDceEnvelope;
+
+
+static std::mutex g_native_dce_client_mutex;
+static uint64_t g_native_dce_client_sequence = 1;
+
+
 struct File {
 	Common::File                        f;
 	std::string                         name;
@@ -423,37 +721,138 @@ struct File {
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
 	SpecialFile                         special;
+	int                                            descriptor_flags = 0;
+	uint64_t                                       special_size;
+	int                                            scope_shared;
+	bool                                           shared_mapped;
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
 	uint64_t                            dents_offset;
 	std::shared_ptr<GuestPipe>                     pipe;
+	std::shared_ptr<Memory::AnonymousSharedMemory> anonymous_shared;
 	std::shared_ptr<GuestPipe>                     socket_send;
 	std::shared_ptr<GuestSocketReadSource>         socket_read_source;
+	std::shared_ptr<SectorBacking>                 sector_backing;
 	std::shared_ptr<Tmpfs::Handle>                 tmpfs;
+	std::shared_ptr<ExfatMount::Handle>            exfat;
+	std::shared_ptr<BfsMount::Handle>              bfs;
+	std::shared_ptr<DirectoryPassthrough::Handle>  passthrough;
+	int32_t                                        hid_next_pad_handle   = 1;
+	uint32_t                                       hid_unknown_log_count = 0;
+	bool                                           data_topology          = false;
+	bool                                           devfs_root             = false;
+	uint64_t                                       sector_position        = 0;
+	bool                                           iccnvs4_snapshot       = false;
+	uint64_t                                       iccnvs4_snapshot_bytes = 0;
+	std::shared_ptr<SectorBacking>                 iccnvs4_backing;
+	int                                            native_dce_display_handle                = -1;
+	uint64_t                                       native_dce_display_generation            = 0;
+	uint32_t                                       native_dce_display_id                    = 0;
+	bool                                           native_dce_display_id_set                = false;
+	bool                                           native_dce_original_videoout_client_open = false;
+	uint64_t                                       native_dce_original_videoout_resource    = 0;
+	uint64_t                                       native_dce_buffers[4] {};
+	uint64_t                                       native_scanin_buffers[72] {};
+	uint64_t                                       native_scanin_base       = 0;
+	uint64_t                                       native_scanin_length     = 0;
+	bool                                           native_scanin_registered = false;
+	int                                            native_sshot_owner_pid   = 0;
+	bool                                           native_sshot_active      = false;
+	uint64_t                                       native_sshot_region      = 0;
+	uint32_t                                       native_sshot_size        = 0;
+	uint32_t                                       native_sshot_block_size  = 0;
+	uint32_t                                       native_sshot_value       = 0;
 };
 
 class FileDescriptors {
 public:
-	FileDescriptors() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~FileDescriptors() = default;
+	explicit FileDescriptors(bool child = false): m_explicit_standard(child) {
+		EXIT_NOT_IMPLEMENTED(!child && !Common::Thread::IsMainThread());
+	}
+	virtual ~FileDescriptors() { CloseAll(); }
 
 	KYTY_CLASS_NO_COPY(FileDescriptors);
 
 	int   CreateDescriptor();
+	bool  OpenStandardDeci(int fd);
+	int   OpenStandardConsole(int flags);
+	bool  HasStandardConsole(int fd);
+	void  BindStandardConsole(int fd);
+	bool  HasStandardDeci(int fd);
+	bool  CloseStandardDeci(int fd);
 	void  DeleteDescriptor(int d);
 	File* GetFile(int d);
 	File* GetFile(const std::filesystem::path& real_name);
 	void  CloseAll();
+	int  GetFlags(int fd);
+	int  SetFlags(int fd, int flags);
+	int  Export(std::string* manifest);
+	int  Import(const std::string& manifest);
+	bool HasExplicitStandardTable() const { return m_explicit_standard; }
 
 private:
 	std::vector<File*> m_files;
+	std::array<bool, 3>                                m_standard_deci {};
+	std::array<bool, 3>                                m_standard_console {};
+	std::array<int, 3>                                 m_standard_flags {};
+	bool                                               m_explicit_standard = false;
 	Common::Mutex      m_mutex;
 };
 
 static MountPoints*     g_mount_points = nullptr;
+static int              g_tmpfs_status = KERNEL_ERROR_ENOSYS;
+// ShellCore mkdirs nobackup/temp 0777 with no chmod and it ends up 040777, so umask 0
+static std::atomic<int>                                                    g_creation_mask {0};
+static std::mutex                                                          g_sector_payload_mutex;
+static std::vector<std::pair<std::string, std::shared_ptr<SectorBacking>>> g_sector_payloads;
+static std::mutex g_passthrough_registration_mutex;
+struct PassthroughRegistration {
+	std::string           device;
+	std::filesystem::path supplied_root;
+	std::filesystem::path root;
+	std::string           identity;
+};
+struct PublishedReadOnlyProvider {
+	std::string device;
+	std::string point;
+};
+static std::vector<PassthroughRegistration>   g_passthrough_registrations;
+static std::vector<PublishedReadOnlyProvider> g_published_read_only_providers;
+
+struct LvdDevice {
+	int                                           unit        = -1;
+	int                                           owner_pid   = 0;
+	uint32_t                                      sector_size = 0;
+	uint32_t                                      granularity = 0;
+	uint64_t                                      capacity    = 0;
+	std::string                                   image_path;
+	std::shared_ptr<DirectoryPassthrough::Handle> backing;
+};
+
+static std::mutex                                          g_lvd_mutex;
+static std::unordered_map<int, std::shared_ptr<LvdDevice>> g_lvd_devices;
+
+
+static constexpr uint64_t A53_BD_RVLIST_CAPACITY   = 0x100000ull;
+static constexpr uint64_t A53_SWAP_CAPACITY        = 0x200000000ull;
+static constexpr uint64_t A53_SWAPX0_CAPACITY      = 0x1fff00000ull;
+static constexpr uint64_t A53_SWAPX1_CAPACITY      = 0x7fe00ull;
+static constexpr uint64_t A53_SWAPX2_CAPACITY      = 0x80000ull;
+// partition sizes from mini-syscore table 0x4c9710, standard variant; sub_428BD0 returns EINVAL on
+// a mismatch
+static constexpr uint64_t A53_SYSTEM_CAPACITY      = 0x28000000ull;
+static constexpr uint64_t A53_SYSTEM_EX_CAPACITY   = 0x60000000ull;
+static constexpr uint64_t A53_PREINST_CAPACITY     = 0x9400000ull;
+static constexpr uint64_t A53_APP_TEMP0_CAPACITY   = 0x40000000ull;
+static constexpr uint64_t A53_SYSTEM_DATA_CAPACITY = 0x200000000ull;
+static constexpr uint64_t A53_UPDATE_CAPACITY      = 0x100000000ull;
+static constexpr uint64_t A53_APP_SWAP_CAPACITY    = 0x380000000ull;
+static constexpr uint64_t A53_HIBERNATION_CAPACITY = 0xd8000000ull;
+
 static bool A53StorageEnabled() {
 	return std::getenv("KYTY_DIAGNOSTIC_A53_STORAGE") != nullptr;
 }
+
 static bool IsA53SsdDevice(const std::string& path) {
 	return path == "/dev/ssd0" || path == "/dev/ssd0.preinst" || path == "/dev/ssd0.system" ||
 	       path == "/dev/ssd0.system_b" || path == "/dev/ssd0.system_ex" ||
@@ -464,8 +863,27 @@ static bool IsA53SsdDevice(const std::string& path) {
 	       path == "/dev/ssd0.bd_rvlist" || path == "/dev/ssd0.swapx0" ||
 	       path == "/dev/ssd0.swapx1" || path == "/dev/ssd0.swapx2";
 }
+
+
+static std::shared_ptr<SectorBacking> FindSectorPayload(const std::string& device) {
+	const auto name = Common::PathToGenericString(
+	    Common::PathFromUtf8(Common::FixFilenameSlash(device)).lexically_normal());
+	std::lock_guard lock(g_sector_payload_mutex);
+	for (const auto& entry: g_sector_payloads)
+		if (entry.first == name) return entry.second;
+	return {};
+}
+
+static void FillSectorPayloadStat(FileStat* stat) {
+	*stat            = {};
+	stat->st_mode    = 0020640u;
+	stat->st_nlink   = 1;
+	stat->st_blksize = 16384u;
+}
+
 static FileDescriptors*              g_primary_files        = nullptr;
 static thread_local FileDescriptors* g_guest_files_override = nullptr;
+
 struct ActiveDescriptorDispatch {
 	FileDescriptors* operator->() const {
 		return g_guest_files_override ? g_guest_files_override : g_primary_files;
@@ -480,8 +898,33 @@ struct ActiveDescriptorDispatch {
 };
 static ActiveDescriptorDispatch g_files {};
 
+static std::mutex                 g_standard_pipe_mutex;
+static std::shared_ptr<GuestPipe> g_standard_pipes[3];
+static SpecialFile                g_standard_pipe_types[3] {};
+
+
+
+
+
+static std::atomic_bool g_diagnostic_gc_device_ready = false;
+static Common::Mutex    g_hmd_shm_mutex;
+static bool             g_hmd_shm_exists = false;
+static constexpr char   HMD_SHM_PATH[]   = "/tmp/SceHmd/Vr2d_shm_pass";
+
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
+}
+
+static bool IsDipswDevice(const std::string& path) {
+	return path == "/dev/dipsw";
+}
+
+static bool IsConsoleDevice(const std::string& path) {
+	return path == "/dev/console";
+}
+
+static bool IsNpdrmDevice(const std::string& path) {
+	return path == "/dev/npdrm";
 }
 
 static void FillRandomBuffer(void* buf, size_t nbytes) {
@@ -539,6 +982,35 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 	return dirents;
 }
 
+static int RefreshTmpfsDirectory(File* file) {
+	std::vector<Tmpfs::DirectoryEntry> entries;
+	const int                          result = Tmpfs::Entries(file->tmpfs, &entries);
+	if (result != OK) return result;
+	std::vector<Common::File::DirEntry> directory;
+	directory.reserve(entries.size());
+	for (const auto& entry: entries) {
+		Common::File::DirEntry value {};
+		value.name    = entry.name;
+		value.is_file = entry.type == 8;
+		directory.push_back(std::move(value));
+	}
+	auto   packed = PackDirents(directory);
+	size_t offset = 0;
+	for (const auto& entry: entries) {
+		const auto inode = static_cast<uint32_t>(entry.inode);
+		std::memcpy(packed.data() + offset, &inode, sizeof(inode));
+		packed[offset + 6] = entry.type;
+		uint16_t length    = 0;
+		std::memcpy(&length, packed.data() + offset + 4, sizeof(length));
+		offset += length;
+	}
+	file->dirents = std::move(packed);
+	return OK;
+}
+
+
+
+
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	const auto remaining =
 	    file->dents_offset < file->dirents.size() ? file->dirents.size() - file->dents_offset : 0;
@@ -566,6 +1038,8 @@ int FileDescriptors::CreateDescriptor() {
 	file->append      = false;
 	file->sync_writes = false;
 	file->special     = SpecialFile::None;
+	file->special_size = 0;
+	file->scope_shared = -1;
 
 	int files_num = static_cast<int>(m_files.size());
 	for (int index = 0; index < files_num; index++) {
@@ -579,11 +1053,346 @@ int FileDescriptors::CreateDescriptor() {
 	return static_cast<int>(m_files.size()) + DESCRIPTOR_MIN - 1;
 }
 
+bool FileDescriptors::OpenStandardDeci(int fd) {
+	if (fd < 0 || fd > 2) {
+		return false;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (m_standard_deci[fd]) {
+		return false;
+	}
+	m_standard_deci[fd]    = true;
+	m_standard_console[fd] = false;
+	m_standard_flags[fd]   = 0;
+	return true;
+}
+
+bool FileDescriptors::HasStandardDeci(int fd) {
+	if (fd < 0 || fd > 2) {
+		return false;
+	}
+	Common::LockGuard lock(m_mutex);
+	return m_standard_deci[fd];
+}
+
+int FileDescriptors::OpenStandardConsole(int flags) {
+	Common::LockGuard lock(m_mutex);
+	for (int fd = 0; fd < DESCRIPTOR_MIN; ++fd) {
+		if (m_standard_deci[fd]) continue;
+		m_standard_deci[fd]    = true;
+		m_standard_console[fd] = true;
+		m_standard_flags[fd]   = flags;
+		return fd;
+	}
+	return -1;
+}
+
+bool FileDescriptors::HasStandardConsole(int fd) {
+	if (fd < 0 || fd >= DESCRIPTOR_MIN) return false;
+	Common::LockGuard lock(m_mutex);
+	return m_standard_deci[fd] && m_standard_console[fd];
+}
+
+void FileDescriptors::BindStandardConsole(int fd) {
+	Common::LockGuard lock(m_mutex);
+	m_standard_deci[fd]    = true;
+	m_standard_console[fd] = true;
+	m_standard_flags[fd]   = 0;
+}
+
+bool FileDescriptors::CloseStandardDeci(int fd) {
+	if (fd < 0 || fd > 2) {
+		return false;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (!m_standard_deci[fd]) {
+		return false;
+	}
+	m_standard_deci[fd]    = false;
+	m_standard_console[fd] = false;
+	m_standard_flags[fd]   = 0;
+	return true;
+}
+
+
+
+
+
+
+
+
+static bool NativeDceReadable(uint64_t addr, uint64_t size, bool need_write);
+
+static bool GuestSocketBufferAccessible(const void* buf, uint64_t len, bool writable) {
+	if (len == 0) {
+		return true;
+	}
+	const auto address = reinterpret_cast<uint64_t>(buf);
+	if (address == 0 || len > UINT64_MAX - address) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return NativeDceReadable(address, len, writable);
+#else
+	const uint64_t end = address + len;
+	for (uint64_t current = address; current < end;) {
+		Memory::VirtualQueryInfo region {};
+		if (Memory::KernelVirtualQuery(reinterpret_cast<const void*>(current), 0, &region,
+		                               sizeof(region)) != OK ||
+		    !region.is_committed || region.start > current || region.end <= current ||
+		    (region.protection & (writable ? 2 : 1)) == 0) {
+			return false;
+		}
+		current = std::min<uint64_t>(region.end, end);
+	}
+	return true;
+#endif
+}
+
+struct LvdAttachRequest {
+	uint32_t version;
+	int32_t  unit;
+	uint32_t sector_size;
+	uint32_t granularity;
+	uint16_t flags;
+	uint16_t image_type;
+	uint32_t layer_count;
+	uint64_t device_size;
+	uint64_t layers;
+};
+static_assert(sizeof(LvdAttachRequest) == 0x28);
+static_assert(offsetof(LvdAttachRequest, unit) == 0x04);
+static_assert(offsetof(LvdAttachRequest, layers) == 0x20);
+
+struct LvdLayer {
+	uint16_t source_type;
+	uint16_t flags;
+	uint32_t reserved;
+	uint64_t path;
+	uint64_t offset;
+	uint64_t end;
+	uint64_t bitmap_path;
+	uint64_t bitmap_offset;
+	uint64_t bitmap_size;
+};
+static_assert(sizeof(LvdLayer) == 0x38);
+
+static bool ParseLvdDevicePath(const std::string& path, int* unit) {
+	constexpr const char* prefix = "/dev/lvd";
+	if (!path.starts_with(prefix) || path.size() == std::strlen(prefix)) return false;
+	int value = 0;
+	for (size_t i = std::strlen(prefix); i < path.size(); ++i) {
+		if (path[i] < '0' || path[i] > '9' || value > 25) return false;
+		value = value * 10 + path[i] - '0';
+	}
+	if (value > 255) return false;
+	if (path != std::string(prefix) + std::to_string(value)) return false;
+	if (unit != nullptr) *unit = value;
+	return true;
+}
+
+static std::shared_ptr<LvdDevice> FindLvdDevice(int unit) {
+	std::lock_guard lock(g_lvd_mutex);
+	const auto      found = g_lvd_devices.find(unit);
+	return found == g_lvd_devices.end() ? nullptr : found->second;
+}
+
+static std::shared_ptr<LvdDevice> FindLvdDevice(const std::string& path) {
+	int unit = -1;
+	return ParseLvdDevicePath(path, &unit) ? FindLvdDevice(unit) : nullptr;
+}
+
+static void FillLvdStat(FileStat* stat, bool block_device) {
+	*stat            = {};
+	stat->st_mode    = block_device ? 0060600u : 0020600u;
+	stat->st_nlink   = 1;
+	stat->st_blksize = 0x4000;
+}
+
+
+
+static int CopyLvdGuestPath(uint64_t address, std::string* path) try {
+	if (address == 0 || path == nullptr) return KERNEL_ERROR_EFAULT;
+	std::array<char, 0x400> bytes {};
+	for (size_t i = 0; i < bytes.size(); ++i) {
+		if (!Memory::CopyFromGuest(&bytes[i], reinterpret_cast<const void*>(address + i), 1)) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		if (bytes[i] == '\0') {
+			if (i == 0 || bytes[0] != '/') return KERNEL_ERROR_EINVAL;
+			path->assign(bytes.data(), i);
+			return OK;
+		}
+	}
+	return KERNEL_ERROR_ENAMETOOLONG;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
+
+
+
+
+
+static int ValidateLvdUfsPassthrough(const std::string& device) {
+	const auto lvd = FindLvdDevice(device);
+	if (!lvd) return KERNEL_ERROR_ENOENT;
+	constexpr uint64_t magic_offset = 0x1055c;
+	if (lvd->capacity < magic_offset + sizeof(uint32_t)) return KERNEL_ERROR_EINVAL;
+	uint32_t   magic = 0;
+	const auto read =
+	    DirectoryPassthrough::Pread(lvd->backing, &magic, sizeof(magic), magic_offset);
+	return read == sizeof(magic) && magic == 0x19540119u ? OK : KERNEL_ERROR_EINVAL;
+}
+
+static void FillTmpfsStat(const Tmpfs::NodeStat& node, FileStat* stat) {
+	*stat                    = {};
+	stat->st_dev             = node.device;
+	stat->st_ino             = static_cast<uint32_t>(node.inode);
+	stat->st_mode            = static_cast<uint16_t>(node.mode);
+	stat->st_nlink           = static_cast<uint16_t>(node.links);
+	stat->st_uid             = node.uid;
+	stat->st_gid             = node.gid;
+	stat->st_size            = static_cast<int64_t>(node.size);
+	stat->st_blocks          = static_cast<int64_t>(node.allocated_bytes / 512);
+	stat->st_blksize         = Tmpfs::PageSize;
+	stat->st_atim.tv_sec     = node.accessed;
+	stat->st_mtim.tv_sec     = node.modified;
+	stat->st_ctim.tv_sec     = node.changed;
+	stat->st_birthtim.tv_sec = node.created;
+}
+
+static int64_t TransferTmpfs(File* file, void* bytes, size_t length, uint64_t offset,
+                             bool sequential, bool write) {
+	if (write ? !file->writable : !file->readable) return KERNEL_ERROR_EBADF;
+	if (file->directory) return KERNEL_ERROR_EISDIR;
+	if (length > INT64_MAX) return KERNEL_ERROR_EINVAL;
+	if (!GuestSocketBufferAccessible(bytes, length, !write)) return KERNEL_ERROR_EFAULT;
+	if (!write && length != 0) Memory::InvalidateMemory(reinterpret_cast<uint64_t>(bytes), length);
+	if (write)
+		return sequential ? Tmpfs::Write(file->tmpfs, bytes, length)
+		                  : Tmpfs::Pwrite(file->tmpfs, bytes, length, offset);
+	return sequential ? Tmpfs::Read(file->tmpfs, bytes, length)
+	                  : Tmpfs::Pread(file->tmpfs, bytes, length, offset);
+}
+
+static void FillExfatStat(const ExfatMount::NodeStat& node, FileStat* stat) {
+	*stat            = {};
+	stat->st_dev     = node.device;
+	stat->st_ino     = node.inode;
+	stat->st_mode    = static_cast<uint16_t>(node.mode);
+	stat->st_nlink   = 1;
+	stat->st_size    = static_cast<int64_t>(node.size);
+	stat->st_blocks  = static_cast<int64_t>(node.allocated_size / 512);
+	stat->st_blksize = 512;
+}
+
+
+static void FillBfsStat(const BfsMount::NodeStat& node, FileStat* stat) {
+	*stat            = {};
+	stat->st_dev     = node.device;
+	stat->st_ino     = node.inode;
+	stat->st_mode    = static_cast<uint16_t>(node.mode);
+	stat->st_nlink   = 1;
+	stat->st_size    = static_cast<int64_t>(node.size);
+	stat->st_blocks  = static_cast<int64_t>(node.allocated_size / 512);
+	stat->st_blksize = 512;
+}
+
+
+
+
+static void FillPassthroughStat(const DirectoryPassthrough::NodeStat& node, FileStat* stat) {
+	*stat            = {};
+	stat->st_dev     = node.device;
+	stat->st_ino     = node.inode;
+	stat->st_mode    = static_cast<uint16_t>(node.mode);
+	stat->st_nlink   = 1;
+	stat->st_size    = static_cast<int64_t>(node.size);
+	stat->st_blocks  = static_cast<int64_t>(node.allocated_size / 512);
+	stat->st_blksize = 512;
+	if (node.captured) {
+		stat->st_uid         = node.uid;
+		stat->st_gid         = node.gid;
+		stat->st_mtim.tv_sec = node.mtime;
+	}
+}
+
+
+
+
 bool IsTmpfsDescriptor(int descriptor) {
 	if (descriptor < DESCRIPTOR_MIN || g_files == nullptr) return false;
 	const auto* file = g_files->GetFile(descriptor);
 	return file != nullptr && file->opened && file->tmpfs != nullptr;
 }
+
+
+static void ApplyIccnvs4NodeStat(FileStat* stat) {
+	stat->st_mode   = 0020000u | 0000640u;
+	stat->st_uid    = 0;
+	stat->st_gid    = 5;
+	stat->st_size   = 0;
+	stat->st_blocks = 0;
+}
+
+
+static std::atomic_bool g_guest_socket_fixture_trace {false};
+
+
+
+
+
+int FileDescriptors::GetFlags(int fd) {
+	if (fd < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (fd >= 0 && fd < DESCRIPTOR_MIN) {
+		return m_standard_deci[fd] || !m_explicit_standard ? m_standard_flags[fd]
+		                                                   : KERNEL_ERROR_EBADF;
+	}
+	const size_t index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size() || m_files[index] == nullptr || !m_files[index]->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	return m_files[index]->descriptor_flags;
+}
+
+int FileDescriptors::SetFlags(int fd, int flags) {
+	if (fd < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if ((flags & ~1) != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (fd >= 0 && fd < DESCRIPTOR_MIN) {
+		if (!m_standard_deci[fd] && m_explicit_standard) {
+			return KERNEL_ERROR_EBADF;
+		}
+		m_standard_flags[fd] = flags;
+		return OK;
+	}
+	const size_t index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size() || m_files[index] == nullptr || !m_files[index]->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	m_files[index]->descriptor_flags = flags;
+	return OK;
+}
+
+int GetDescriptorFlags(int fd) {
+	return g_files == nullptr ? KERNEL_ERROR_EBADF : g_files->GetFlags(fd);
+}
+
+int SetDescriptorFlags(int fd, int flags) {
+	return g_files == nullptr ? KERNEL_ERROR_EBADF : g_files->SetFlags(fd, flags);
+}
+
+
+
+
+
 void FileDescriptors::DeleteDescriptor(int d) {
 	Common::LockGuard lock(m_mutex);
 
@@ -594,7 +1403,6 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	EXIT_IF(m_files[index]->opened);
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-	// Close host files opened before a failed descriptor setup.
 	m_files[index]->f.Close();
 #endif
 
@@ -640,19 +1448,243 @@ void FileDescriptors::CloseAll() {
 	}
 }
 
-void MountPoints::Mount(const std::filesystem::path& folder, const std::string& point) {
+void MountPoints::Mount(const std::filesystem::path& folder, const std::string& point,
+                        bool read_only) {
+	if (ExfatMount::Contains(point)) {
+		LOGF("HOST_MOUNT_UNSUPPORTED path=%s existing_exfat_mount=1\n", point.c_str());
+		return;
+	}
+	if (BfsMount::Contains(point)) {
+		LOGF("HOST_MOUNT_UNSUPPORTED path=%s existing_bfs_mount=1\n", point.c_str());
+		return;
+	}
+	if (DirectoryPassthrough::Contains(point)) {
+		LOGF("HOST_MOUNT_UNSUPPORTED path=%s existing_passthrough_mount=1\n", point.c_str());
+		return;
+	}
+	if (NullfsMount::Contains(point)) {
+		LOGF("HOST_MOUNT_UNSUPPORTED path=%s existing_nullfs_mount=1\n", point.c_str());
+		return;
+	}
 	Common::LockGuard lock(m_mutex);
 
-	auto point_str  = Common::FixDirectorySlash(point);
+	auto point_str = Common::FixDirectorySlash(point);
 
 	Umount(point_str);
 
 	MountPair p;
-	p.dir   = folder;
-	p.point = point_str;
-	p.archive = Common::OpenArchive(folder);
+	p.dir       = folder;
+	p.point     = point_str;
+	p.archive   = Common::OpenArchive(folder);
+	p.read_only = read_only;
 
 	m_mount_pairs.push_back(std::move(p));
+	if (read_only) {
+		std::error_code error;
+		auto            root = std::filesystem::weakly_canonical(folder, error);
+		EXIT_IF(error);
+		m_read_only_roots.push_back(std::move(root));
+	}
+}
+
+bool MountPoints::HasReadOnlyRoot() {
+	Common::LockGuard lock(m_mutex);
+	return std::any_of(m_mount_pairs.begin(), m_mount_pairs.end(),
+	                   [](const auto& mount) { return mount.point == "/" && mount.read_only; });
+}
+
+bool MountPoints::HasNonRootMountForPath(const std::string& path) {
+	Common::LockGuard lock(m_mutex);
+	auto              guest = Common::FixFilenameSlash(path);
+	while (guest.starts_with("//"))
+		guest.erase(0, 1);
+	const auto normalized = Common::FixDirectorySlash(
+	    Common::PathToGenericString(Common::PathFromUtf8(guest).lexically_normal()));
+	return std::any_of(m_mount_pairs.begin(), m_mount_pairs.end(), [&](const auto& mount) {
+		return mount.point != "/" && normalized.starts_with(mount.point);
+	});
+}
+
+bool MountPoints::GetMountDirectory(const std::string& point, std::filesystem::path* directory) {
+	Common::LockGuard lock(m_mutex);
+	const auto        normalized = Common::FixDirectorySlash(point);
+	const auto mount = std::find_if(m_mount_pairs.begin(), m_mount_pairs.end(),
+	                                [&](const auto& entry) { return entry.point == normalized; });
+	if (mount == m_mount_pairs.end()) return false;
+	*directory = mount->dir;
+	return true;
+}
+
+bool MountPoints::HasSubmount(const std::string& point) {
+	Common::LockGuard lock(m_mutex);
+	const auto        normalized = Common::FixDirectorySlash(point);
+	return std::any_of(m_mount_pairs.begin(), m_mount_pairs.end(), [&](const auto& mount) {
+		return mount.point.size() > normalized.size() &&
+		       std::equal(normalized.begin(), normalized.end(), mount.point.begin(),
+		                  [](char left, char right) {
+			                  if (left >= 'A' && left <= 'Z') left += 'a' - 'A';
+			                  if (right >= 'A' && right <= 'Z') right += 'a' - 'A';
+			                  return left == right;
+		                  });
+	});
+}
+
+std::vector<Common::File::DirEntry>
+MountPoints::DirectoryEntries(const std::string&           mounted_name,
+                              const std::filesystem::path& directory) {
+	const bool data_covered =
+	    Tmpfs::Contains("/data") || ExfatMount::Contains("/data") || BfsMount::Contains("/data") ||
+	    DirectoryPassthrough::Contains("/data") || NullfsMount::Contains("/data");
+	Common::LockGuard lock(m_mutex);
+	auto              entries = Common::File::GetDirEntries(directory);
+	auto              guest   = Common::FixFilenameSlash(mounted_name);
+	while (guest.starts_with("//"))
+		guest.erase(0, 1);
+	const auto parent = Common::FixDirectorySlash(
+	    Common::PathToGenericString(Common::PathFromUtf8(guest).lexically_normal()));
+	for (const auto& mount: m_mount_pairs) {
+		if (!mount.point.starts_with(parent)) continue;
+		auto name = mount.point.substr(parent.size());
+		if (name.ends_with('/')) name.pop_back();
+		if (name.empty() || name.find('/') != std::string::npos) continue;
+		const auto info = Common::File::GetInfo(mount.dir);
+		if (!mount.archive && (!info || info->is_file)) continue;
+		auto existing = std::find_if(entries.begin(), entries.end(),
+		                             [&](const auto& entry) { return entry.name == name; });
+		if (existing == entries.end())
+			entries.push_back({std::move(name), false});
+		else
+			existing->is_file = false;
+	}
+	if (parent == "/") {
+		const bool read_only_root =
+		    std::any_of(m_mount_pairs.begin(), m_mount_pairs.end(),
+			            [](const auto& mount) { return mount.point == "/" && mount.read_only; });
+		if (read_only_root) {
+			auto data = std::find_if(entries.begin(), entries.end(), [](const auto& entry) {
+				return Common::EqualNoCase(entry.name, "data");
+			});
+			if (data == entries.end())
+				entries.push_back({"data", false});
+			else if (data_covered)
+				data->is_file = false;
+		}
+	}
+	return entries;
+}
+
+struct PsmShellUiApplicationRoute {
+	const char* guest_path;
+	const char* source_environment;
+	const char* sha256_environment;
+	uint64_t    expected_size;
+	const char* expected_sha256;
+};
+
+static constexpr PsmShellUiApplicationRoute kPsmShellUiApplicationRoutes[] = {
+    {"/app0/psm/Application/app.exe", "KYTY_DIAGNOSTIC_SONY_SHELLUI_APP_PE",
+	 "KYTY_DIAGNOSTIC_SONY_SHELLUI_APP_PE_SHA256", 9728,
+	 "74f76c80c6dd44d27d706748d9746500ab9b9e0f863cb843fcd096536b507f84"},
+    {"/app0/psm/Application/app.exe.sprx", "KYTY_DIAGNOSTIC_SONY_SHELLUI_APP_AOT",
+	 "KYTY_DIAGNOSTIC_SONY_SHELLUI_APP_AOT_SHA256", 127876,
+	 "31fe344c9b7570fd3a49c8d2031d88db5c90e050f261bad866463894ecc55426"},
+};
+
+struct PsmShellUiApplicationLease {
+	std::filesystem::path source;
+	std::vector<uint8_t>  bytes;
+	AuthInfo::Digest      sha256 {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE handle = INVALID_HANDLE_VALUE;
+#endif
+	bool active = false;
+};
+
+static std::mutex g_psm_shellui_application_lease_mutex;
+static std::array<PsmShellUiApplicationLease, std::size(kPsmShellUiApplicationRoutes) + 1>
+    g_psm_shellui_application_leases;
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool SamePsmShellUiFile(HANDLE left, HANDLE right) {
+	BY_HANDLE_FILE_INFORMATION left_info {};
+	BY_HANDLE_FILE_INFORMATION right_info {};
+	return left != INVALID_HANDLE_VALUE && right != INVALID_HANDLE_VALUE &&
+	       GetFileInformationByHandle(left, &left_info) &&
+	       GetFileInformationByHandle(right, &right_info) &&
+	       left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
+	       left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
+	       left_info.nFileIndexLow == right_info.nFileIndexLow;
+}
+
+#else
+static bool SamePsmShellUiFile(const std::filesystem::path& left,
+                               const std::filesystem::path& right) {
+	std::error_code error;
+	return std::filesystem::equivalent(left, right, error) && !error;
+}
+#endif
+
+
+static void ReleasePsmShellUiApplicationLeases() {
+	std::lock_guard lock(g_psm_shellui_application_lease_mutex);
+	for (auto& lease: g_psm_shellui_application_leases) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (lease.handle != INVALID_HANDLE_VALUE) CloseHandle(lease.handle);
+		lease.handle = INVALID_HANDLE_VALUE;
+#endif
+		lease.source.clear();
+		lease.bytes.clear();
+		lease.sha256 = {};
+		lease.active = false;
+	}
+}
+
+
+
+
+
+static bool IsPsmShellUiApplicationHostPath(const std::filesystem::path& path) {
+	if (path.empty()) return false;
+	std::lock_guard lock(g_psm_shellui_application_lease_mutex);
+	for (size_t slot = 0; slot < std::size(kPsmShellUiApplicationRoutes); ++slot) {
+		const auto& lease = g_psm_shellui_application_leases[slot];
+		if (!lease.active) continue;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const HANDLE candidate = CreateFileW(
+		    path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		const bool same = SamePsmShellUiFile(candidate, lease.handle);
+		if (candidate != INVALID_HANDLE_VALUE) CloseHandle(candidate);
+		if (same) return true;
+#else
+		if (SamePsmShellUiFile(path, lease.source)) return true;
+#endif
+	}
+	return false;
+}
+
+
+
+bool MountPoints::IsReadOnly(const std::filesystem::path& path) {
+	if (Process::IsExecChildImagePath(path) || IsPsmShellUiApplicationHostPath(path)) return true;
+	Common::LockGuard lock(m_mutex);
+	if (path.empty() || m_read_only_roots.empty()) return false;
+	std::error_code error;
+	const auto      actual = std::filesystem::weakly_canonical(path, error);
+	if (error) return true;
+	for (const auto& root: m_read_only_roots) {
+		auto target    = actual.begin();
+		auto component = root.begin();
+		for (; component != root.end() && target != actual.end(); ++component, ++target) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (_wcsicmp(component->c_str(), target->c_str()) != 0) break;
+#else
+			if (*component != *target) break;
+#endif
+		}
+		if (component == root.end()) return true;
+	}
+	return false;
 }
 
 void MountPoints::Umount(const std::string& folder_or_point) {
@@ -662,8 +1694,9 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 
 	const auto it = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(), [&folder_or_point_str](const MountPair& p) {
-		    return Common::FixDirectorySlash(Common::PathToGenericString(p.dir)) == folder_or_point_str ||
-		           p.point == folder_or_point_str;
+		    return Common::FixDirectorySlash(Common::PathToGenericString(p.dir)) ==
+			           folder_or_point_str ||
+			       p.point == folder_or_point_str;
 	    });
 	if (it != m_mount_pairs.end()) {
 		m_mount_pairs.erase(it);
@@ -678,7 +1711,6 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 		return path;
 	}
 
-	// Preserve unmatched components for the caller's ENOENT path.
 	std::filesystem::path resolved =
 	    path.has_root_path() ? path.root_path() : std::filesystem::path(".");
 	bool matched = true;
@@ -724,14 +1756,23 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
-	// Match the entire guest path so a mount root works with or without a trailing slash.
-	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
-	const auto it           = std::find_if(
-	    m_mount_pairs.begin(), m_mount_pairs.end(),
-	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
+	// Repeated leading slashes count as one, //priv/mms has to reach the /priv mount.
+	auto guest_name = Common::FixFilenameSlash(mounted_name);
+	while (guest_name.starts_with("//")) {
+		guest_name.erase(0, 1);
+	}
+	guest_name = Common::PathToGenericString(Common::PathFromUtf8(guest_name).lexically_normal());
+	const auto mounted_path = Common::FixDirectorySlash(guest_name);
+	auto       it           = m_mount_pairs.end();
+	for (auto candidate = m_mount_pairs.begin(); candidate != m_mount_pairs.end(); ++candidate) {
+		if (mounted_path.starts_with(candidate->point) &&
+		    (it == m_mount_pairs.end() || candidate->point.size() >= it->point.size())) {
+			it = candidate;
+		}
+	}
 	if (it != m_mount_pairs.end()) {
-		const auto& p = *it;
-		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
+		const auto& p        = *it;
+		auto        rel_path = Common::RemoveFirst(guest_name, p.point.size());
 		while (rel_path.starts_with('/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
@@ -743,27 +1784,234 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n", mounted_name.c_str());
+			LOGF("FileSystem: Windows-incompatible guest filename: %s\n",
+			     Log::EscapeField(mounted_name).c_str());
+			return {};
 		}
-		return p.dir / native_rel_path;
+		auto actual = p.dir / native_rel_path;
 #else
-		return ResolvePathIgnoringCase(p.dir / native_rel_path);
+		auto actual = ResolvePathIgnoringCase(p.dir / native_rel_path);
 #endif
 	}
 
-	// Unmounted guest paths must not fall through to the host filesystem.
 	return {};
 }
 
+enum class DataTopologyPath {
+	None,
+	Directory,
+	Missing,
+};
+
+static bool UseCapturedRootMetadata(const char* path) {
+	if (path == nullptr || !CapturedRootMetadata::Enabled()) return false;
+	std::string normalized;
+	if (Tmpfs::NormalizePath(path, &normalized) != OK || normalized.starts_with("/dev/"))
+		return false;
+	return !g_mount_points->HasNonRootMountForPath(normalized);
+}
+
+static bool HasDataTopology() {
+	if (g_mount_points == nullptr || !g_mount_points->HasReadOnlyRoot()) return false;
+	if (Tmpfs::Contains("/data") || ExfatMount::Contains("/data") || BfsMount::Contains("/data") ||
+	    DirectoryPassthrough::Contains("/data") || NullfsMount::Contains("/data"))
+		return false;
+	const auto direct = g_mount_points->ResolvePath("/data");
+	return direct.empty() || !Common::File::GetInfo(direct).has_value();
+}
+
+static DataTopologyPath ResolveDataTopologyPath(const std::string& path) {
+	if (path.empty() || path[0] != '/' || !HasDataTopology()) return DataTopologyPath::None;
+	bool data = false;
+	for (size_t start = 1; start <= path.size();) {
+		const auto end       = path.find('/', start);
+		const auto component = path.substr(start, end == std::string::npos ? end : end - start);
+		if (!component.empty() && component != ".") {
+			if (component == "..") {
+				data = false;
+			} else if (!data && component == "data") {
+				data = true;
+			} else if (data) {
+				const auto prefix = "/data/" + component;
+				if (g_mount_points->HasNonRootMountForPath(prefix)) {
+					return DataTopologyPath::None;
+				}
+				return DataTopologyPath::Missing;
+			} else {
+				return DataTopologyPath::None;
+			}
+		}
+		if (end == std::string::npos) break;
+		start = end + 1;
+	}
+	return data ? DataTopologyPath::Directory : DataTopologyPath::None;
+}
+
+static void FillDataTopologyStat(FileStat* stat) {
+	*stat            = {};
+	stat->st_dev     = 0x4b445441u;
+	stat->st_ino     = 0x64617461u;
+	stat->st_mode    = 0040555u;
+	stat->st_nlink   = 2;
+	stat->st_blksize = DIR_BLOCK_SIZE;
+}
+
+struct DevfsRootEntry {
+	uint32_t    inode;
+	uint8_t     type;
+	std::string name;
+};
+
+// root image only has the empty /dev mountpoint, so devfs contents come from a console listing
+static const std::vector<DevfsRootEntry>* DevfsRootListing() {
+	static const std::vector<DevfsRootEntry>* listing = []() -> const std::vector<DevfsRootEntry>* {
+		const char* source = std::getenv("KYTY_PS5_DEVFS_LISTING");
+		if (source == nullptr || source[0] == '\0') return nullptr;
+		std::ifstream input(Common::PathFromUtf8(source));
+		auto          entries = std::make_unique<std::vector<DevfsRootEntry>>();
+		std::string   line;
+		while (input && std::getline(input, line)) {
+			if (line.empty() || line[0] == '#') continue;
+			const auto tab  = line.find('\t');
+			const auto tab2 = tab == std::string::npos ? tab : line.find('\t', tab + 1);
+			if (tab2 == std::string::npos) return nullptr;
+			DevfsRootEntry entry {};
+			entry.inode =
+			    static_cast<uint32_t>(std::strtoul(line.substr(0, tab).c_str(), nullptr, 10));
+			const auto type =
+			    std::strtoul(line.substr(tab + 1, tab2 - tab - 1).c_str(), nullptr, 10);
+			entry.name = line.substr(tab2 + 1);
+			if (entry.inode == 0 || (type != 2 && type != 4 && type != 10) || entry.name.empty() ||
+			    entry.name.size() > 255 || entry.name == "." || entry.name == ".." ||
+			    entry.name.find('/') != std::string::npos) {
+				LOGF("DEVFS_ROOT_LISTING rejected line=%zu\n", entries->size() + 1);
+				return nullptr;
+			}
+			entry.type = static_cast<uint8_t>(type);
+			entries->push_back(std::move(entry));
+		}
+		if (!input.eof() || entries->empty()) {
+			LOGF("DEVFS_ROOT_LISTING unreadable\n");
+			return nullptr;
+		}
+		LOGF("DEVFS_ROOT_LISTING entries=%zu source=console_observation\n", entries->size());
+		return entries.release();
+	}();
+	return listing;
+}
+
+static bool IsDevfsRoot(const char* path) {
+	std::string normalized;
+	return path != nullptr && path[0] == '/' && Tmpfs::NormalizePath(path, &normalized) == OK &&
+	       normalized == "/dev" && DevfsRootListing() != nullptr;
+}
+
+// devfs_getattr for the root directory, through vn_stat's max(PAGE_SIZE, va_blocksize)
+static void FillDevfsRootStat(FileStat* stat) {
+	*stat          = {};
+	stat->st_ino   = 2;
+	stat->st_mode  = 0040555u;
+	stat->st_nlink = 2;
+	for (const auto& entry: *DevfsRootListing())
+		if (entry.type == 4) stat->st_nlink++;
+	stat->st_size    = 512;
+	stat->st_blocks  = 1;
+	stat->st_blksize = 0x4000;
+}
+
+// Subdirectory cdevs plus inodes of unlisted entries (type 0, no name). With the root listing these
+// are the devfs_inos in use when a new devfs mount allocates.
+static const std::vector<uint32_t>* DevfsHeldInodes() {
+	static const std::vector<uint32_t>* held = []() -> const std::vector<uint32_t>* {
+		const char* source = std::getenv("KYTY_PS5_DEVFS_SUBDIR_LISTING");
+		const auto* root   = DevfsRootListing();
+		if (source == nullptr || source[0] == '\0' || root == nullptr) return nullptr;
+		std::ifstream input(Common::PathFromUtf8(source));
+		auto          inodes = std::make_unique<std::vector<uint32_t>>();
+		std::string   line;
+		while (input && std::getline(input, line)) {
+			if (line.empty() || line[0] == '#') continue;
+			const auto tab  = line.find('\t');
+			const auto tab2 = tab == std::string::npos ? tab : line.find('\t', tab + 1);
+			if (tab2 == std::string::npos) return nullptr;
+			const auto inode = std::strtoul(line.substr(0, tab).c_str(), nullptr, 10);
+			const auto type =
+			    std::strtoul(line.substr(tab + 1, tab2 - tab - 1).c_str(), nullptr, 10);
+			const auto name  = line.substr(tab2 + 1);
+			const auto slash = name.find('/');
+			bool       valid =
+			    inode > 2 && (type == 0 ? name.empty()
+				                        : type == 2 && slash != std::string::npos && slash > 0 &&
+				                              slash + 1 < name.size() &&
+				                              name.find('/', slash + 1) == std::string::npos);
+			if (valid && type != 0) {
+				const auto subdir = name.substr(0, slash);
+				valid             = std::any_of(root->begin(), root->end(), [&](const auto& entry) {
+					return entry.type == 4 && entry.name == subdir;
+				});
+			}
+			if (!valid) {
+				LOGF("DEVFS_SUBDIR_LISTING rejected line=%zu\n", inodes->size() + 1);
+				return nullptr;
+			}
+			inodes->push_back(static_cast<uint32_t>(inode));
+		}
+		if (!input.eof()) {
+			LOGF("DEVFS_SUBDIR_LISTING unreadable\n");
+			return nullptr;
+		}
+		LOGF("DEVFS_SUBDIR_LISTING entries=%zu source=console_observation\n", inodes->size());
+		return inodes.release();
+	}();
+	return held;
+}
+
+static std::vector<uint8_t> PackDevfsRoot(const std::vector<uint32_t>* directories = nullptr) {
+	std::vector<DevfsRootEntry> entries {{2, 4, "."}, {2, 4, ".."}};
+	size_t                      next = 0;
+	for (auto entry: *DevfsRootListing()) {
+		if (directories != nullptr && entry.type == 4) entry.inode = (*directories)[next++];
+		entries.push_back(std::move(entry));
+	}
+	std::vector<Common::File::DirEntry> directory;
+	for (const auto& entry: entries)
+		directory.push_back({entry.name, entry.type != 4});
+	auto   packed = PackDirents(directory);
+	size_t offset = 0;
+	for (const auto& entry: entries) {
+		std::memcpy(packed.data() + offset, &entry.inode, sizeof(entry.inode));
+		packed[offset + 6] = entry.type;
+		uint16_t length    = 0;
+		std::memcpy(&length, packed.data() + offset + 4, sizeof(length));
+		offset += length;
+	}
+	return packed;
+}
+
 void Initialize() {
-	g_mount_points = new MountPoints;
-	g_files        = new FileDescriptors;
+	g_diagnostic_gc_device_ready = false;
+	{
+		std::lock_guard lock(g_lvd_mutex);
+		g_lvd_devices.clear();
+	}
+	g_native_metadbg_stream = std::make_shared<NativeMetadbgStream>();
+	g_native_system_mbus    = std::make_shared<NativeSystemMbusState>();
+	g_mount_points          = new MountPoints;
+	g_files                 = new FileDescriptors;
+	std::string scope;
+	if (!Process::GetScope(&scope)) {
+		scope = "fs_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+	}
+	g_tmpfs_status = Tmpfs::Initialize(scope);
+	if (g_tmpfs_status != OK) LOGF("TMPFS_NAMESPACE initialization_error=0x%x\n", g_tmpfs_status);
 }
 
 void EmergencyShutdown() {
 	if (g_files != nullptr) {
 		g_files->CloseAll();
 	}
+	Common::LockGuard lock(g_hmd_shm_mutex);
+	g_hmd_shm_exists = false;
 }
 
 void Shutdown() {
@@ -775,18 +2023,840 @@ void Shutdown() {
 }
 
 void Mount(const std::filesystem::path& folder, const std::string& point) {
+	std::lock_guard publication(g_mount_publication_mutex);
 
 	g_mount_points->Mount(folder, point);
 }
 
-void Umount(const std::string& folder_or_point) {
+void MountReadOnly(const std::filesystem::path& folder, const std::string& point) {
+	std::lock_guard publication(g_mount_publication_mutex);
+	g_mount_points->Mount(folder, point, true);
+}
 
+int MountInitialSystemTmpDirectory(const std::filesystem::path& sysroot,
+                                   const std::filesystem::path& directory) {
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	const auto host_error = [](const std::error_code& error) {
+		if (error == std::errc::no_such_file_or_directory) return KERNEL_ERROR_ENOENT;
+		if (error == std::errc::not_a_directory) return KERNEL_ERROR_ENOTDIR;
+		if (error == std::errc::permission_denied) return KERNEL_ERROR_EACCES;
+		if (error == std::errc::too_many_symbolic_link_levels) return KERNEL_ERROR_ELOOP;
+		return KERNEL_ERROR_EIO;
+	};
+	const auto ordinary_directory = [&](const std::filesystem::path& path) {
+		if (!path.is_absolute()) return KERNEL_ERROR_EINVAL;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const auto drive = path.root_name().native();
+		if (drive.size() != 2 || drive[1] != L':' ||
+		    !((drive[0] >= L'A' && drive[0] <= L'Z') || (drive[0] >= L'a' && drive[0] <= L'z')))
+			return KERNEL_ERROR_EINVAL;
+#endif
+		auto       current         = path.root_path();
+		const auto check_component = [&]() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			const auto attributes = GetFileAttributesW(current.c_str());
+			if (attributes == INVALID_FILE_ATTRIBUTES) {
+				const auto error = GetLastError();
+				if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
+					return KERNEL_ERROR_ENOENT;
+				if (error == ERROR_ACCESS_DENIED) return KERNEL_ERROR_EACCES;
+				return KERNEL_ERROR_EIO;
+			}
+			if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return KERNEL_ERROR_ELOOP;
+			if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return KERNEL_ERROR_ENOTDIR;
+#else
+			std::error_code error;
+			const auto      status = std::filesystem::symlink_status(current, error);
+			if (error) return host_error(error);
+			if (std::filesystem::is_symlink(status)) return KERNEL_ERROR_ELOOP;
+			if (!std::filesystem::exists(status)) return KERNEL_ERROR_ENOENT;
+			if (!std::filesystem::is_directory(status)) return KERNEL_ERROR_ENOTDIR;
+#endif
+			return OK;
+		};
+		int status = check_component();
+		if (status != OK) return status;
+		for (const auto& component: path.relative_path()) {
+			if (component.empty()) continue;
+			if (component == "." || component == "..") return KERNEL_ERROR_EINVAL;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			const auto name = component.native();
+			if (name.find_first_of(L":<>\"|?*") != std::wstring::npos || name.back() == L'.' ||
+			    name.back() == L' ')
+				return KERNEL_ERROR_EINVAL;
+#endif
+			current /= component;
+			status = check_component();
+			if (status != OK) return status;
+		}
+		return OK;
+	};
+	int status = ordinary_directory(sysroot);
+	if (status != OK) return status;
+	if (!g_mount_points->IsReadOnly(sysroot)) return KERNEL_ERROR_EINVAL;
+	std::error_code error;
+	if (!std::filesystem::equivalent(sysroot, g_mount_points->ResolvePath("/"), error))
+		return error ? host_error(error) : KERNEL_ERROR_EINVAL;
+	const auto supplied           = sysroot / "system_tmp";
+	status                        = ordinary_directory(supplied);
+	const bool supplied_directory = status == OK;
+	if (!supplied_directory && status != KERNEL_ERROR_ENOENT) return status;
+	auto underlay = supplied;
+	if (!supplied_directory) {
+		status = ordinary_directory(directory);
+		if (status != OK) return status;
+		const auto source = std::filesystem::canonical(sysroot, error);
+		if (error) return host_error(error);
+		underlay = std::filesystem::canonical(directory, error);
+		if (error) return host_error(error);
+		const auto within = [](const std::filesystem::path& child,
+		                       const std::filesystem::path& parent) {
+			auto target = child.begin();
+			for (auto part = parent.begin(); part != parent.end(); ++part, ++target) {
+				if (target == child.end()) return false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				if (_wcsicmp(part->c_str(), target->c_str()) != 0) return false;
+#else
+				if (*part != *target) return false;
+#endif
+			}
+			return true;
+		};
+		if (within(underlay, source) || within(source, underlay)) return KERNEL_ERROR_EINVAL;
+		const bool empty = std::filesystem::is_empty(underlay, error);
+		if (error) return host_error(error);
+		if (!empty) return KERNEL_ERROR_ENOTEMPTY;
+	}
+	std::filesystem::path existing;
+	if (g_mount_points->GetMountDirectory("/system_tmp", &existing)) {
+		if (ordinary_directory(existing) != OK || !g_mount_points->IsReadOnly(existing) ||
+		    !std::filesystem::equivalent(existing, underlay, error) || error)
+			return KERNEL_ERROR_EBUSY;
+	} else if (!supplied_directory) {
+		MountReadOnly(underlay, "/system_tmp");
+	}
+	LOGF("INITIAL_SYSTEM_TMP_DIRECTORY source=%s guest=/system_tmp host=%s\n",
+	     supplied_directory ? "supplied_sysroot" : "modeled_empty_underlay",
+	     Common::PathToString(underlay).c_str());
+	return OK;
+}
+
+uint16_t GetUmask() {
+	return static_cast<uint16_t>(g_creation_mask.load(std::memory_order_relaxed));
+}
+
+int KYTY_SYSV_ABI KernelUmask(int mask) {
+	return g_creation_mask.exchange(mask & 0777, std::memory_order_relaxed);
+}
+
+int MountTmpfs(const std::string& point, uint32_t mode, uint64_t byte_limit, uint32_t inode_limit) {
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_tmpfs_status != OK) return g_tmpfs_status;
+	if (ExfatMount::Overlaps(point) || BfsMount::Overlaps(point) ||
+	    DirectoryPassthrough::Overlaps(point) || NullfsMount::Overlaps(point))
+		return KERNEL_ERROR_EBUSY;
+	const int traversal = ValidateMountedTraversal(point);
+	if (traversal != OK) return traversal;
+	std::string normalized;
+	const int   parsed = Tmpfs::NormalizePath(point, &normalized);
+	if (parsed != OK) return parsed;
+	FileStat    covered {};
+	std::string walked = "/";
+	for (size_t start = 1; start <= point.size();) {
+		const auto end       = point.find('/', start);
+		const auto component = point.substr(start, end == std::string::npos ? end : end - start);
+		if (!component.empty() && component != ".") {
+			if (component == "..") {
+				const auto slash = walked.find_last_of('/');
+				walked.resize(slash == 0 ? 1 : slash);
+			} else {
+				if (walked.size() > 1) walked += '/';
+				walked += component;
+			}
+		}
+		const int status = KernelStat(walked.c_str(), &covered);
+		if (status != OK) return status;
+		if ((covered.st_mode & 0170000u) != 0040000u) return KERNEL_ERROR_ENOTDIR;
+		if (end == std::string::npos) break;
+		start = end + 1;
+	}
+	const int result =
+	    Tmpfs::Mount(normalized, mode, byte_limit, inode_limit, covered.st_uid, covered.st_gid);
+	if (result == OK)
+		LOGF("TMPFS_MOUNTED path=%s mode=%o byte_limit=%" PRIu64
+		     " inode_limit=%u backing=shared_memory\n",
+		     normalized.c_str(), mode, byte_limit, inode_limit);
+	return result;
+}
+
+int MountExfatReadOnly(const std::string& point, std::shared_ptr<ExfatVolume> volume) {
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	if (!volume) return KERNEL_ERROR_EINVAL;
+	const int traversal = ValidateMountedTraversal(point);
+	if (traversal != OK) return traversal;
+	std::string normalized;
+	const int   parsed = Tmpfs::NormalizePath(point, &normalized);
+	if (parsed != OK) return parsed;
+	if (Tmpfs::Overlaps(normalized) || DirectoryPassthrough::Overlaps(normalized) ||
+	    BfsMount::Overlaps(normalized) || NullfsMount::Overlaps(normalized) ||
+	    g_mount_points->HasSubmount(normalized))
+		return KERNEL_ERROR_EBUSY;
+	FileStat  covered {};
+	const int existing = KernelStat(point.c_str(), &covered);
+	if (existing != OK) return existing;
+	if ((covered.st_mode & 0170000u) != 0040000u) return KERNEL_ERROR_ENOTDIR;
+	return ExfatMount::Mount(normalized, std::move(volume));
+}
+
+int MountBfsReadOnly(const std::string& point, std::shared_ptr<BfsVolume> volume) {
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	if (!volume) return KERNEL_ERROR_EINVAL;
+	const int traversal = ValidateMountedTraversal(point);
+	if (traversal != OK) return traversal;
+	std::string normalized;
+	const int   parsed = Tmpfs::NormalizePath(point, &normalized);
+	if (parsed != OK) return parsed;
+	if (Tmpfs::Overlaps(normalized) || DirectoryPassthrough::Overlaps(normalized) ||
+	    ExfatMount::Overlaps(normalized) || NullfsMount::Overlaps(normalized) ||
+	    g_mount_points->HasSubmount(normalized))
+		return KERNEL_ERROR_EBUSY;
+	FileStat  covered {};
+	const int existing = KernelStat(point.c_str(), &covered);
+	if (existing != OK) return existing;
+	if ((covered.st_mode & 0170000u) != 0040000u) return KERNEL_ERROR_ENOTDIR;
+	return BfsMount::Mount(normalized, std::move(volume));
+}
+
+// nullfs may cover any directory vnode; stacking on a mount root or over submounts is refused
+static bool NullfsPointBusy(const std::string& point) {
+	const auto slash  = point.rfind('/');
+	const auto parent = slash == 0 ? std::string("/") : point.substr(0, slash);
+	const bool inside = Tmpfs::Contains(parent) || ExfatMount::Contains(parent) ||
+	                    BfsMount::Contains(parent) || DirectoryPassthrough::Contains(parent);
+	std::filesystem::path occupied;
+	return (!inside && (Tmpfs::Overlaps(point) || ExfatMount::Overlaps(point) ||
+	                    BfsMount::Overlaps(point) || DirectoryPassthrough::Overlaps(point))) ||
+	       NullfsMount::Overlaps(point) || DevfsInstanceOverlaps(point) ||
+	       g_mount_points->HasSubmount(point) ||
+	       g_mount_points->GetMountDirectory(point, &occupied);
+}
+
+// fresh directory vnodes per devfs mount, inodes from the global devfs_inos unrhdr (lowest free);
+// cdev inodes shared with /dev
+int MountDevfs(const std::string& point) {
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr || DevfsRootListing() == nullptr || DevfsHeldInodes() == nullptr)
+		return KERNEL_ERROR_EOPNOTSUPP;
+	int result = ValidateNullfsTraversal(point);
+	if (result != OK) return result;
+	std::string normalized;
+	result = Tmpfs::NormalizePath(point, &normalized);
+	if (result != OK) return result;
+	if (normalized == "/dev" || NullfsPointBusy(normalized)) return KERNEL_ERROR_EBUSY;
+	FileStat target {};
+	result = KernelStat(normalized.c_str(), &target);
+	if (result != OK) return result;
+	if ((target.st_mode & 0170000u) != 0040000u) return KERNEL_ERROR_ENOTDIR;
+	std::vector<uint32_t> used = *DevfsHeldInodes();
+	for (const auto& entry: *DevfsRootListing())
+		used.push_back(entry.inode);
+	DevfsInstance   instance {normalized, {}};
+	std::lock_guard lock(g_devfs_instances_mutex);
+	for (const auto& live: g_devfs_instances)
+		used.insert(used.end(), live.directories.begin(), live.directories.end());
+	std::sort(used.begin(), used.end());
+	uint32_t candidate = 3;
+	for (const auto& entry: *DevfsRootListing()) {
+		if (entry.type != 4) continue;
+		while (std::binary_search(used.begin(), used.end(), candidate))
+			candidate++;
+		instance.directories.push_back(candidate++);
+	}
+	std::string inodes;
+	for (auto inode: instance.directories)
+		inodes += (inodes.empty() ? "" : ",") + std::to_string(inode);
+	LOGF("DEVFS_INSTANCE_MOUNTED path=%s dir_inodes=%s\n", normalized.c_str(), inodes.c_str());
+	g_devfs_instances.push_back(std::move(instance));
+	return OK;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// nullfs mounts are kernel-global on the console. ShellCore builds /mnt/sandbox in its own process
+// while SysCore execs the app, so they're published run-wide and the app imports those under its
+// chroot.
+struct SharedSandboxMounts {
+	static constexpr uint64_t Signature = 0x3176534d42444e53ull;
+	struct Entry {
+		uint32_t used;
+		uint32_t device;
+		uint32_t inode;
+		uint32_t reserved;
+		uint64_t flags;
+		char     point[512];
+		char     source[512];
+	};
+	uint64_t signature;
+	Entry    entries[1024];
+};
+
+class SharedSandboxLock {
+public:
+	SharedSandboxLock() {
+		static std::once_flag       once;
+		static HANDLE               mutex = nullptr;
+		static SharedSandboxMounts* table = nullptr;
+		std::call_once(once, [] {
+			std::string scope;
+			if (!Process::GetScope(&scope)) return;
+			const auto name          = "Local\\kyty_ps5_" + scope + "_sandbox_mounts_v1";
+			HANDLE     created_mutex = CreateMutexA(nullptr, FALSE, (name + "_lock").c_str());
+			HANDLE     section =
+			    CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+				                   sizeof(SharedSandboxMounts), (name + "_state").c_str());
+			if (created_mutex == nullptr || section == nullptr) {
+				LOGF("SANDBOX_MOUNT_TABLE unavailable error=%lu\n", GetLastError());
+				return;
+			}
+			auto* view = static_cast<SharedSandboxMounts*>(MapViewOfFile(
+			    section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedSandboxMounts)));
+			if (view == nullptr) return;
+			mutex = created_mutex;
+			table = view;
+		});
+		if (mutex == nullptr) return;
+		const DWORD wait = WaitForSingleObject(mutex, INFINITE);
+		if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) return;
+		m_mutex = mutex;
+		if (table->signature == 0) table->signature = SharedSandboxMounts::Signature;
+		if (table->signature == SharedSandboxMounts::Signature) m_table = table;
+	}
+	~SharedSandboxLock() {
+		if (m_mutex != nullptr) ReleaseMutex(m_mutex);
+	}
+	SharedSandboxMounts* table() const { return m_table; }
+
+private:
+	HANDLE               m_mutex = nullptr;
+	SharedSandboxMounts* m_table = nullptr;
+};
+
+static void PublishSandboxMount(const std::string& point, const std::string& source, uint64_t flags,
+                                uint32_t device, uint32_t inode) {
+	if (!point.starts_with("/mnt/sandbox/")) return;
+	if (point.size() >= sizeof(SharedSandboxMounts::Entry::point) ||
+	    source.size() >= sizeof(SharedSandboxMounts::Entry::source)) {
+		LOGF("SANDBOX_MOUNT_PUBLISH path=%s skipped=name_too_long\n", point.c_str());
+		return;
+	}
+	SharedSandboxLock lock;
+	if (lock.table() == nullptr) return;
+	SharedSandboxMounts::Entry* slot = nullptr;
+	for (auto& entry: lock.table()->entries) {
+		if (entry.used != 0 && point == entry.point) {
+			slot = &entry;
+			break;
+		}
+		if (entry.used == 0 && slot == nullptr) slot = &entry;
+	}
+	if (slot == nullptr) {
+		LOGF("SANDBOX_MOUNT_PUBLISH path=%s skipped=table_full\n", point.c_str());
+		return;
+	}
+	std::memset(slot, 0, sizeof(*slot));
+	std::memcpy(slot->point, point.c_str(), point.size());
+	std::memcpy(slot->source, source.c_str(), source.size());
+	slot->flags  = flags;
+	slot->device = device;
+	slot->inode  = inode;
+	slot->used   = 1;
+}
+
+static void RetractSandboxMount(const std::string& point) {
+	if (!point.starts_with("/mnt/sandbox/")) return;
+	SharedSandboxLock lock;
+	if (lock.table() == nullptr) return;
+	for (auto& entry: lock.table()->entries) {
+		if (entry.used != 0 && point == entry.point) entry.used = 0;
+	}
+}
+#else
+static void PublishSandboxMount(const std::string&, const std::string&, uint64_t, uint32_t,
+                                uint32_t) {}
+static void RetractSandboxMount(const std::string&) {}
+#endif
+
+int ImportExecSandboxMounts(const std::string& root, const std::string& word) try {
+	std::string normalized_root;
+	int         result = Tmpfs::NormalizePath(root, &normalized_root);
+	if (result != OK || normalized_root == "/" || word.empty() || word.find('/') != word.npos) {
+		LOGF("GUEST_EXEC_SANDBOX_MOUNTS root=%s word=%s imported=0 rejected=0 "
+		     "skipped=unusable_root_or_word\n",
+		     root.c_str(), word.c_str());
+		return KERNEL_ERROR_EINVAL;
+	}
+	// only the randomized system tree, the child mounts app0, dev and system_tmp itself
+	const std::string                       prefix = normalized_root + "/" + word;
+	std::vector<SharedSandboxMounts::Entry> selected;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	{
+		SharedSandboxLock lock;
+		if (lock.table() == nullptr) return KERNEL_ERROR_ENOSYS;
+		for (const auto& entry: lock.table()->entries) {
+			if (entry.used == 0) continue;
+			const std::string_view point(entry.point);
+			if (point == prefix || (point.starts_with(prefix) && point[prefix.size()] == '/'))
+				selected.push_back(entry);
+		}
+	}
+#endif
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	size_t imported = 0, rejected = 0;
+	for (const auto& entry: selected) {
+		const std::string point = std::string(entry.point).substr(normalized_root.size());
+		FileStat          lower {};
+		result = KernelStat(entry.source, &lower);
+		if (result == OK && (lower.st_dev != entry.device || lower.st_ino != entry.inode))
+			result = KERNEL_ERROR_ESTALE;
+		if (result == OK) result = NullfsMount::Mount(point, entry.source, entry.flags);
+		if (result != OK) {
+			rejected++;
+			LOGF("GUEST_EXEC_SANDBOX_MOUNT_REJECTED path=%s source=%s error=0x%x\n", point.c_str(),
+			     entry.source, result);
+			continue;
+		}
+		imported++;
+	}
+	LOGF("GUEST_EXEC_SANDBOX_MOUNTS root=%s word=%s imported=%zu rejected=%zu\n",
+	     normalized_root.c_str(), word.c_str(), imported, rejected);
+	return rejected == 0 ? OK : KERNEL_ERROR_EINVAL;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
+
+int MountNullfs(const std::string& source, const std::string& point, uint64_t flags) {
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	int traversal = ValidateNullfsTraversal(source);
+	if (traversal != OK) return traversal;
+	traversal = ValidateNullfsTraversal(point);
+	if (traversal != OK) return traversal;
+	std::string normalized_source;
+	std::string normalized_point;
+	int         result = Tmpfs::NormalizePath(source, &normalized_source);
+	if (result != OK) return result;
+	result = Tmpfs::NormalizePath(point, &normalized_point);
+	if (result != OK) return result;
+	if (NullfsPointBusy(normalized_point)) return KERNEL_ERROR_EBUSY;
+	FileStat target {};
+	result = KernelStat(normalized_point.c_str(), &target);
+	if (result != OK) {
+		LOGF("NULLFS_REJECTED path=%s source=%s stage=target_stat error=0x%x\n",
+		     normalized_point.c_str(), normalized_source.c_str(), result);
+		return result;
+	}
+	if ((target.st_mode & 0170000u) != 0040000u) {
+		LOGF("NULLFS_REJECTED path=%s source=%s stage=target_type error=0x%x\n",
+		     normalized_point.c_str(), normalized_source.c_str(), KERNEL_ERROR_ENOTDIR);
+		return KERNEL_ERROR_ENOTDIR;
+	}
+	result = ValidateMountedTraversal(source);
+	if (result != OK) return result;
+	FileStat lower {};
+	result = KernelStat(normalized_source.c_str(), &lower);
+	if (result != OK) {
+		LOGF("NULLFS_REJECTED path=%s source=%s stage=source_stat error=0x%x\n",
+		     normalized_point.c_str(), normalized_source.c_str(), result);
+		return result;
+	}
+	if ((lower.st_mode & 0170000u) != 0040000u) {
+		LOGF("NULLFS_REJECTED path=%s source=%s stage=source_type error=0x%x\n",
+		     normalized_point.c_str(), normalized_source.c_str(), KERNEL_ERROR_ENOTDIR);
+		return KERNEL_ERROR_ENOTDIR;
+	}
+	result = NullfsMount::Mount(normalized_point, normalized_source, flags);
+	if (result == OK) {
+		LOGF("NULLFS_MOUNTED path=%s source=%s lower_dev=0x%x lower_inode=0x%x flags=0x%llx\n",
+		     normalized_point.c_str(), normalized_source.c_str(), lower.st_dev, lower.st_ino,
+		     static_cast<unsigned long long>(flags));
+		PublishSandboxMount(normalized_point, normalized_source, flags, lower.st_dev, lower.st_ino);
+	}
+	return result;
+}
+
+int MountRegisteredExfatReadOnly(const std::string& device, const std::string& point) {
+	auto backing = FindSectorPayload(device);
+	if (!backing) return KERNEL_ERROR_ENOENT;
+	if (!backing->ReadOnly()) return KERNEL_ERROR_EROFS;
+	ExfatVolume::Result          opened;
+	std::shared_ptr<ExfatVolume> volume = ExfatVolume::Open(std::move(backing), &opened);
+	if (!volume) {
+		switch (opened) {
+			case ExfatVolume::Result::Invalid: return KERNEL_ERROR_EINVAL;
+			case ExfatVolume::Result::NotFound: return KERNEL_ERROR_ENOENT;
+			case ExfatVolume::Result::NotDirectory: return KERNEL_ERROR_ENOTDIR;
+			case ExfatVolume::Result::IsDirectory: return KERNEL_ERROR_EISDIR;
+			case ExfatVolume::Result::Unsupported: return KERNEL_ERROR_ENOTSUP;
+			default: return KERNEL_ERROR_EIO;
+		}
+	}
+	return MountExfatReadOnly(point, std::move(volume));
+}
+
+int MountRegisteredBfs(const std::string& device, const std::string& point) {
+	auto backing = FindSectorPayload(device);
+	if (!backing) return KERNEL_ERROR_ENOENT;
+	if (!backing->ReadOnly()) return KERNEL_ERROR_EROFS;
+	BfsVolume::Options options;
+	const auto         slash = device.rfind('/');
+	options.partition_name   = slash == std::string::npos ? device : device.substr(slash + 1);
+	BfsVolume::Result          opened;
+	std::shared_ptr<BfsVolume> volume = BfsVolume::Open(std::move(backing), options, &opened);
+	if (!volume) {
+		switch (opened) {
+			case BfsVolume::Result::Invalid: return KERNEL_ERROR_EINVAL;
+			case BfsVolume::Result::NotFound: return KERNEL_ERROR_ENOENT;
+			case BfsVolume::Result::NotDirectory: return KERNEL_ERROR_ENOTDIR;
+			case BfsVolume::Result::IsDirectory: return KERNEL_ERROR_EISDIR;
+			case BfsVolume::Result::Unsupported: return KERNEL_ERROR_ENOTSUP;
+			case BfsVolume::Result::MissingData: return KERNEL_ERROR_EIO;
+			case BfsVolume::Result::Corrupt: return KERNEL_ERROR_EIO;
+			default: return KERNEL_ERROR_EIO;
+		}
+	}
+	const int result = MountBfsReadOnly(point, std::move(volume));
+	if (result == OK) {
+		LOGF("BFS_MOUNTED device=%s point=%s partition=%s\n", device.c_str(), point.c_str(),
+		     options.partition_name.c_str());
+	}
+	return result;
+}
+
+static std::string ReadOnlyProviderPoint(const std::string& device) {
+	if (device == "/dev/lvd0") return "/mnt/rnps";
+	if (device != "/dev/ssd0.system" && device != "/dev/ssd0.system_b" &&
+	    device != "/dev/ssd0.system_ex" && device != "/dev/ssd0.system_ex_b" &&
+	    device != "/dev/ssd0.system_data" && device != "/dev/ssd0.system_data_b" &&
+	    device != "/dev/ssd0.update" && device != "/dev/ssd0.update_b" &&
+	    device != "/dev/ssd0.preinst" && device != "/dev/ssd0.preinst_b" &&
+	    device != "/dev/ssd0.user")
+		return {};
+	return "/" + device.substr(sizeof("/dev/ssd0.") - 1);
+}
+
+static std::string ReadOnlyProviderFileSystemType(const std::string& device) {
+	return device.starts_with("/dev/ssd0.") ? "exfatfs" : "";
+}
+
+static bool SameProviderRoot(const std::filesystem::path& left,
+                             const std::filesystem::path& right) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return _wcsicmp(left.c_str(), right.c_str()) == 0;
+#else
+	return left == right;
+#endif
+}
+
+static int ReadProviderRoot(const std::filesystem::path& supplied, std::filesystem::path* root,
+                            std::string* identity) {
+	if (!supplied.is_absolute() || supplied.native().find(std::filesystem::path::value_type {}) !=
+	                                   std::filesystem::path::string_type::npos)
+		return KERNEL_ERROR_EINVAL;
+	if (Common::PathToString(supplied).find_first_of("\r\n") != std::string::npos)
+		return KERNEL_ERROR_EINVAL;
+	std::error_code error;
+	auto            canonical = std::filesystem::canonical(supplied, error);
+	if (error || !std::filesystem::is_directory(canonical, error)) return KERNEL_ERROR_ENOENT;
+	if (Common::PathToString(canonical).find_first_of("\r\n") != std::string::npos)
+		return KERNEL_ERROR_EINVAL;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto handle =
+	    CreateFileW(canonical.c_str(), FILE_READ_ATTRIBUTES,
+		            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+		            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) return KERNEL_ERROR_EIO;
+	BY_HANDLE_FILE_INFORMATION info {};
+	const bool                 inspected = GetFileInformationByHandle(handle, &info) != FALSE;
+	CloseHandle(handle);
+	if (!inspected) return KERNEL_ERROR_EIO;
+	if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return KERNEL_ERROR_ELOOP;
+	*identity = std::to_string(info.dwVolumeSerialNumber) + ":" +
+	            std::to_string(info.nFileIndexHigh) + ":" + std::to_string(info.nFileIndexLow);
+#else
+	struct stat info {};
+	if (::stat(canonical.c_str(), &info) != 0) return KERNEL_ERROR_EIO;
+	*identity = std::to_string(info.st_dev) + ":" + std::to_string(info.st_ino);
+#endif
+	*root = std::move(canonical);
+	return OK;
+}
+
+static bool FindPassthroughRegistration(const std::string&       device,
+                                        PassthroughRegistration* registration) {
+	std::lock_guard lock(g_passthrough_registration_mutex);
+	for (const auto& entry: g_passthrough_registrations) {
+		if (entry.device == device) {
+			*registration = entry;
+			return true;
+		}
+	}
+	return false;
+}
+
+static int ValidateProviderRegistration(const PassthroughRegistration& registration) {
+	std::filesystem::path root;
+	std::string           identity;
+	const int             result = ReadProviderRoot(registration.supplied_root, &root, &identity);
+	if (result != OK) return result;
+	return SameProviderRoot(root, registration.root) && identity == registration.identity
+	           ? OK
+			   : KERNEL_ERROR_EINVAL;
+}
+
+bool HasCapturedPartitionPassthrough(const std::string& device) {
+	PassthroughRegistration registration;
+	return FindPassthroughRegistration(device, &registration) &&
+	       CapturedDirectory::ForRoot(registration.root) != nullptr;
+}
+
+static int AttachSystemResourceArbitratorCapture(const std::string& device,
+                                                 const std::string& point) {
+	if (device != "/dev/ssd0.system" || point != "/system") return OK;
+	constexpr std::string_view captured_manifest_sha256 =
+	    "a45253eea9da61dc2b3c7bfd50905aa64995646fcee782cc680517879be612b0";
+	// derived manifest (some payloads withheld) has its own digest
+	const char* derived_manifest_sha256 = std::getenv("KYTY_PS5_CAPTURED_STORAGE_DERIVED_SHA256");
+	const std::string manifest_sha256 =
+	    derived_manifest_sha256 != nullptr && derived_manifest_sha256[0] != '\0'
+	        ? std::string(derived_manifest_sha256)
+	        : std::string(captured_manifest_sha256);
+	constexpr std::string_view prefix = "/priv/resource_arbitrator_ro";
+	constexpr std::string_view file   = "/priv/resource_arbitrator_ro/ra-config.json";
+	constexpr std::string_view file_sha256 =
+	    "d9479085076615484a2a443b7b1ee6725a9f7701225696a63581a636b328c71a";
+	const auto snapshot = CapturedDirectory::ForPoint(point);
+	if (!snapshot) return OK;
+	if (snapshot->manifest_sha256 != manifest_sha256) return KERNEL_ERROR_EINVAL;
+	const CapturedDirectory::Entry* entry = nullptr;
+	const int                       found = CapturedDirectory::Find(*snapshot, file, &entry);
+	if (found != OK) return found;
+	if (!entry->metadata || entry->type != 8 || entry->stat.size != 10333 || entry->file.empty() ||
+	    entry->sha256 != file_sha256)
+		return KERNEL_ERROR_EINVAL;
+	const int attached =
+	    DirectoryPassthrough::AttachCapturedFallback(point, std::string(prefix), manifest_sha256);
+	if (attached != OK) return attached;
+	LOGF("STORAGE_CAPTURED_FALLBACK_MOUNTED point=/system prefix=/priv/resource_arbitrator_ro "
+	     "manifest_sha256=%s file_sha256=%s read_only=1 derived=%d\n",
+	     manifest_sha256.c_str(), file_sha256.data(),
+	     manifest_sha256 != captured_manifest_sha256 ? 1 : 0);
+	// what the decrypted primary lacks, data only
+	static constexpr std::string_view data_prefixes[] = {
+	    "/common/cert",
+	    "/common/etc",
+	    "/common/font2",
+	    "/common/mms_ro",
+	    "/common/psml_package",
+	    "/common/text_to_speech",
+	    "/common/lib/0VCZq_7VjvwjsFYg8xirSTau96ShhC6SD95Lnjb2tCE.sbin",
+	    "/common/lib/0VCZq_7VjvwjsFYg8xirSTau96ShhC6SD95Lnjb2tCE_r2.sbin",
+	    "/common/lib/N4pyqHm8htvejpjmzEmWm0JvkKU60YeyEEPs4BodCBw.sbin",
+	    "/common/lib/N4pyqHm8htvejpjmzEmWm0JvkKU60YeyEEPs4BodCBw_r2.sbin",
+	    "/common/lib/ScePlayReady4.sbin",
+	    "/common/lib/ScePlayReady4_r2.sbin",
+	    "/priv/bd",
+	    "/priv/bgdc_ro",
+	    "/priv/etc",
+	    "/priv/hid_config_service_ro",
+	    "/priv/mms_ro",
+	    "/priv/ps4appcategory_ro",
+	    "/priv/ps4sisrctl_ro",
+	    "/priv/psnow_ro",
+	    "/priv/system_logger2_ro",
+	    "/priv/title_separation_ro",
+	    "/priv/tts",
+	    "/priv/voice_and_agent_ro",
+	    "/priv/vr_hand_ro",
+	    "/priv/workaround_ctl_ro",
+	    "/sys/minimum_hrtf.dat",
+	    "/sys/minimum_tri_table.dat",
+	    "/sys/preset1.srtf",
+	    "/sys/preset2.srtf",
+	    "/sys/preset3.srtf",
+	    "/sys/preset4.srtf",
+	    "/sys/preset5.srtf",
+	    "/sys/preset_tri_table.dat",
+	    "/sys/vsh_prefetch_list.dat",
+	    "/vsh/app",
+	    "/vsh_asset",
+	};
+	for (const auto data_prefix: data_prefixes) {
+		const int data = DirectoryPassthrough::AttachCapturedFallback(
+		    point, std::string(data_prefix), manifest_sha256);
+		if (data != OK) return data;
+	}
+	LOGF("STORAGE_CAPTURED_FALLBACK_DATA_MOUNTED point=/system prefixes=%zu manifest_sha256=%s "
+	     "read_only=1\n",
+	     std::size(data_prefixes), manifest_sha256.c_str());
+	return OK;
+}
+
+
+int MountRegisteredPartitionPassthrough(const std::string& device, const std::string& point,
+                                        bool writable) try {
+	PassthroughRegistration registration;
+	if (!FindPassthroughRegistration(device, &registration)) return KERNEL_ERROR_ENOENT;
+	const int valid = ValidateProviderRegistration(registration);
+	if (valid != OK) return valid;
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (device.starts_with("/dev/lvd")) {
+		const int lvd = ValidateLvdUfsPassthrough(device);
+		if (lvd != OK) return lvd;
+	}
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	const int traversal = ValidateMountedTraversal(point);
+	if (traversal != OK) return traversal;
+	std::string normalized;
+	const int   parsed = Tmpfs::NormalizePath(point, &normalized);
+	if (parsed != OK) return parsed;
+	if (Tmpfs::Overlaps(normalized) || ExfatMount::Overlaps(normalized) ||
+	    BfsMount::Overlaps(normalized) || NullfsMount::Overlaps(normalized) ||
+	    g_mount_points->HasSubmount(normalized))
+		return KERNEL_ERROR_EBUSY;
+	FileStat  covered {};
+	const int existing = KernelStat(point.c_str(), &covered);
+	if (existing != OK) return existing;
+	if ((covered.st_mode & 0170000u) != 0040000u) return KERNEL_ERROR_ENOTDIR;
+	auto published = g_published_read_only_providers;
+	if (normalized == ReadOnlyProviderPoint(device)) published.push_back({device, normalized});
+	const auto     guest_fstype = ReadOnlyProviderFileSystemType(device);
+	const auto     guest_source = guest_fstype.empty() ? std::string {} : device;
+	const uint64_t guest_flags  = guest_fstype.empty() || writable ? 0 : 1;
+	int result = DirectoryPassthrough::Mount(normalized, registration.root, writable, guest_fstype,
+	                                         guest_source, guest_flags);
+	if (result == OK) {
+		result = AttachSystemResourceArbitratorCapture(device, normalized);
+		if (result != OK) {
+			DirectoryPassthrough::Unmount(normalized);
+			return result;
+		}
+		g_published_read_only_providers.swap(published);
+		const auto u8 = registration.root.u8string();
+		LOGF("STORAGE_PASSTHROUGH_MOUNTED device=%s point=%s host_root=%s NON_AUTHENTIC=1\n",
+		     device.c_str(), point.c_str(), reinterpret_cast<const char*>(u8.c_str()));
+	}
+	return result;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
+
+
+
+int ExportExecNullfsMounts(std::string* manifest) try {
+	if (manifest == nullptr) return KERNEL_ERROR_EFAULT;
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	std::vector<NullfsMount::MountInfo> mounts;
+	const int                           snapshot = NullfsMount::SnapshotMounts(&mounts);
+	if (snapshot != OK) return snapshot;
+	std::ostringstream output;
+	output << "KYTY_EXEC_NULLFS 1\n";
+	for (const auto& mount: mounts) {
+		if (mount.point.find_first_of("\r\n") != mount.point.npos ||
+		    mount.source.find_first_of("\r\n") != mount.source.npos)
+			return KERNEL_ERROR_EINVAL;
+		FileStat  lower {};
+		const int result = KernelStat(mount.source.c_str(), &lower);
+		if (result != OK) return result;
+		if ((lower.st_mode & 0170000u) != 0040000u) return KERNEL_ERROR_ENOTDIR;
+		output << (mount.flags != 0 ? "F " : "N ") << std::quoted(mount.point) << ' '
+		       << std::quoted(mount.source) << ' ' << lower.st_dev << ' ' << lower.st_ino;
+		if (mount.flags != 0) output << ' ' << mount.flags;
+		output << '\n';
+	}
+	output << "END\n";
+	auto encoded = output.str();
+	if (encoded.size() > 65536) return KERNEL_ERROR_E2BIG;
+	*manifest = std::move(encoded);
+	return OK;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
+
+
+bool IsDiagnosticGcDeviceReady() noexcept {
+	return g_diagnostic_gc_device_ready.load();
+}
+
+void Umount(const std::string& folder_or_point) {
+	std::lock_guard publication(g_mount_publication_mutex);
+
+	if (NullfsMount::Contains(folder_or_point)) {
+		const int result = NullfsMount::Unmount(folder_or_point);
+		if (result != OK)
+			LOGF("NULLFS_UNMOUNT path=%s error=0x%x\n", folder_or_point.c_str(), result);
+		else
+			RetractSandboxMount(folder_or_point);
+		return;
+	}
+
+	if (NullfsMount::Overlaps(folder_or_point)) {
+		LOGF("NULLFS_COVERED_UNMOUNT path=%s error=0x%x\n", folder_or_point.c_str(),
+		     KERNEL_ERROR_EBUSY);
+		return;
+	}
+
+	if (ExfatMount::Contains(folder_or_point)) {
+		const int result = ExfatMount::Unmount(folder_or_point);
+		if (result != OK)
+			LOGF("EXFAT_UNMOUNT path=%s error=0x%x\n", folder_or_point.c_str(), result);
+		return;
+	}
+
+	if (BfsMount::Contains(folder_or_point)) {
+		const int result = BfsMount::Unmount(folder_or_point);
+		if (result != OK) LOGF("BFS_UNMOUNT path=%s error=0x%x\n", folder_or_point.c_str(), result);
+		return;
+	}
+
+	if (DirectoryPassthrough::Contains(folder_or_point)) {
+		const int result = DirectoryPassthrough::Unmount(folder_or_point);
+		if (result != OK)
+			LOGF("PASSTHROUGH_UNMOUNT path=%s error=0x%x\n", folder_or_point.c_str(), result);
+		if (result == OK) {
+			std::erase_if(g_published_read_only_providers, [](const auto& binding) {
+				DirectoryPassthrough::MountInfo info;
+				return DirectoryPassthrough::DescribeMount(binding.point, &info) != OK;
+			});
+		}
+		return;
+	}
+
+	if (Tmpfs::Contains(folder_or_point)) {
+		const int result = Tmpfs::Unmount(folder_or_point);
+		if (result != OK)
+			LOGF("TMPFS_UNMOUNT path=%s error=0x%x\n", folder_or_point.c_str(), result);
+		return;
+	}
 	g_mount_points->Umount(folder_or_point);
 }
 
-std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
+bool IsNullfsNoExec(const std::string& mounted_file_name) {
+	if (ValidateNullfsTraversal(mounted_file_name) != OK) return false;
+	NullfsMount::Resolution resolution;
+	return NullfsMount::Resolve(mounted_file_name, &resolution) == OK && resolution.no_exec;
+}
 
-	return g_mount_points->ResolvePath(mounted_file_name);
+std::filesystem::path GetRealFilename(const std::string& mounted_file_name) {
+	if (ValidateNullfsTraversal(mounted_file_name) != OK) return {};
+	NullfsMount::Resolution resolution;
+	if (NullfsMount::Resolve(mounted_file_name, &resolution) != OK) return {};
+	const auto& resolved = resolution.mounted ? resolution.path : mounted_file_name;
+	if (ResolveDataTopologyPath(resolved) != DataTopologyPath::None) return {};
+	return g_mount_points->ResolvePath(resolved);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -796,29 +2866,158 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	std::string working_path;
+	const int   working = ResolveInitialWorkingDirectoryPath(&path, &working_path);
+	if (working != OK) return working;
+	std::string nullfs_path;
+	bool        nullfs_read_only = false;
+	const int nullfs = ResolveNullfsPath(&path, &nullfs_path, nullptr, nullptr, &nullfs_read_only);
+	if (nullfs != OK) return nullfs;
+	const bool native_sshot_path = std::strcmp(path, "/dev/sshot") == 0;
+	if (native_sshot_path && (flags != 2 || mode != 0)) return KERNEL_ERROR_EINVAL;
 
+	if (path[0] == '/') {
+		const int traversal = ValidateMountedTraversal(path);
+		if (traversal != OK) return traversal;
+	}
+	if (nullfs_read_only) {
+		// vn_open_cred: CREATE lookup of a missing name, then O_EXCL, then VWRITE for write access
+		// or O_TRUNC (EISDIR first for directories)
+		const auto flags_u = static_cast<uint32_t>(flags);
+		if ((flags_u & 3u) == 3u) return KERNEL_ERROR_EINVAL;
+		const bool writes = (flags_u & 3u) != 0 || (flags_u & 0x0400u) != 0;
+		if ((flags_u & 0x0200u) != 0 || writes) {
+			FileStat  existing {};
+			const int found = KernelStat(path, &existing);
+			if (found == KERNEL_ERROR_ENOENT && (flags_u & 0x0200u) != 0)
+				return NullfsReadOnlyLookup(path, true);
+			if (found == OK) {
+				if ((flags_u & 0x0a00u) == 0x0a00u) return KERNEL_ERROR_EEXIST;
+				if (writes)
+					return (existing.st_mode & 0170000u) == 0040000u ? KERNEL_ERROR_EISDIR
+					                                                 : KERNEL_ERROR_EROFS;
+			}
+		}
+	}
+	std::vector<uint32_t> devfs_directories;
+	const bool            devfs_instance = DevfsInstanceAt(path, &devfs_directories);
+	if (devfs_instance || IsDevfsRoot(path)) {
+		// vn_open_cred order: EINVAL for O_ACCMODE, EEXIST for O_CREAT|O_EXCL, then EISDIR for any
+		// write, create or truncate
+		const auto flags_u = static_cast<uint32_t>(flags);
+		if ((flags_u & 3u) == 3u) return KERNEL_ERROR_EINVAL;
+		if ((flags_u & 0x0a00u) == 0x0a00u) return KERNEL_ERROR_EEXIST;
+		if ((flags_u & 3u) != 0 || (flags_u & (0x0200u | 0x0400u)) != 0) return KERNEL_ERROR_EISDIR;
+		std::string point = "/dev";
+		if (devfs_instance) Tmpfs::NormalizePath(path, &point);
+		const int descriptor   = g_files->CreateDescriptor();
+		auto*     file         = g_files->GetFile(descriptor);
+		file->name             = point;
+		file->real_name        = Common::PathFromUtf8(point);
+		file->directory        = true;
+		file->readable         = true;
+		file->devfs_root       = true;
+		file->dirents          = PackDevfsRoot(devfs_instance ? &devfs_directories : nullptr);
+		file->dents_offset     = 0;
+		file->descriptor_flags = (flags_u & 0x00100000u) != 0 ? 1 : 0;
+		file->opened           = true;
+		return descriptor;
+	}
+	if (Tmpfs::Contains(path)) {
+		const int descriptor = g_files->CreateDescriptor();
+		auto*     file       = g_files->GetFile(descriptor);
+		const int opened     = Tmpfs::Open(
+		    path, flags, mode & ~g_creation_mask.load(std::memory_order_relaxed), &file->tmpfs);
+		if (opened != OK) {
+			g_files->DeleteDescriptor(descriptor);
+			return opened;
+		}
+		Tmpfs::NodeStat stat {};
+		const int       status = Tmpfs::Fstat(file->tmpfs, &stat);
+		if (status != OK) {
+			Tmpfs::Close(file->tmpfs);
+			g_files->DeleteDescriptor(descriptor);
+			return status;
+		}
+		file->name             = path;
+		file->special          = SpecialFile::Temporary;
+		file->directory        = (stat.mode & 0170000u) == 0040000u;
+		file->readable         = (flags & 3) != 1;
+		file->writable         = (flags & 3) != 0;
+		file->append           = (flags & 8) != 0;
+		file->descriptor_flags = (flags & 0x00100000) != 0 ? 1 : 0;
+		file->opened           = true;
+		return descriptor;
+	}
+	const auto data_topology = ResolveDataTopologyPath(path);
+	if (data_topology != DataTopologyPath::None) {
+		const auto flags_u = static_cast<uint32_t>(flags);
+		const auto access  = flags_u & 3u;
+		if (access == 3u) return KERNEL_ERROR_EINVAL;
+		const bool mutation =
+		    access != 0 || (flags_u & (0x0008u | 0x0200u | 0x0400u | 0x0800u)) != 0;
+		if (mutation) return KERNEL_ERROR_EROFS;
+		if (data_topology == DataTopologyPath::Missing) return KERNEL_ERROR_ENOENT;
+		const int descriptor   = g_files->CreateDescriptor();
+		auto*     file         = g_files->GetFile(descriptor);
+		file->name             = path;
+		file->real_name        = Common::PathFromUtf8(path);
+		file->directory        = true;
+		file->readable         = true;
+		file->data_topology    = true;
+		file->descriptor_flags = (flags_u & 0x00100000u) != 0 ? 1 : 0;
+		file->opened           = true;
+		return descriptor;
+	}
 	auto flags_u = static_cast<uint32_t>(flags);
+	if (std::strcmp(path, "/dev/mbus") == 0 &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr) {
+		if ((flags_u & 3u) == 3u) return KERNEL_ERROR_EINVAL;
+		if ((flags_u & 0x20000u) != 0) return KERNEL_ERROR_ENOTDIR;
+		if ((flags_u & ~0x00100007u) != 0) return KERNEL_ERROR_ENOSYS;
+	}
 
 	LOGF("\t path = %s\n"
 	     "\t flags = %08" PRIx32 "\n"
 	     "\t mode = %04" PRIx16 "\n",
-	     path, flags_u, mode);
+	     EscapeLogPath(path).c_str(), flags_u, mode);
 
-	bool append    = (flags_u & 0x0008u) != 0;
-	bool fsync     = (flags_u & 0x0080u) != 0;
-	bool sync      = (flags_u & 0x0080u) != 0;
-	bool creat     = (flags_u & 0x0200u) != 0;
-	bool trunc     = (flags_u & 0x0400u) != 0;
-	bool excl      = (flags_u & 0x0800u) != 0;
-	bool dsync     = (flags_u & 0x1000u) != 0;
-	bool direct    = (flags_u & 0x00010000u) != 0;
-	bool directory = (flags_u & 0x00020000u) != 0;
+	bool      append           = (flags_u & 0x0008u) != 0;
+	bool      fsync            = (flags_u & 0x0080u) != 0;
+	bool      sync             = (flags_u & 0x0080u) != 0;
+	bool      creat            = (flags_u & 0x0200u) != 0;
+	bool      trunc            = (flags_u & 0x0400u) != 0;
+	bool      excl             = (flags_u & 0x0800u) != 0;
+	bool      dsync            = (flags_u & 0x1000u) != 0;
+	bool      direct           = (flags_u & 0x00010000u) != 0;
+	bool      directory        = (flags_u & 0x00020000u) != 0;
+	const int descriptor_flags = (flags_u & 0x00100000u) != 0 ? 1 : 0;
+	const int deci_access      = flags & ~0x00100000;
 
 	if (direct) {
 		LOGF("\t O_DIRECT ignored on host file backend\n");
 	}
 
 	flags_u &= 0x3u;
+	const char* iccnvs4_image       = std::getenv("KYTY_PS5_ICCNVS4_IMAGE");
+	const char* iccnvs4_overlay     = std::getenv("KYTY_PS5_ICCNVS4_OVERLAY");
+	const bool  iccnvs4_has_overlay = iccnvs4_overlay != nullptr && iccnvs4_overlay[0] != '\0';
+	const bool  iccnvs4_requested   = std::strcmp(path, "/dev/iccnvs4") == 0 &&
+	                                  iccnvs4_image != nullptr && iccnvs4_image[0] != '\0';
+	if (iccnvs4_requested) {
+		if (flags_u == 3) return KERNEL_ERROR_EINVAL;
+		if (directory) return KERNEL_ERROR_ENOTDIR;
+		if ((flags_u == 1 && !iccnvs4_has_overlay) || creat || trunc || append || excl)
+			return KERNEL_ERROR_EROFS;
+	}
+	if (FindSectorPayload(path)) {
+		if (flags_u == 3 || creat || trunc || append || excl) return KERNEL_ERROR_EINVAL;
+		if (directory) return KERNEL_ERROR_ENOTDIR;
+	}
+	if (A53StorageEnabled() && IsA53SsdDevice(path) && flags_u == 3) {
+		// partition-verify opens /dev/ssd0 with an access mode the switch below rejects
+		flags_u = 0;
+	}
 
 	Common::File::Mode rw_mode = Common::File::Mode::Read;
 
@@ -827,6 +3026,11 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		case 1: rw_mode = Common::File::Mode::Write; break;
 		case 2: rw_mode = Common::File::Mode::ReadWrite; break;
 		default: EXIT("invalid flag_u: %u\n", flags_u);
+	}
+	bool exact_shellui_guest = false;
+	ClassifyPsmShellUiApplicationRoute(path, &exact_shellui_guest);
+	if (exact_shellui_guest && (rw_mode != Common::File::Mode::Read || append || creat || trunc)) {
+		return KERNEL_ERROR_EROFS;
 	}
 
 	EXIT_NOT_IMPLEMENTED(directory && rw_mode != Common::File::Mode::Read);
@@ -854,7 +3058,108 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		return descriptor;
 	}
 
-	file->real_name = g_mount_points->ResolvePath(file->name);
+	if (!directory && IsDipswDevice(file->name)) {
+		file->real_name = file->name;
+		file->special   = SpecialFile::Dipsw;
+		file->opened    = true;
+
+		LOGF_COLOR(Log::Color::Green, "\tOpen device: %s, [ok]\n",
+		           Common::PathToString(file->real_name).c_str());
+
+		return descriptor;
+	}
+
+	// SysCore child opens three debug consoles before exec setup, mapped to host stdio
+	if (!directory && std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr &&
+	    (file->name == "/dev/deci_stdin" || file->name == "/dev/deci_stdout" ||
+	     file->name == "/dev/deci_stderr")) {
+		const bool input = file->name == "/dev/deci_stdin";
+		const bool error = file->name == "/dev/deci_stderr";
+		if ((input && deci_access != 0) || (!input && deci_access != 1)) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		file->real_name = file->name;
+		file->special   = input ? SpecialFile::DeciStdin
+		                        : (error ? SpecialFile::DeciStderr : SpecialFile::DeciStdout);
+		file->opened    = true;
+		LOGF("SYSCORE_DECI_STREAM_OPEN guest_fd=%d path=%s"
+		     " host_standard_stream_backing=1"
+		     " guest_open_flags=%d\n",
+		     descriptor, file->name.c_str(), flags);
+		return descriptor;
+	}
+	if (!directory && IsConsoleDevice(file->name)) {
+		file->real_name = file->name;
+		file->special   = SpecialFile::Console;
+		file->opened    = true;
+
+		LOGF_COLOR(Log::Color::Green, "\tOpen device: %s, [ok]\n",
+		           Common::PathToString(file->real_name).c_str());
+
+		return descriptor;
+	}
+
+	if (!directory && IsNpdrmDevice(file->name)) {
+		file->real_name = file->name;
+		file->special   = SpecialFile::Npdrm;
+		file->opened    = true;
+
+		LOGF_COLOR(Log::Color::Green, "\tOpen device: %s, [ok]\n",
+		           Common::PathToString(file->real_name).c_str());
+
+		return descriptor;
+	}
+	if (!directory && A53StorageEnabled() && file->name == "/dev/bfs/ctl") {
+		if (trunc || append || excl || creat) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		file->special   = SpecialFile::BfsCtl;
+		file->real_name = file->name;
+		file->opened    = true;
+		LOGF("BFS_CTL_DEVICE_OPEN fd=%d flags=0x%x NON_AUTHENTIC"
+		     " backing_present=%d\n",
+		     descriptor, flags, FindSectorPayload("/dev/ssd0.user") != nullptr ? 1 : 0);
+		return descriptor;
+	}
+
+	if (auto backing = FindSectorPayload(file->name)) {
+		if (directory || creat || trunc || append || excl) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (backing->ReadOnly() && file->writable) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EROFS;
+		}
+		file->sector_backing = std::move(backing);
+		file->real_name      = file->name;
+		file->opened         = true;
+		return descriptor;
+	}
+
+	const bool original_iccnvs4 = !directory && file->name == "/dev/iccnvs4" &&
+	                              iccnvs4_image != nullptr && iccnvs4_image[0] != '\0';
+	if (original_iccnvs4 && (creat || trunc || append || excl)) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_EROFS;
+	}
+	if (original_iccnvs4) {
+		file->real_name = std::filesystem::path(iccnvs4_image);
+		if (!file->real_name.is_absolute()) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENOENT;
+		}
+		rw_mode        = Common::File::Mode::Read;
+		file->writable = false;
+		file->readable = true;
+		LOGF("ICCNVS4_SNAPSHOT_MAPPED guest=%s host=%s"
+		     " read_only known_ranges_only\n",
+		     file->name.c_str(), Common::PathToString(file->real_name).c_str());
+	} else {
+		file->real_name = g_mount_points->ResolvePath(file->name);
+	}
 	if (file->real_name.empty()) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
@@ -864,7 +3169,6 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_EROFS;
 	}
-
 	if (trunc && rw_mode == Common::File::Mode::Read) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_EACCES;
@@ -874,10 +3178,14 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	const bool dir_exist = info && !info->is_file;
 	const bool file_exist = info && info->is_file;
 
-	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_ENOENT;
+	}
+	if (g_mount_points->IsReadOnly(file->real_name) &&
+	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_EROFS;
 	}
 
 	if (directory || dir_exist) {
@@ -889,17 +3197,16 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
 		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
 
-		const auto entries = Common::File::GetDirEntries(file->real_name);
+		const auto entries = g_mount_points->DirectoryEntries(file->name, file->real_name);
 		file->dirents      = PackDirents(entries);
 		file->dents_offset = 0;
 		file->directory    = true;
 
 		LOGF_COLOR(Log::Color::Green, "\tOpen dir: %s, entries = %" PRIu32 ", [ok]\n",
-		           Common::PathToString(file->real_name).c_str(),
-		           static_cast<uint32_t>(entries.size()));
+		           EscapeLogPath(file->real_name).c_str(), static_cast<uint32_t>(entries.size()));
 
 		for (const auto& f: entries) {
-			LOGF("\t\t%s %s\n", f.is_file ? "[file]" : "[dir ]", f.name.c_str());
+			LOGF("\t\t%s %s\n", f.is_file ? "[file]" : "[dir ]", Log::EscapeField(f.name).c_str());
 		}
 	} else {
 		bool result = false;
@@ -914,12 +3221,12 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			result = file->f.Create(file->real_name);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
-			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
+			           EscapeLogPath(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		} else {
 			result = file->f.Open(file->real_name, rw_mode);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
-			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
+			           EscapeLogPath(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		}
 
 		if (result && trunc) {
@@ -940,11 +3247,84 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	return descriptor;
 }
 
+
+static bool IsReservedPhyshmBackendName(const char* path) {
+	constexpr char Root[] = "/.physhm";
+	return std::strncmp(path, Root, sizeof(Root) - 1) == 0 &&
+	       (path[sizeof(Root) - 1] == '\0' || path[sizeof(Root) - 1] == '/');
+}
+
+
+int KYTY_SYSV_ABI KernelShmUnlink(const char* path) {
+	PRINT_NAME();
+	if (path == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+	if (reinterpret_cast<uintptr_t>(path) == 1) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+	if (IsReservedPhyshmBackendName(path)) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+	std::string scope;
+	if (std::strcmp(path, HMD_SHM_PATH) != 0 || Process::GetScope(&scope)) {
+		const int error = Memory::UnlinkScopeSharedMemory(path);
+		if (error != 0) {
+			*Posix::GetErrorAddr() = error;
+			return -1;
+		}
+		return 0;
+	}
+	Common::LockGuard lock(g_hmd_shm_mutex);
+	if (!g_hmd_shm_exists) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+		return -1;
+	}
+	g_hmd_shm_exists = false;
+	return 0;
+}
+
+
+bool GetSharedMemorySize(int d, size_t* size) {
+	if (size == nullptr || d < DESCRIPTOR_MIN) {
+		return false;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || file->special != SpecialFile::SharedMemory) {
+		return false;
+	}
+	*size = file->anonymous_shared
+	            ? static_cast<size_t>(Memory::GetAnonymousSharedMemorySize(file->anonymous_shared))
+	            : static_cast<size_t>(file->special_size);
+	return true;
+}
+
+bool IsSharedMemoryNamed(int d, const char* name) {
+	if (name == nullptr || d < DESCRIPTOR_MIN) {
+		return false;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || file->special != SpecialFile::SharedMemory) {
+		return false;
+	}
+	if (file->anonymous_shared) {
+		return false;
+	}
+	return file->name == name;
+}
+
 int KYTY_SYSV_ABI KernelClose(int d) {
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EPERM;
+		if (g_files != nullptr && g_files->CloseStandardDeci(d)) {
+			return OK;
+		}
+		return g_files != nullptr && g_files->HasExplicitStandardTable() ? KERNEL_ERROR_EBADF
+		                                                                 : KERNEL_ERROR_EPERM;
 	}
 
 	if (::Libs::Network::Net::IsSocket(d)) {
@@ -966,11 +3346,84 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	file->opened = false;
 
-	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
+	LOGF("\tClose: %s\n", EscapeLogPath(file->real_name).c_str());
 
 	g_files->DeleteDescriptor(d);
 
 	return OK;
+}
+
+int CreateEqueueDescriptor(int64_t handle) {
+	if (!EventQueue::KernelPinEqueue(handle) || g_files == nullptr) {
+		return KERNEL_ERROR_EBADF;
+	}
+	const int fd   = g_files->CreateDescriptor();
+	auto*     file = g_files->GetFile(fd);
+	EXIT_IF(file == nullptr);
+	file->name         = "equeue-fd";
+	file->real_name    = "/dev/kqueue";
+	file->special      = SpecialFile::NativeEqueueDescriptor;
+	file->special_size = static_cast<uint64_t>(handle);
+	file->opened       = true;
+	LOGF("SYSCORE_EQUEUE_FD queue=%" PRId64 " fd=%d backing=existing_kernel_equeue\n", handle, fd);
+	return fd;
+}
+
+
+
+
+bool IsNativeDmemDescriptor(int fd) {
+	if (fd < DESCRIPTOR_MIN || g_files == nullptr) {
+		return false;
+	}
+	const auto* file = g_files->GetFile(fd);
+	return file != nullptr && file->opened && file->special == SpecialFile::NativeDmem;
+}
+
+bool IsSectorPayloadDescriptor(int fd) {
+	if (fd < DESCRIPTOR_MIN || g_files == nullptr) return false;
+	const auto* file = g_files->GetFile(fd);
+	return file != nullptr && file->opened && file->sector_backing != nullptr;
+}
+
+bool IsIccnvs4SnapshotDescriptor(int fd) {
+	if (fd < DESCRIPTOR_MIN || g_files == nullptr) return false;
+	const auto* file = g_files->GetFile(fd);
+	return file != nullptr && file->opened && file->iccnvs4_snapshot;
+}
+
+bool IsNativeAvProbeDescriptor(int fd) {
+	if (fd < DESCRIPTOR_MIN || g_files == nullptr) {
+		return false;
+	}
+	const auto* file = g_files->GetFile(fd);
+	return file != nullptr && file->opened && file->special == SpecialFile::NativeAvProbe;
+}
+
+bool IsNativeAvDescriptor(int fd) {
+	if (fd < DESCRIPTOR_MIN || g_files == nullptr) return false;
+	const auto* file = g_files->GetFile(fd);
+	return file != nullptr && file->opened &&
+	       (file->special == SpecialFile::NativeAvDevice ||
+	        file->special == SpecialFile::NativeAvProbe);
+}
+
+bool IsA53StorageDescriptor(int fd) {
+	if (fd < DESCRIPTOR_MIN || g_files == nullptr) return false;
+	const auto* file = g_files->GetFile(fd);
+	return file != nullptr && file->opened &&
+	       (file->special == SpecialFile::NativeA53Io ||
+	        file->special == SpecialFile::NativeNsidCtl ||
+	        file->special == SpecialFile::NativeSsd || file->special == SpecialFile::BfsCtl);
+}
+
+
+bool IsNativeDipswDescriptor(int fd) {
+	if (fd < DESCRIPTOR_MIN || g_files == nullptr) {
+		return false;
+	}
+	const auto* file = g_files->GetFile(fd);
+	return file != nullptr && file->opened && file->special == SpecialFile::Dipsw;
 }
 
 int CreateGuestSocketPair(int* fds) {
@@ -1021,10 +3474,225 @@ int CreateGuestSocketPair(int* fds) {
 	     first, second);
 	return OK;
 }
+
+int KYTY_SYSV_ABI KernelPipe(int* fds) {
+	if (fds == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	const int reader      = g_files->CreateDescriptor();
+	const int writer      = g_files->CreateDescriptor();
+	auto      pipe        = std::make_shared<GuestPipe>();
+	auto*     read_file   = g_files->GetFile(reader);
+	auto*     write_file  = g_files->GetFile(writer);
+	read_file->name       = "guest-pipe-read";
+	read_file->real_name  = "/dev/pipe-read";
+	read_file->special    = SpecialFile::PipeRead;
+	read_file->pipe       = pipe;
+	read_file->readable   = true;
+	read_file->opened     = true;
+	write_file->name      = "guest-pipe-write";
+	write_file->real_name = "/dev/pipe-write";
+	write_file->special   = SpecialFile::PipeWrite;
+	write_file->pipe      = std::move(pipe);
+	write_file->writable  = true;
+	write_file->opened    = true;
+	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(fds), sizeof(int) * 2);
+	// sceKernelPipe returns (write, read), the reverse of pipe(2). ShellUI dups fd[0] onto
+	// stdout/stderr and reads fd[1].
+	fds[0] = writer;
+	fds[1] = reader;
+	LOGF("GUEST_PIPE_CREATE writer=%d reader=%d (guest slots write,read)\n", writer, reader);
+	return OK;
+}
+
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	PRINT_NAME();
 
+// Windows-only. Guest ranges must be committed before memcpy or a VideoOut flip
+static bool NativeDceReadable(uint64_t addr, uint64_t size, bool need_write = false) {
+	if (addr == 0 || size == 0 || addr > UINT64_MAX - size) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const uint64_t end = addr + size;
+	for (uint64_t pos = addr; pos < end;) {
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(pos), &mbi, sizeof(mbi)) == 0 ||
+		    mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) != 0) {
+			return false;
+		}
+		const DWORD access   = mbi.Protect & 0xff;
+		const bool  readable = access == PAGE_READONLY || access == PAGE_READWRITE ||
+		                       access == PAGE_WRITECOPY || access == PAGE_EXECUTE_READ ||
+		                       access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
+		const bool  writable = access == PAGE_READWRITE || access == PAGE_WRITECOPY ||
+		                       access == PAGE_EXECUTE_READWRITE || access == PAGE_EXECUTE_WRITECOPY;
+		if (!readable || (need_write && !writable)) {
+			return false;
+		}
+		const uint64_t limit = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+		if (limit <= pos) {
+			return false;
+		}
+		pos = std::min(limit, end);
+	}
+	return true;
+#else
+	(void)addr;
+	(void)size;
+	(void)need_write;
+	return false;
+#endif
+}
+
+static bool NativeDceGuestFrameMapped(uint64_t addr, uint64_t size, bool need_write = true) {
+	if (addr == 0 || size == 0 || addr > UINT64_MAX - size) {
+		return false;
+	}
+	const uint64_t end = addr + size;
+	for (uint64_t current = addr; current < end;) {
+		Memory::VirtualQueryInfo info {};
+		if (Memory::KernelVirtualQuery(reinterpret_cast<const void*>(current), 0, &info,
+		                               sizeof(info)) != 0 ||
+		    !info.is_committed || (info.protection & (need_write ? 2u : 1u)) == 0 ||
+		    current < info.start || info.end <= current) {
+			return false;
+		}
+		current = std::min<uint64_t>(info.end, end);
+	}
+	return true;
+}
+
+struct NativeDceEnvelope {
+	uint64_t command;
+	uint32_t display_id;
+	uint32_t payload_size;
+	uint64_t payload_addr;
+	uint64_t index_or_zero;
+	uint64_t result_addr;
+	uint64_t result_size;
+};
+static_assert(sizeof(NativeDceEnvelope) == 0x30);
+static_assert(offsetof(NativeDceEnvelope, payload_addr) == 0x10);
+static_assert(offsetof(NativeDceEnvelope, index_or_zero) == 0x18);
+
+struct NativeDceRegisterPayload {
+	uint64_t zero0;
+	uint32_t zero8;
+	uint32_t register_base_index; // start index, 0 for splash
+	uint64_t guest_data;
+	uint64_t zero18;
+	uint64_t metadata;
+	uint64_t zero28;
+};
+static_assert(sizeof(NativeDceRegisterPayload) == 0x30);
+static_assert(offsetof(NativeDceRegisterPayload, guest_data) == 0x10);
+
+
+
+// SysAv 0x476A4F..0x476A86: 0x28-byte in/out for /dev/dmem[0..2] ioctl 0xC0288001, qword 0 returns
+// the address
+struct NativeDmemAllocatePayload {
+	int64_t  search_start;
+	int64_t  search_end;
+	uint64_t length;
+	uint64_t alignment;
+	uint32_t memory_type;
+	uint32_t reserved;
+};
+static_assert(sizeof(NativeDmemAllocatePayload) == 0x28);
+static_assert(offsetof(NativeDmemAllocatePayload, length) == 0x10);
+static_assert(offsetof(NativeDmemAllocatePayload, alignment) == 0x18);
+static_assert(offsetof(NativeDmemAllocatePayload, memory_type) == 0x20);
+
+struct NativeSshotRequest {
+	uint32_t                  status;
+	uint32_t                  reserved04;
+	uint64_t                  region;
+	uint64_t                  reserved10;
+	uint32_t                  size;
+	uint32_t                  block_size;
+	uint32_t                  value;
+	std::array<uint8_t, 0x4c> reserved24;
+};
+static_assert(sizeof(NativeSshotRequest) == 0x70);
+static_assert(offsetof(NativeSshotRequest, region) == 0x08);
+static_assert(offsetof(NativeSshotRequest, size) == 0x18);
+static_assert(offsetof(NativeSshotRequest, block_size) == 0x1c);
+static_assert(offsetof(NativeSshotRequest, value) == 0x20);
+
+
+
+
+
+
+
+
+int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
+	PRINT_NAME();
+	if (request == 0x80049301u) {
+		int32_t value = 0;
+		if (!Memory::CopyFromGuest(&value, arg, sizeof(value))) return KERNEL_ERROR_EFAULT;
+		if (::Libs::Network::Net::IsSocket(d)) {
+			const int result = ::Libs::Network::Net::SetLocalSocketPolicy(d, value);
+			return result >= 0 ? result : PosixToKernel(*Posix::GetErrorAddr());
+		}
+	}
+	if (IsTmpfsDescriptor(d)) return KERNEL_ERROR_ENOTTY;
+	if (request == 0xc0048118u && std::getenv("KYTY_DIAGNOSTIC_TRACE_GC_IOCTL") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_GC_IOCTL_QUERY fd=%d request=0x%08" PRIx64
+		     " arg=0x%016" PRIx64 "\n",
+		     d, request, reinterpret_cast<uint64_t>(arg));
+	}
+
 	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	if (request == 0xc0088803u) {
+		if (arg == nullptr) {
+			return KERNEL_ERROR_EFAULT;
+		}
+
+		struct DipswBit {
+			uint16_t index;
+			uint16_t reserved;
+			uint32_t value;
+		};
+		static_assert(sizeof(DipswBit) == 8);
+
+		auto* bit = static_cast<DipswBit*>(arg);
+		if (bit->index >= 256) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(DipswBit));
+		bit->value = 0;
+		return OK;
+	}
+
+	if (request == 0x8010880au) {
+		struct DipswStateBuffer {
+			void*    data;
+			uint64_t size;
+		};
+
+		if (arg == nullptr) {
+			return KERNEL_ERROR_EFAULT;
+		}
+
+		auto* state = static_cast<DipswStateBuffer*>(arg);
+		if (state->data == nullptr || state->size < 0x20u) {
+			return KERNEL_ERROR_EFAULT;
+		}
+
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(state->data), 0x20u);
+		std::memset(state->data, 0, 0x20u);
+		return OK;
+	}
+
+	return KERNEL_ERROR_ENOTTY;
+}
+
+
+
 		return KERNEL_ERROR_EPERM;
 	}
 
@@ -1126,27 +3794,19 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
 
 	EXIT_IF(!file->opened);
+	if (g_mount_points->IsReadOnly(file->real_name)) return KERNEL_ERROR_EROFS;
 
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (nbytes > UINT_MAX) return KERNEL_ERROR_EINVAL;
+	if (!GuestSocketBufferAccessible(buf, nbytes, false)) return KERNEL_ERROR_EFAULT;
 
-	file->mutex.Lock();
-
-	bool     is_invalid    = file->f.IsInvalid();
+	Common::LockGuard lock(file->mutex);
+	if (file->f.IsInvalid()) return KERNEL_ERROR_EIO;
 	uint32_t bytes_written = 0;
-	if (file->append) {
-		file->f.Seek(file->f.Size());
-	}
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
-	if (file->sync_writes) {
-		file->f.Flush();
-	}
-
-	file->mutex.Unlock();
-
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
-		return KERNEL_ERROR_EIO;
-	}
+	if (file->append && !file->f.Seek(file->f.Size())) return KERNEL_ERROR_EIO;
+	std::error_code host_error;
+	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written, &host_error);
+	const bool flushed = !file->sync_writes || file->f.Flush();
+	if (!flushed || (bytes_written == 0 && host_error)) return KERNEL_ERROR_EIO;
 
 	LOGF("\tWrite %u bytes to: %s\n", bytes_written, Common::PathToString(file->real_name).c_str());
 
@@ -1157,10 +3817,10 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EPERM;
+		return d >= 0 ? KERNEL_ERROR_ESPIPE : KERNEL_ERROR_EBADF;
 	}
 
-	if (buf == nullptr) {
+	if (buf == nullptr && nbytes != 0) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
@@ -1170,7 +3830,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened || !file->readable) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -1189,9 +3849,9 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return static_cast<int64_t>(nbytes);
 	}
 
-	file->mutex.Lock();
-
-	bool       is_invalid = file->f.IsInvalid();
+	if (!file->readable) return KERNEL_ERROR_EBADF;
+	Common::LockGuard lock(file->mutex);
+	if (file->f.IsInvalid()) return KERNEL_ERROR_EIO;
 	auto       pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining =
@@ -1199,19 +3859,27 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Seek(offset);
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
-	file->f.Seek(pos);
+	if (!file->f.Seek(static_cast<uint64_t>(offset))) return KERNEL_ERROR_EIO;
+	std::error_code host_error;
+	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read, &host_error);
+	if (!file->f.Seek(pos)) return KERNEL_ERROR_EIO;
+	if (bytes_read == 0 && host_error) return KERNEL_ERROR_EIO;
 
-	file->mutex.Unlock();
-
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
-		return KERNEL_ERROR_EIO;
+	if (file->name == "/dev/iccnvs4" && std::getenv("KYTY_PS5_ICCNVS4_IMAGE") != nullptr) {
+		// printf so it survives the guest-log cap
+		static std::atomic<uint32_t> icc_pread_audit {0};
+		if (icc_pread_audit.fetch_add(1) < 8) {
+			std::printf("ICCNVS4_IMAGE_PREAD"
+			            " fd=%d offset=%" PRId64 " requested=%zu"
+			            " read=%u first_byte=%s%02x\n",
+			            d, offset, nbytes, bytes_read, bytes_read ? "0x" : "none",
+			            bytes_read ? static_cast<unsigned>(*reinterpret_cast<const uint8_t*>(buf))
+			                       : 0u);
+			std::fflush(stdout);
+		}
 	}
-
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
-	     Common::PathToString(file->real_name).c_str());
+	     EscapeLogPath(file->real_name).c_str());
 
 	return bytes_read;
 }
@@ -1227,6 +3895,8 @@ static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
 	}
 
 	if (iovcnt != 0) {
+		if (!GuestSocketBufferAccessible(iov, static_cast<size_t>(iovcnt) * sizeof(*iov), false))
+			return KERNEL_ERROR_EFAULT;
 		buffers->assign(iov, iov + iovcnt);
 	}
 	*total = 0;
@@ -1240,6 +3910,51 @@ static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
 		*total += buffer.iov_len;
 	}
 	return OK;
+}
+
+static int64_t TransferTmpfsVector(File* file, const std::vector<KernelIovec>& buffers,
+                                   size_t total, int64_t offset, bool write) {
+	if (file->directory) return KERNEL_ERROR_EISDIR;
+	for (const auto& buffer: buffers) {
+		if (buffer.iov_len != 0 &&
+		    !GuestSocketBufferAccessible(buffer.iov_base, buffer.iov_len, !write)) {
+			return KERNEL_ERROR_EFAULT;
+		}
+	}
+	if (total == 0) return 0;
+	if (static_cast<uint64_t>(offset) > static_cast<uint64_t>(INT64_MAX) - total) {
+		return KERNEL_ERROR_EFBIG;
+	}
+	if (write && total > Tmpfs::MaximumMountBytes) return KERNEL_ERROR_ENOSPC;
+	std::vector<uint8_t> data;
+	try {
+		data.resize(std::min<size_t>(total, Tmpfs::MaximumMountBytes));
+	} catch (const std::bad_alloc&) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+	if (write) {
+		size_t position = 0;
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len != 0)
+				std::memcpy(data.data() + position, buffer.iov_base, buffer.iov_len);
+			position += buffer.iov_len;
+		}
+		return Tmpfs::Pwrite(file->tmpfs, data.data(), data.size(), static_cast<uint64_t>(offset));
+	}
+	const auto result =
+	    Tmpfs::Pread(file->tmpfs, data.data(), data.size(), static_cast<uint64_t>(offset));
+	if (result <= 0) return result;
+	size_t position = 0;
+	for (const auto& buffer: buffers) {
+		const auto count = std::min<size_t>(buffer.iov_len, static_cast<size_t>(result) - position);
+		if (count != 0) {
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
+			std::memcpy(buffer.iov_base, data.data() + position, count);
+			position += count;
+		}
+		if (position == static_cast<size_t>(result)) break;
+	}
+	return result;
 }
 
 int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
@@ -1262,6 +3977,10 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	if (file == nullptr || !file->opened || !file->readable) {
 		return KERNEL_ERROR_EBADF;
 	}
+	if (file->tmpfs) return TransferTmpfsVector(file, buffers, total, offset, false);
+	if (file->sector_backing || file->iccnvs4_snapshot || file->exfat || file->bfs ||
+	    file->passthrough)
+		return KERNEL_ERROR_ENOTSUP;
 
 	Common::LockGuard lock(file->mutex);
 	if (file->directory) {
@@ -1291,6 +4010,7 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	}
 	auto    remaining  = static_cast<uint64_t>(offset) < file_size ? file_size - offset : 0;
 	int64_t bytes_read = 0;
+	std::error_code host_error;
 	for (const auto& buffer: buffers) {
 		if (remaining == 0) {
 			break;
@@ -1301,16 +4021,17 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
-		file->f.Read(buffer.iov_base, count, &bytes);
+		file->f.Read(buffer.iov_base, count, &bytes, &host_error);
 		bytes_read += bytes;
 		remaining -= bytes;
-		if (bytes < count) {
+		if (host_error || bytes < count) {
 			break;
 		}
 	}
 	if (!file->f.Seek(position)) {
 		return KERNEL_ERROR_EIO;
 	}
+	if (bytes_read == 0 && host_error) return KERNEL_ERROR_EIO;
 	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
 	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
 	return bytes_read;
@@ -1320,10 +4041,10 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	PRINT_NAME();
 
 	if (d < DESCRIPTOR_MIN) {
-		return KERNEL_ERROR_EPERM;
+		return d >= 0 ? KERNEL_ERROR_ESPIPE : KERNEL_ERROR_EBADF;
 	}
 
-	if (buf == nullptr) {
+	if (buf == nullptr && nbytes != 0) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
@@ -1340,28 +4061,23 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	EXIT_NOT_IMPLEMENTED(file->directory);
 	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
 
-	EXIT_IF(!file->opened);
+	if (g_mount_points->IsReadOnly(file->real_name)) return KERNEL_ERROR_EROFS;
+	if (nbytes > UINT_MAX) return KERNEL_ERROR_EINVAL;
+	if (!GuestSocketBufferAccessible(buf, nbytes, false)) return KERNEL_ERROR_EFAULT;
+	if (nbytes == 0) return 0;
 
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
-
-	file->mutex.Lock();
-
-	bool     is_invalid    = file->f.IsInvalid();
-	auto     pos           = file->f.Tell();
+	Common::LockGuard lock(file->mutex);
+	if (file->f.IsInvalid()) return KERNEL_ERROR_EIO;
+	const auto pos    = file->f.Tell();
+	const auto target = file->append ? file->f.Size() : static_cast<uint64_t>(offset);
+	if (target > static_cast<uint64_t>(INT64_MAX) - nbytes) return KERNEL_ERROR_EFBIG;
 	uint32_t bytes_written = 0;
-	file->f.Seek(file->append ? file->f.Size() : static_cast<uint64_t>(offset));
-	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
-	if (file->sync_writes) {
-		file->f.Flush();
-	}
-	file->f.Seek(pos);
-
-	file->mutex.Unlock();
-
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
-		return KERNEL_ERROR_EIO;
-	}
+	if (!file->f.Seek(target)) return KERNEL_ERROR_EIO;
+	std::error_code host_error;
+	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written, &host_error);
+	const bool flushed  = !file->sync_writes || file->f.Flush();
+	const bool restored = file->f.Seek(pos);
+	if (!flushed || !restored || (bytes_written == 0 && host_error)) return KERNEL_ERROR_EIO;
 
 	LOGF("\tWrite %u bytes (pos = %" PRId64 ") to: %s\n", bytes_written, offset,
 	     Common::PathToString(file->real_name).c_str());
@@ -1396,6 +4112,7 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	if (file->special != SpecialFile::None) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	if (g_mount_points->IsReadOnly(file->real_name)) return KERNEL_ERROR_EROFS;
 	if (total == 0) {
 		return 0;
 	}
@@ -1413,20 +4130,21 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	}
 
 	int64_t bytes_written = 0;
+	std::error_code host_error;
 	for (const auto& buffer: buffers) {
 		if (buffer.iov_len == 0) {
 			continue;
 		}
 		uint32_t bytes = 0;
-		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes, &host_error);
 		bytes_written += bytes;
-		if (bytes < buffer.iov_len) {
+		if (host_error || bytes < buffer.iov_len) {
 			break;
 		}
 	}
 	const bool flushed  = !file->sync_writes || file->f.Flush();
 	const bool restored = file->f.Seek(position);
-	if (!flushed || !restored) {
+	if (!flushed || !restored || (bytes_written == 0 && host_error)) {
 		return KERNEL_ERROR_EIO;
 	}
 
@@ -1447,14 +4165,24 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	if (file == nullptr) {
 		return KERNEL_ERROR_EBADF;
 	}
+	if (file->tmpfs && !file->directory) return Tmpfs::Seek(file->tmpfs, offset, whence);
+	if (file->exfat && !file->directory) return ExfatMount::Seek(file->exfat, offset, whence);
+	if (file->bfs && !file->directory) return BfsMount::Seek(file->bfs, offset, whence);
+	if (file->passthrough && !file->directory)
+		return DirectoryPassthrough::Seek(file->passthrough, offset, whence);
+	if (file->iccnvs4_snapshot && whence == 2) return KERNEL_ERROR_ENOTSUP;
 
 	EXIT_IF(!file->opened);
 
-	if (file->special != SpecialFile::None) {
+	if (file->special != SpecialFile::None && !file->tmpfs) {
 		return KERNEL_ERROR_ESPIPE;
 	}
 
 	Common::LockGuard lock(file->mutex);
+	if (file->tmpfs && file->directory) {
+		const int result = RefreshTmpfsDirectory(file);
+		if (result != OK) return result;
+	}
 
 	if (!file->directory && file->f.IsInvalid()) {
 		LOGF("\tfile is invalid\n");
@@ -1501,9 +4229,94 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	PRINT_NAME();
+	if (std::getenv("KYTY_DIAGNOSTIC_PSS_FILESTAT") != nullptr &&
+	    (path == nullptr || path[0] == '\0' || std::strncmp(path, "/app0/psm", 9) == 0)) {
+		LOGF("PSS_KERNELSTAT caller=0x%016" PRIx64 " guest_path=%s sb=0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(__builtin_return_address(0)), EscapeLogPath(path).c_str(),
+		     reinterpret_cast<uint64_t>(sb));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		void*      trace[12] {};
+		const auto depth = CaptureStackBackTrace(0, 12, trace, nullptr);
+		for (USHORT i = 0; i < depth; ++i) {
+			LOGF("PSS_KERNELSTAT frame=%u pc=0x%016" PRIx64 "\n", i,
+			     reinterpret_cast<uint64_t>(trace[i]));
+		}
+#endif
+	}
 
 	if (path == nullptr || sb == nullptr) {
 		return KERNEL_ERROR_EINVAL;
+	}
+	std::string working_path;
+	const int   working = ResolveInitialWorkingDirectoryPath(&path, &working_path);
+	if (working != OK) return working;
+	std::string nullfs_path;
+	const int   nullfs = ResolveNullfsPath(&path, &nullfs_path);
+	if (nullfs != OK) return nullfs;
+	if (path[0] == '/') {
+		const int traversal = ValidateMountedTraversal(path);
+		if (traversal != OK) return traversal;
+	}
+	if (DevfsInstanceAt(path) || IsDevfsRoot(path)) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillDevfsRootStat(sb);
+		return OK;
+	}
+	if (ExfatMount::Contains(path)) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		ExfatMount::NodeStat stat {};
+		const int            result = ExfatMount::Stat(path, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillExfatStat(stat, sb);
+		return OK;
+	}
+	if (BfsMount::Contains(path)) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		BfsMount::NodeStat stat {};
+		const int          result = BfsMount::Stat(path, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillBfsStat(stat, sb);
+		return OK;
+	}
+	if (DirectoryPassthrough::Contains(path)) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		DirectoryPassthrough::NodeStat stat {};
+		const int                      result = DirectoryPassthrough::Stat(path, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillPassthroughStat(stat, sb);
+		return OK;
+	}
+	if (Tmpfs::Contains(path)) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Tmpfs::NodeStat stat {};
+		const int       result = Tmpfs::Stat(path, &stat);
+		if (result != OK) return result;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillTmpfsStat(stat, sb);
+		return OK;
+	}
+	const auto data_topology = ResolveDataTopologyPath(path);
+	if (data_topology == DataTopologyPath::Missing) return KERNEL_ERROR_ENOENT;
+	if (data_topology == DataTopologyPath::Directory) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillDataTopologyStat(sb);
+		return OK;
+	}
+	if (std::strcmp(path, "/dev/lvdctl") == 0 || FindLvdDevice(path)) {
+		FileStat stat {};
+		FillLvdStat(&stat, std::strcmp(path, "/dev/lvdctl") != 0);
+		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
+	}
+	if (auto backing = FindSectorPayload(path)) {
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		FillSectorPayloadStat(sb);
+		return OK;
 	}
 
 	LOGF("\t KernelStat: %s\n", path);
@@ -1527,14 +4340,15 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	const bool is_dir = !info->is_file;
 
 	FileStat stat {};
-	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
+	stat.st_mode =
+	    original_iccnvs4 ? (0020000u | 0000660u) : (0000777u | (is_dir ? 0040000u : 0100000u));
 
 	auto at = Common::DateTime::FromSystemUTC();
 	auto wt = at;
 
 	if (is_dir) {
-		stat.st_size =
-		    static_cast<int64_t>(PackDirents(Common::File::GetDirEntries(real_file_name)).size());
+		stat.st_size = static_cast<int64_t>(
+		    PackDirents(g_mount_points->DirectoryEntries(path, real_file_name)).size());
 		stat.st_blksize = 512;
 		stat.st_blocks  = stat.st_size / 512;
 	} else {
@@ -1549,6 +4363,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	SecToTimespec(&stat.st_mtim, wt.ToUnix());
 	stat.st_ctim     = stat.st_atim;
 	stat.st_birthtim = stat.st_mtim;
+	if (original_iccnvs4) ApplyIccnvs4NodeStat(&stat);
 	*sb              = stat;
 
 	return OK;
@@ -1573,16 +4388,66 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	EXIT_IF(!file->opened);
 
-	LOGF("\tKernelFstat: %s\n", Common::PathToString(file->real_name).c_str());
+	LOGF("\tKernelFstat: %s\n", EscapeLogPath(file->real_name).c_str());
 
 	FileStat stat {};
-	stat.st_mode = 0000777u | (file->directory ? 0040000u : 0100000u);
+	const bool original_iccnvs4 = file->iccnvs4_snapshot;
+	if (file->special == SpecialFile::SharedMemory && file->anonymous_shared) {
+		const auto size = Memory::GetAnonymousSharedMemorySize(file->anonymous_shared);
+		stat.st_mode    = static_cast<uint16_t>(
+		    0100000u | Memory::GetAnonymousSharedMemoryMode(file->anonymous_shared));
+		stat.st_size    = static_cast<int64_t>(size);
+		stat.st_blksize = 0x4000;
+		stat.st_blocks  = static_cast<int64_t>((size + 0x3fffu) / 0x4000u);
+		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
+	}
+	if (file->special == SpecialFile::NativeS3da || file->special == SpecialFile::NativeMetadbg) {
+		stat.st_mode  = file->special == SpecialFile::NativeS3da ? 0020666u : 0020600u;
+		stat.st_nlink = 1;
+		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
+	}
+	if (file->special == SpecialFile::NativeMbus ||
+	    file->special == SpecialFile::NativeSystemMbus ||
+	    file->special == SpecialFile::NativeAvDevice || file->special == SpecialFile::Envelope ||
+	    file->special == SpecialFile::Rnps) {
+		stat.st_mode  = 0020600u;
+		stat.st_nlink = 1;
+		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
+	}
+	if (file->special == SpecialFile::NativeA53Io) {
+		stat.st_mode  = 0020600u;
+		stat.st_nlink = 1;
+		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
+	}
+	if (file->special == SpecialFile::NativeNsidCtl || file->special == SpecialFile::NativeSsd) {
+		stat.st_mode    = 0020640u;
+		stat.st_nlink   = 1;
+		stat.st_blksize = 16384u;
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		*sb = stat;
+		return OK;
+	}
+	if (file->special == SpecialFile::BfsCtl) {
+		stat.st_mode    = 0020640u;
+		stat.st_nlink   = 1;
+		stat.st_blksize = 0x10000u;
+		if (!GuestSocketBufferAccessible(sb, sizeof(*sb), true)) return KERNEL_ERROR_EFAULT;
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(sb), sizeof(*sb));
+		*sb = stat;
+		return OK;
+	}
+	if (original_iccnvs4 && !GuestSocketBufferAccessible(sb, sizeof(*sb), true))
+		return KERNEL_ERROR_EFAULT;
+	stat.st_mode = (original_iccnvs4 || file->special == SpecialFile::NativeS3da)
+	                   ? (0020000u | 0000660u)
+	                   : (0000777u | (file->directory ? 0040000u : 0100000u));
 
 	auto at = Common::DateTime::FromSystemUTC();
 	auto wt = at;
 
 	if (file->special != SpecialFile::None) {
-		stat.st_size    = 0;
+		stat.st_size    = static_cast<int64_t>(file->special_size);
 		stat.st_blksize = 512;
 		stat.st_blocks  = 0;
 		SecToTimespec(&stat.st_atim, at.ToUnix());
@@ -1621,10 +4486,12 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	SecToTimespec(&stat.st_mtim, wt.ToUnix());
 	stat.st_ctim     = stat.st_atim;
 	stat.st_birthtim = stat.st_mtim;
+	if (original_iccnvs4) ApplyIccnvs4NodeStat(&stat);
 	*sb              = stat;
 
 	return OK;
 }
+
 
 int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	PRINT_NAME();
@@ -1650,8 +4517,14 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	if (!file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
+	if (file->tmpfs) return Tmpfs::Truncate(file->tmpfs, static_cast<uint64_t>(length));
+	if (file->passthrough)
+		return DirectoryPassthrough::Truncate(file->passthrough, static_cast<uint64_t>(length));
+	if (file->exfat) return KERNEL_ERROR_EROFS;
+	if (file->bfs) return KERNEL_ERROR_EROFS;
+	if (file->sector_backing || file->iccnvs4_snapshot) return KERNEL_ERROR_EINVAL;
 
-	if (file->directory || file->special != SpecialFile::None) {
+	if (file->directory) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
@@ -1667,14 +4540,30 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	return OK;
 }
 
+
 int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	std::string nullfs_path;
+	bool        nullfs_read_only = false;
+	const int nullfs = ResolveNullfsPath(&path, &nullfs_path, nullptr, nullptr, &nullfs_read_only);
+	if (nullfs != OK) return nullfs;
 
+	if (path[0] == '/') {
+		const int traversal = ValidateMountedTraversal(path);
+		if (traversal != OK) return traversal;
+	}
+	if (nullfs_read_only) return NullfsReadOnlyLookup(path, false);
+	if (Tmpfs::Contains(path)) return Tmpfs::Unlink(path);
+	if (ExfatMount::Contains(path)) return KERNEL_ERROR_EROFS;
+	if (BfsMount::Contains(path)) return KERNEL_ERROR_EROFS;
+	if (DirectoryPassthrough::Contains(path)) return DirectoryPassthrough::Unlink(path);
+	if (ResolveDataTopologyPath(path) != DataTopologyPath::None) return KERNEL_ERROR_EROFS;
 	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (g_mount_points->IsReadOnly(real_file_name)) return KERNEL_ERROR_EROFS;
 	if (Common::IsArchivePath(real_file_name)) {
 		return KERNEL_ERROR_EROFS;
 	}
@@ -1710,26 +4599,97 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	if (from == nullptr || to == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	for (const char* path: {from, to}) {
+		const int traversal = ValidateNullfsTraversal(path);
+		if (traversal != OK) return traversal;
+		if (SpecialFinalComponent(path)) return KERNEL_ERROR_EINVAL;
+		if (NullfsMount::IsMountPoint(path)) return KERNEL_ERROR_EBUSY;
+	}
+	std::string nullfs_from;
+	std::string nullfs_to;
+	uint64_t    from_generation = 0;
+	uint64_t    to_generation   = 0;
+	bool        from_mounted    = false;
+	bool        to_mounted      = false;
+	bool        from_read_only  = false;
+	bool        to_read_only    = false;
+	int         nullfs =
+	    ResolveNullfsPath(&from, &nullfs_from, &from_generation, &from_mounted, &from_read_only);
+	if (nullfs != OK) return nullfs;
+	nullfs = ResolveNullfsPath(&to, &nullfs_to, &to_generation, &to_mounted, &to_read_only);
+	if (nullfs != OK) return nullfs;
+	// kern_renameat finishes both lookups (DELETE on the source, RENAME on the target) before
+	// comparing mounts
+	if (from_read_only) return NullfsReadOnlyLookup(from, false);
+	if (to_read_only) {
+		FileStat  source {};
+		const int found = KernelStat(from, &source);
+		if (found != OK) return found;
+		const int lookup = NullfsReadOnlyLookup(to, true);
+		return lookup == KERNEL_ERROR_EEXIST ? KERNEL_ERROR_EROFS : lookup;
+	}
+	if (from_mounted != to_mounted || (from_mounted && from_generation != to_generation))
+		return KERNEL_ERROR_EXDEV;
 
+	for (const char* path: {from, to}) {
+		if (path[0] == '/') {
+			const int traversal = ValidateMountedTraversal(path);
+			if (traversal != OK) return traversal;
+		}
+	}
+	const bool source_tmpfs       = Tmpfs::Contains(from);
+	const bool target_tmpfs       = Tmpfs::Contains(to);
+	const bool source_exfat       = ExfatMount::Contains(from);
+	const bool target_exfat       = ExfatMount::Contains(to);
+	const bool source_bfs         = BfsMount::Contains(from);
+	const bool target_bfs         = BfsMount::Contains(to);
+	const bool source_passthrough = DirectoryPassthrough::Contains(from);
+	const bool target_passthrough = DirectoryPassthrough::Contains(to);
+	if (source_exfat || target_exfat)
+		return source_exfat && target_exfat ? KERNEL_ERROR_EROFS : KERNEL_ERROR_EXDEV;
+	if (source_bfs || target_bfs)
+		return source_bfs && target_bfs ? KERNEL_ERROR_EROFS : KERNEL_ERROR_EXDEV;
+	if (source_passthrough || target_passthrough) {
+		return source_passthrough && target_passthrough ? DirectoryPassthrough::Rename(from, to)
+		                                                : KERNEL_ERROR_EXDEV;
+	}
+	if (source_tmpfs || target_tmpfs) {
+		return source_tmpfs && target_tmpfs ? Tmpfs::Rename(from, to) : KERNEL_ERROR_EXDEV;
+	}
+	const auto source_data_topology = ResolveDataTopologyPath(from);
+	const auto target_data_topology = ResolveDataTopologyPath(to);
+	if (source_data_topology != DataTopologyPath::None ||
+	    target_data_topology != DataTopologyPath::None) {
+		return source_data_topology != DataTopologyPath::None &&
+		               target_data_topology != DataTopologyPath::None
+		           ? KERNEL_ERROR_EROFS
+				   : KERNEL_ERROR_EXDEV;
+	}
 	auto from_path = std::string(from);
 	auto to_path   = std::string(to);
 	auto real_from = g_mount_points->ResolvePath(from_path);
 	auto real_to   = g_mount_points->ResolvePath(to_path);
+	if (g_mount_points->IsReadOnly(real_from) || g_mount_points->IsReadOnly(real_to))
+		return KERNEL_ERROR_EROFS;
 	if (Common::IsArchivePath(real_from) || Common::IsArchivePath(real_to)) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	if (real_to.empty() || !Common::File::IsFileExisting(real_from)) {
+	if (real_from.empty() || real_to.empty()) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	Common::File::CreateDirectories(real_to.parent_path());
-
-	if (Common::File::IsFileExisting(real_to)) {
-		Common::File::DeleteFile(real_to);
-	}
-
-	if (!Common::File::RenameFile(real_from, real_to)) {
+	std::error_code error;
+	if (std::filesystem::equivalent(real_from, real_to, error) && !error) return OK;
+	std::filesystem::rename(real_from, real_to, error);
+	if (error) {
+		if (error == std::errc::no_such_file_or_directory) return KERNEL_ERROR_ENOENT;
+		if (error == std::errc::not_a_directory) return KERNEL_ERROR_ENOTDIR;
+		if (error == std::errc::is_a_directory) return KERNEL_ERROR_EISDIR;
+		if (error == std::errc::directory_not_empty) return KERNEL_ERROR_ENOTEMPTY;
+		if (error == std::errc::file_exists) return KERNEL_ERROR_EEXIST;
+		if (error == std::errc::permission_denied) return KERNEL_ERROR_EACCES;
+		if (error == std::errc::cross_device_link) return KERNEL_ERROR_EXDEV;
 		return KERNEL_ERROR_EIO;
 	}
 
@@ -1743,10 +4703,6 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 
 	if (fd < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
-	}
-
-	if (buf == nullptr) {
-		return KERNEL_ERROR_EFAULT;
 	}
 
 	auto* file = g_files->GetFile(fd);
@@ -1789,7 +4745,24 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	std::string nullfs_path;
+	bool        nullfs_read_only = false;
+	const int nullfs = ResolveNullfsPath(&path, &nullfs_path, nullptr, nullptr, &nullfs_read_only);
+	if (nullfs != OK) return nullfs;
 
+	if (path[0] == '/') {
+		const int traversal = ValidateMountedTraversal(path);
+		if (traversal != OK) return traversal;
+	}
+	if (nullfs_read_only) return NullfsReadOnlyLookup(path, true);
+	if (Tmpfs::Contains(path))
+		return Tmpfs::Mkdir(path, mode & ~g_creation_mask.load(std::memory_order_relaxed));
+	if (ExfatMount::Contains(path)) return KERNEL_ERROR_EROFS;
+	if (BfsMount::Contains(path)) return KERNEL_ERROR_EROFS;
+	if (DirectoryPassthrough::Contains(path))
+		return DirectoryPassthrough::Mkdir(path,
+		                                   mode & ~g_creation_mask.load(std::memory_order_relaxed));
+	if (ResolveDataTopologyPath(path) != DataTopologyPath::None) return KERNEL_ERROR_EROFS;
 	if (std::strlen(path) > 255) {
 		return KERNEL_ERROR_ENAMETOOLONG;
 	}
@@ -1799,6 +4772,7 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     path, mode);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	if (g_mount_points->IsReadOnly(real_name)) return KERNEL_ERROR_EROFS;
 	if (real_name.empty()) {
 		return KERNEL_ERROR_ENOENT;
 	}
@@ -1827,10 +4801,29 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	const int traversal = ValidateNullfsTraversal(path);
+	if (traversal != OK) return traversal;
+	if (SpecialFinalComponent(path)) return KERNEL_ERROR_EINVAL;
+	if (NullfsMount::IsMountPoint(path) || DevfsInstanceAt(path)) return KERNEL_ERROR_EBUSY;
+	std::string nullfs_path;
+	bool        nullfs_read_only = false;
+	const int nullfs = ResolveNullfsPath(&path, &nullfs_path, nullptr, nullptr, &nullfs_read_only);
+	if (nullfs != OK) return nullfs;
 
+	if (path[0] == '/') {
+		const int traversal = ValidateMountedTraversal(path);
+		if (traversal != OK) return traversal;
+	}
+	if (nullfs_read_only) return NullfsReadOnlyLookup(path, false);
+	if (Tmpfs::Contains(path)) return Tmpfs::Rmdir(path);
+	if (ExfatMount::Contains(path)) return KERNEL_ERROR_EROFS;
+	if (BfsMount::Contains(path)) return KERNEL_ERROR_EROFS;
+	if (DirectoryPassthrough::Contains(path)) return DirectoryPassthrough::Rmdir(path);
+	if (ResolveDataTopologyPath(path) != DataTopologyPath::None) return KERNEL_ERROR_EROFS;
 	LOGF("\t path = %s\n", path);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	if (g_mount_points->IsReadOnly(real_name)) return KERNEL_ERROR_EROFS;
 	if (Common::IsArchivePath(real_name)) {
 		return KERNEL_ERROR_EROFS;
 	}
@@ -1846,13 +4839,104 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	return OK;
 }
 
+// sys_unmount: match f_mntonname (MNAMELEN 88), newest first. Non-mountpoint is EINVAL, a covered
+// mount or nullfs lower is EBUSY.
+int KYTY_SYSV_ABI KernelUnmount(const char* path, int flags) {
+	if (path == nullptr) return KERNEL_ERROR_EFAULT;
+	if (std::strlen(path) >= 88) return KERNEL_ERROR_ENAMETOOLONG;
+	const char* backend = "none";
+	int         result  = KERNEL_ERROR_EINVAL;
+	std::string normalized;
+	if ((flags & ~0x00080000) != 0) {
+		backend = "unmodeled_flags";
+		result  = KERNEL_ERROR_ENOSYS;
+	} else if (path[0] == '/' && Tmpfs::NormalizePath(path, &normalized) == OK &&
+	           normalized != "/") {
+		std::lock_guard       publication(g_mount_publication_mutex);
+		const auto            slash  = normalized.rfind('/');
+		const auto            parent = slash == 0 ? std::string("/") : normalized.substr(0, slash);
+		std::filesystem::path occupied;
+		if (DevfsInstanceAt(normalized)) {
+			backend = "devfs";
+			std::lock_guard lock(g_devfs_instances_mutex);
+			std::erase_if(g_devfs_instances,
+			              [&](const auto& instance) { return instance.point == normalized; });
+			result = OK;
+		} else if (NullfsMount::IsMountPoint(normalized)) {
+			backend = "nullfs";
+			result  = NullfsMount::Unmount(normalized);
+			if (result == OK) RetractSandboxMount(normalized);
+		} else if (Tmpfs::Contains(normalized) && !Tmpfs::Contains(parent) &&
+		           !NullfsMount::Contains(normalized)) {
+			backend = "tmpfs";
+			std::vector<NullfsMount::MountInfo> nullfs;
+			NullfsMount::SnapshotMounts(&nullfs);
+			const auto beneath = [&](const std::string& other) {
+				return other == normalized ||
+				       (other.starts_with(normalized) && other[normalized.size()] == '/');
+			};
+			const bool upper = std::any_of(nullfs.begin(), nullfs.end(), [&](const auto& mount) {
+				return beneath(mount.source);
+			});
+			const bool submounts =
+			    DevfsInstanceOverlaps(normalized) ||
+			    std::any_of(nullfs.begin(), nullfs.end(),
+				            [&](const auto& mount) { return beneath(mount.point); });
+			result = upper || submounts ? KERNEL_ERROR_EBUSY : Tmpfs::Unmount(normalized);
+			if (!upper && result == KERNEL_ERROR_EBUSY && (flags & 0x00080000) != 0) {
+				backend = "tmpfs_force_unmodeled";
+				result  = KERNEL_ERROR_ENOSYS;
+			}
+		} else if ((ExfatMount::Contains(normalized) && !ExfatMount::Contains(parent)) ||
+		           (BfsMount::Contains(normalized) && !BfsMount::Contains(parent)) ||
+		           (DirectoryPassthrough::Contains(normalized) &&
+		            !DirectoryPassthrough::Contains(parent)) ||
+		           g_mount_points->GetMountDirectory(normalized, &occupied)) {
+			backend = "unmodeled_mount";
+			result  = KERNEL_ERROR_ENOSYS;
+		}
+	}
+	LOGF("NATIVE_UNMOUNT path=%s flags=0x%x backend=%s result=0x%x\n", path,
+	     static_cast<uint32_t>(flags), backend, static_cast<uint32_t>(result));
+	return result;
+}
+
 int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 	PRINT_NAME();
 
 	if (path == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	std::string nullfs_path;
+	const int   nullfs = ResolveNullfsPath(&path, &nullfs_path);
+	if (nullfs != OK) return nullfs;
 
+	if (path[0] == '/') {
+		const int traversal = ValidateMountedTraversal(path);
+		if (traversal != OK) return traversal;
+	}
+	if (DevfsInstanceAt(path)) return OK;
+	if (Tmpfs::Contains(path)) {
+		Tmpfs::NodeStat stat {};
+		return Tmpfs::Stat(path, &stat);
+	}
+	if (ExfatMount::Contains(path)) {
+		ExfatMount::NodeStat stat {};
+		return ExfatMount::Stat(path, &stat);
+	}
+	if (BfsMount::Contains(path)) {
+		BfsMount::NodeStat stat {};
+		return BfsMount::Stat(path, &stat);
+	}
+	if (DirectoryPassthrough::Contains(path)) {
+		DirectoryPassthrough::NodeStat stat {};
+		return DirectoryPassthrough::Stat(path, &stat);
+	}
+	const auto data_topology = ResolveDataTopologyPath(path);
+	if (data_topology == DataTopologyPath::Directory) return OK;
+	if (data_topology == DataTopologyPath::Missing) return KERNEL_ERROR_ENOENT;
+	if (IsDevfsRoot(path)) return OK;
+	if (std::strcmp(path, "/dev/lvdctl") == 0 || FindLvdDevice(path)) return OK;
 	if (std::strlen(path) > 255) {
 		return KERNEL_ERROR_ENAMETOOLONG;
 	}
@@ -1860,6 +4944,7 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 	LOGF("\t KernelCheckReachability: %s\n", path);
 
 	std::string mounted_path = std::string(path);
+	if (FindSectorPayload(mounted_path)) return OK;
 
 	if (IsRandomDevice(mounted_path)) {
 		return OK;
@@ -1873,5 +4958,7 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 
 	return KERNEL_ERROR_ENOENT;
 }
+
+
 
 } // namespace Libs::LibKernel::FileSystem

@@ -9,7 +9,28 @@
 #include <vector>
 
 namespace Libs::LibKernel::BfsMount {
+struct NodeStat {
+	uint32_t device         = 0;
+	uint32_t inode          = 0;
+	uint32_t mode           = 0;
+	uint64_t size           = 0;
+	uint64_t allocated_size = 0;
+};
+struct DirectoryEntry {
+	uint32_t    inode     = 0;
+	bool        directory = false;
+	std::string name;
+};
 
 class Handle;
+int     Mount(const std::string& point, std::shared_ptr<BfsVolume> volume);
+int     Unmount(const std::string& point);
+bool    Contains(const std::string& path);
+bool    Overlaps(const std::string& path);
+int     ValidateTraversal(const std::string& path);
+int     Close(std::shared_ptr<Handle>& handle);
+int     Stat(const std::string& path, NodeStat* stat);
+int64_t Pread(const std::shared_ptr<Handle>& handle, void* data, size_t length, uint64_t offset);
+int64_t Seek(const std::shared_ptr<Handle>& handle, int64_t offset, int whence);
 } // namespace Libs::LibKernel::BfsMount
 #endif

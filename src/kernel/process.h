@@ -43,5 +43,6 @@ private:
 int GetPid();
 bool GetScope(std::string* scope);
 AuthInfo::AuthorizationFacts GetCurrentAuthorizationFacts();
+bool FindPeerByHostPid(uint32_t host_pid, PeerProcess* peer);
 } // namespace Libs::LibKernel::Process
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_PROCESS_H_ */

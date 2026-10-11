@@ -15,9 +15,11 @@
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
+#define NOMINMAX
 #endif
 #include <windows.h>
 #endif
+
 namespace Libs::LibKernel::Tmpfs {
 namespace {
 
@@ -1300,10 +1302,77 @@ class Handle {};
 
 int Initialize(const std::string&) {
 	return KERNEL_ERROR_ENOTSUP;
+}
+void Shutdown() {
+	credentials = {};
+}
+int ValidateTraversal(const std::string& path) {
+	std::string normalized;
+	return NormalizePath(path, &normalized);
+}
+bool Contains(const std::string&) {
+	return false;
+}
+bool Overlaps(const std::string&) {
+	return false;
+}
+int Mount(const std::string&, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Unmount(const std::string&) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int QueryUsage(const std::string&, Usage*) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Open(const std::string&, int, uint32_t, std::shared_ptr<Handle>*) {
+	return KERNEL_ERROR_ENOTSUP;
+}
 int Close(std::shared_ptr<Handle>& handle) {
 	if (!handle) return KERNEL_ERROR_EBADF;
 	handle.reset();
 	return OK;
+}
+int64_t Read(const std::shared_ptr<Handle>&, void*, uint64_t) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int64_t Pread(const std::shared_ptr<Handle>&, void*, uint64_t, uint64_t) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int64_t Write(const std::shared_ptr<Handle>&, const void*, uint64_t) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int64_t Pwrite(const std::shared_ptr<Handle>&, const void*, uint64_t, uint64_t) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int64_t Seek(const std::shared_ptr<Handle>&, int64_t, int) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Truncate(const std::shared_ptr<Handle>&, uint64_t) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Stat(const std::string&, NodeStat*) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Fstat(const std::shared_ptr<Handle>&, NodeStat*) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Entries(const std::shared_ptr<Handle>&, std::vector<DirectoryEntry>*) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Mkdir(const std::string&, uint32_t) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Unlink(const std::string&) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Rmdir(const std::string&) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+int Rename(const std::string&, const std::string&) {
+	return KERNEL_ERROR_ENOTSUP;
+}
+
 #endif
 
 int ExportHandle(const std::shared_ptr<Handle>& handle, std::string* token) {

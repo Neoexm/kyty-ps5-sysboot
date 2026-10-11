@@ -57,6 +57,7 @@ bool Contains(const std::string& path);
 bool Overlaps(const std::string& path);
 int  Mount(const std::string& path, uint32_t mode, uint64_t byte_limit, uint32_t inode_limit,
            uint32_t uid = 0, uint32_t gid = 0);
+int  Unmount(const std::string& path);
 int  QueryUsage(const std::string& path, Usage* usage);
 
 int     Open(const std::string& path, int flags, uint32_t mode, std::shared_ptr<Handle>* handle);
@@ -68,6 +69,7 @@ int64_t Pwrite(const std::shared_ptr<Handle>& handle, const void* data, uint64_t
                uint64_t offset);
 int64_t Seek(const std::shared_ptr<Handle>& handle, int64_t offset, int whence);
 int     Truncate(const std::shared_ptr<Handle>& handle, uint64_t size);
+int     Stat(const std::string& path, NodeStat* stat);
 int     Fstat(const std::shared_ptr<Handle>& handle, NodeStat* stat);
 int     Entries(const std::shared_ptr<Handle>& handle, std::vector<DirectoryEntry>* entries);
 int     Mkdir(const std::string& path, uint32_t mode);
@@ -78,4 +80,5 @@ int     ExportHandle(const std::shared_ptr<Handle>& handle, std::string* token);
 int     ImportHandle(const std::string& token, std::shared_ptr<Handle>* handle);
 
 } // namespace Libs::LibKernel::Tmpfs
+
 #endif

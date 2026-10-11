@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
+#include <afunix.h>
 #ifdef s_addr
 #undef s_addr
 #endif
@@ -17,8 +18,10 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #endif
 
@@ -27,7 +30,12 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "kernel/eventQueue.h"
+#include "kernel/fileSystem.h"
+#include "kernel/memory.h"
+#include "kernel/process.h"
 #include "kernel/pthread.h"
+#include "kernel/socketPolicy.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -39,6 +47,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <limits>
@@ -848,9 +857,110 @@ using SocketLength                                  = socklen_t;
 using SocketIoLength                                = size_t;
 #endif
 
+using LocalCredentials = LibKernel::SocketPolicy::Credentials;
+#if defined(_WIN32)
+struct LocalPolicyRecord {
+	uint32_t         magic      = 0;
+	uint32_t         version    = 0;
+	uint32_t         host_pid   = 0;
+	uint32_t         flags      = 0;
+	uint64_t         birth      = 0;
+	uint64_t         generation = 0;
+	uint32_t         type       = 0;
+	uint32_t         listening  = 0;
+	LocalCredentials credentials;
+	uint8_t          reserved[6] {};
+};
+struct LocalPolicyLock {
+	HANDLE mutex;
+	bool   acquired;
+	explicit LocalPolicyLock(HANDLE value): mutex(value), acquired(false) {
+		if (mutex) {
+			const auto result = WaitForSingleObject(mutex, 5000);
+			acquired          = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+		}
+	}
+	~LocalPolicyLock() {
+		if (acquired) ReleaseMutex(mutex);
+	}
+};
+static uint64_t LocalProcessBirth(HANDLE process) {
+	FILETIME birth {}, exit {}, kernel {}, user {};
+	if (!GetProcessTimes(process, &birth, &exit, &kernel, &user)) return 0;
+	return (static_cast<uint64_t>(birth.dwHighDateTime) << 32) | birth.dwLowDateTime;
+}
+struct LocalPolicyEndpoint {
+	HANDLE             mutex   = nullptr;
+	HANDLE             file    = INVALID_HANDLE_VALUE;
+	HANDLE             mapping = nullptr;
+	LocalPolicyRecord* record  = nullptr;
+	std::string        path;
+
+	~LocalPolicyEndpoint() {
+		if (record) UnmapViewOfFile(record);
+		if (mapping) CloseHandle(mapping);
+		if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+		if (mutex) CloseHandle(mutex);
+	}
+	static std::shared_ptr<LocalPolicyEndpoint> Open(const char* path, bool create = false) {
+		auto endpoint     = std::make_shared<LocalPolicyEndpoint>();
+		endpoint->path    = path;
+		const auto digest = LibKernel::AuthInfo::Sha256(path, std::strlen(path));
+		const auto name = "Local\\KytyPS5_LocalSocket_v1_" + LibKernel::AuthInfo::DigestHex(digest);
+		endpoint->mutex = CreateMutexA(nullptr, FALSE, name.c_str());
+		LocalPolicyLock lock(endpoint->mutex);
+		if (!lock.acquired) return {};
+		endpoint->file =
+		    CreateFileA((endpoint->path + ".policy").c_str(), GENERIC_READ | GENERIC_WRITE,
+			            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+			            create ? OPEN_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (endpoint->file == INVALID_HANDLE_VALUE) return {};
+		LARGE_INTEGER size {};
+		if (!GetFileSizeEx(endpoint->file, &size) ||
+		    (size.QuadPart != 0 && size.QuadPart != sizeof(LocalPolicyRecord)))
+			return {};
+		endpoint->mapping = CreateFileMappingA(endpoint->file, nullptr, PAGE_READWRITE, 0,
+		                                       sizeof(LocalPolicyRecord), nullptr);
+		if (!endpoint->mapping) return {};
+		endpoint->record = static_cast<LocalPolicyRecord*>(MapViewOfFile(
+		    endpoint->mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(LocalPolicyRecord)));
+		if (!endpoint->record) return {};
+		auto& record = *endpoint->record;
+		if (record.magic == 0 && record.version == 0 && record.host_pid == 0) {
+			record         = {};
+			record.magic   = 0x4b53504c;
+			record.version = 1;
+		}
+		if (record.magic != 0x4b53504c || record.version != 1 ||
+		    record.credentials.capability62 > LibKernel::SocketPolicy::Fact::Set ||
+		    record.credentials.word68_bit57 > LibKernel::SocketPolicy::Fact::Set)
+			return {};
+		return endpoint;
+	}
+	void Flush() { FlushViewOfFile(record, sizeof(*record)); }
+};
+#endif
 struct SocketTransport {
 	SocketTransport(NativeSocket value, int socket_type): socket(value), type(socket_type) {}
 	~SocketTransport() { Close(); }
+	bool StoreLocalPolicyFlags(uint32_t flags) {
+#if defined(_WIN32)
+		LocalPolicyLock lock(local_policy ? local_policy->mutex : nullptr);
+		if (local_policy &&
+		    (!lock.acquired || local_policy->record->host_pid != GetCurrentProcessId() ||
+		     local_policy->record->birth != LocalProcessBirth(GetCurrentProcess()) ||
+		     local_policy->record->generation != local_generation))
+			return false;
+#endif
+		local_policy_flags = flags;
+#if defined(_WIN32)
+		if (local_policy) {
+			local_policy->record->flags = flags;
+			local_policy->Flush();
+		}
+#endif
+		return true;
+	}
 	bool HasPendingReceive() const {
 #if defined(_WIN32)
 		return buffered_bytes.load(std::memory_order_relaxed) != 0 ||
@@ -875,7 +985,12 @@ struct SocketTransport {
 	}
 	std::atomic<NativeSocket> socket;
 	const int                type;
+	bool                      local_unix = false;
+	std::mutex                local_policy_mutex;
+	uint32_t                  local_policy_flags = 0;
 #if defined(_WIN32)
+	std::shared_ptr<LocalPolicyEndpoint> local_policy;
+	uint64_t                             local_generation = 0;
 	std::mutex         receive_mutex;
 	std::vector<char>  receive_buffer;
 	std::atomic_size_t buffered_bytes   = 0;
@@ -897,6 +1012,7 @@ struct P2pEndpoint {
 struct SocketSlot {
 	std::shared_ptr<SocketTransport> transport;
 	std::optional<P2pEndpoint>       p2p;
+	std::string                      name;
 };
 
 struct NetTimeval {
@@ -1875,6 +1991,81 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 	return fd;
 }
 
+int SetLocalSocketPolicy(int s, int32_t value) {
+	NativeSocket                     socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) return -1;
+	if (!transport->local_unix || (transport->type != SOCK_STREAM && transport->type != 5)) {
+		return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+	}
+	std::lock_guard lock(transport->local_policy_mutex);
+	if (transport->socket.load() == INVALID_NATIVE_SOCKET)
+		return SetGuestSocketError(Posix::POSIX_EBADF);
+	if (!transport->StoreLocalPolicyFlags((transport->local_policy_flags & ~0x10u) |
+	                                      (value != 0 ? 0x10u : 0)))
+		return SetGuestSocketError(Posix::POSIX_EIO);
+	LOGF("PSM_LOCAL_UNIX_POLICY fd=%d flags=0x%x\n", s, transport->local_policy_flags);
+	return 0;
+}
+int KYTY_SYSV_ABI Ioctl(int s, uint64_t request, void* arg) {
+	if (request == 0x80049301u) {
+		int32_t value = 0;
+		if (!LibKernel::Memory::CopyFromGuest(&value, arg, sizeof(value)))
+			return SetGuestSocketError(Posix::POSIX_EFAULT);
+		return SetLocalSocketPolicy(s, value);
+	}
+	std::string                      name;
+	std::shared_ptr<SocketTransport> transport;
+	{
+		Common::LockGuard lock(g_socket_mutex);
+		if (s < 0 || s >= SOCKET_FD_MAX) {
+			return SetGuestSocketError(Posix::POSIX_EBADF);
+		}
+		const auto& slot = g_sockets[static_cast<size_t>(s)];
+		if (!slot.transport) {
+			return SetGuestSocketError(Posix::POSIX_EBADF);
+		}
+		name      = slot.name;
+		transport = slot.transport;
+	}
+
+#if defined(_WIN32)
+	if (request == 0x40049303u && transport->local_unix && arg != nullptr) {
+		// host only knows the peer's host pid; guest pid comes from its published record
+		ULONG                           host_pid = 0;
+		DWORD                           bytes    = 0;
+		LibKernel::Process::PeerProcess peer;
+		if (WSAIoctl(transport->socket.load(), SIO_AF_UNIX_GETPEERPID, nullptr, 0, &host_pid,
+		             sizeof(host_pid), &bytes, nullptr, nullptr) == 0 &&
+		    LibKernel::Process::FindPeerByHostPid(host_pid, &peer)) {
+			LOGF("\t local socket peer: fd = %d, host pid = %lu, pid = %d\n", s, host_pid,
+			     peer.pid);
+			*static_cast<int*>(arg) = peer.pid;
+			return 0;
+		}
+	}
+#endif
+
+	if (transport->local_unix) return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+
+	if (name.rfind("SceNet", 0) != 0) {
+		return SetGuestSocketError(Posix::POSIX_ENOTTY);
+	}
+
+	switch (request) {
+		case 0x802450c9u:
+		case 0xc0206911u:
+		case 0x80206910u:
+		case 0x8080691au:
+			LOGF("\t socket ioctl: fd = %d, name = %s, request = 0x%08" PRIx64 "\n", s,
+			     name.c_str(), request);
+			return 0;
+		default:
+			LOGF("\t unsupported socket ioctl: fd = %d, name = %s, request = 0x%08" PRIx64 "\n", s,
+			     name.c_str(), request);
+			return SetGuestSocketError(Posix::POSIX_ENOTTY);
+	}
+}
 int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 	PRINT_NAME();
 

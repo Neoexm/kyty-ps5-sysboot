@@ -599,6 +599,8 @@ static std::atomic<uint64_t>               g_mini_safe_mode_mount_result_jz_site
 static std::atomic<uint64_t>               g_mini_safe_mode_global_flag_jz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_local_var_jz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_dword_4d7520_addr {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_system_mount_jnz_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_system_ex_mount_jz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_ssd0_open_jnz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_sub402340_ssd0_user_jnz_site {0};
 static std::atomic<uint64_t>               g_mini_cold_boot_progress_site {0};
@@ -844,6 +846,56 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				     " site=0x%016" PRIx64 " rbp=0x%016" PRIx64
 				     " v788_main_on_standby=0x%x resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
 				     info->exception_address, ctx->Rbp, var_val, resume_rip, label);
+				Log::Flush();
+				return true;
+			}
+		}
+	}
+	const uint64_t sys_mount_jnz =
+	    g_mini_safe_mode_system_mount_jnz_site.load(std::memory_order_acquire);
+	const uint64_t sys_ex_mount_jz =
+	    g_mini_safe_mode_system_ex_mount_jz_site.load(std::memory_order_acquire);
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    info->exception_address != 0 &&
+	    (info->exception_address == sys_mount_jnz || info->exception_address == sys_ex_mount_jz)) {
+		auto* ctx = reinterpret_cast<CONTEXT*>(info->native_context);
+		if (info->exception_address == sys_mount_jnz &&
+		    IsReadableRange(info->exception_address, 2)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			if (code[0] == 0x0f && code[1] == 0x0b) {
+				const int32_t  eax        = static_cast<int32_t>(ctx->Rax & 0xFFFFFFFFULL);
+				const uint64_t taken      = info->exception_address + 2 + 0x3a;
+				const uint64_t fall       = info->exception_address + 2;
+				const uint64_t resume_rip = (eax != 0) ? taken : fall;
+				const char*    label      = (eax != 0) ? "jnz_taken_system_mount_FAILED"
+				                                       : "jnz_not_taken_system_mount_SUCCESS";
+				ctx->Rip                  = resume_rip;
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_SYSTEM_MOUNT_RESULT_PROBE"
+				     " site=0x%016" PRIx64 " nmount_eax=0x%x nmount_eax_signed=%d"
+				     " dev=/dev/ssd0.system target=/system fstype=exfatfs"
+				     " resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
+				     info->exception_address, static_cast<unsigned>(eax), eax, resume_rip, label);
+				Log::Flush();
+				return true;
+			}
+		}
+		if (info->exception_address == sys_ex_mount_jz &&
+		    IsReadableRange(info->exception_address, 6)) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			if (code[0] == 0x0f && code[1] == 0x0b && code[2] == 0x00 && code[3] == 0x00 &&
+			    code[4] == 0x00 && code[5] == 0x00) {
+				const int32_t  eax        = static_cast<int32_t>(ctx->Rax & 0xFFFFFFFFULL);
+				const uint64_t taken      = info->exception_address + 6 + 0x3fc;
+				const uint64_t fall       = info->exception_address + 6;
+				const uint64_t resume_rip = (eax == 0) ? taken : fall;
+				const char*    label = (eax == 0) ? "jz_taken_system_ex_mount_SUCCESS_normal_boot"
+				                                  : "jz_not_taken_system_ex_mount_FAILED";
+				ctx->Rip             = resume_rip;
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_SYSTEM_EX_MOUNT_RESULT_PROBE"
+				     " site=0x%016" PRIx64 " nmount_eax=0x%x nmount_eax_signed=%d"
+				     " dev=/dev/ssd0.system_ex target=/system_ex fstype=exfatfs"
+				     " resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
+				     info->exception_address, static_cast<unsigned>(eax), eax, resume_rip, label);
 				Log::Flush();
 				return true;
 			}

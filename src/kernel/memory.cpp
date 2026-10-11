@@ -2649,6 +2649,28 @@ int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int pr
 	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
+static ScopeMemory::SharedObject* FindScopeSharedMemory(const char* name) {
+	for (uint32_t i = 0; i < g_scope_memory->shared_count; i++) {
+		auto& shared = g_scope_memory->shared[i];
+		if (shared.linked && std::strcmp(shared.name, name) == 0) {
+			return &shared;
+		}
+	}
+	return nullptr;
+}
+int UnlinkScopeSharedMemory(const char* name) {
+	if (g_scope_memory == nullptr) {
+		return Posix::POSIX_ENOTSUP;
+	}
+
+	ScopeMemoryLock lock;
+	auto*           shared = FindScopeSharedMemory(name);
+	if (shared == nullptr) {
+		return Posix::POSIX_ENOENT;
+	}
+	shared->linked = false;
+	return 0;
+}
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 	PRINT_NAME();
 

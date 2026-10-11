@@ -39,6 +39,10 @@
 #include <unistd.h>
 #endif
 namespace Libs::LibKernel::Process {
+static std::filesystem::path RecordPath(const std::string& scope, const char* key, uint32_t id) {
+	return std::filesystem::temp_directory_path() /
+	       fmt::format("kyty_ps5_{}_{}_{}.txt", scope, key, id);
+}
 static void SecureWipe(void* data, size_t size) {
 #if defined(_WIN32)
 	if (data != nullptr && size != 0) SecureZeroMemory(data, size);
@@ -340,5 +344,14 @@ bool FindPeerByPid(int pid, PeerProcess* peer) {
 		peer->has_filtered_auth_info = GetCurrentFilteredAuthInfo(&peer->filtered_auth_info);
 		return true;
 	}
+}
+bool FindPeerByHostPid(uint32_t host_pid, PeerProcess* peer) {
+	std::string scope;
+	if (!GetScope(&scope)) {
+		return false;
+	}
+	int           pid = 0;
+	std::ifstream record(RecordPath(scope, "host", host_pid));
+	return (record >> pid) && FindPeerByPid(pid, peer) && peer->host_pid == host_pid;
 }
 } // namespace Libs::LibKernel::Process

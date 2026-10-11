@@ -1404,7 +1404,15 @@ static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {
-	return POSIX_N_CALL(FileSystem::KernelOpen(path, flags, mode));
+	return POSIX_N_CALL(FileSystem::KernelOpen(path, flags, (flags & 0x200) != 0 ? mode : 0));
+}
+
+static int KYTY_SYSV_ABI umask(int mask) {
+	return FileSystem::KernelUmask(mask);
+}
+
+static int KYTY_SYSV_ABI fsync(int d) {
+	return POSIX_CALL(KernelFsync(d));
 }
 
 static int KYTY_SYSV_ABI close(int d) {
@@ -1424,6 +1432,12 @@ static int KYTY_SYSV_ABI close(int d) {
 	return POSIX_CALL(FileSystem::KernelClose(d));
 }
 
+static int KYTY_SYSV_ABI ioctl(int d, uint64_t request, void* arg) {
+	if (Network::Net::IsSocket(d)) {
+		return Network::Net::Ioctl(d, request, arg);
+	}
+	return POSIX_N_CALL(FileSystem::KernelIoctl(d, request, arg));
+}
 static int KYTY_SYSV_ABI sysctlbyname(const char* name, void* oldp, size_t* oldlenp,
                                       const void* newp, size_t newlen) {
 	if (name == nullptr || oldlenp == nullptr) {
@@ -2103,6 +2117,11 @@ int KYTY_SYSV_ABI mkdir(const char* path, uint16_t mode) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelMkdir(path, mode));
 }
 
+int KYTY_SYSV_ABI rmdir(const char* path) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
+}
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
@@ -3271,6 +3290,15 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("uWyW3v98sU4", FileSystem::KernelCheckReachability);
 }
 
+// unmount(2), syscall 22
+static int KYTY_SYSV_ABI KernelUnmount(const char* path, int flags) {
+	const int result = LibKernel::FileSystem::KernelUnmount(path, flags);
+	if (result != OK) {
+		*Posix::GetErrorAddr() = LibKernel::KernelToPosix(result);
+		return -1;
+	}
+	return 0;
+}
 LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);

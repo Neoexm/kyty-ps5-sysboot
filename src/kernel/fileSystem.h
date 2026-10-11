@@ -14,6 +14,11 @@
 #include <mutex>
 #include <vector>
 
+namespace Libs::LibKernel {
+class SectorBacking;
+class ExfatVolume;
+class BfsVolume;
+} // namespace Libs::LibKernel
 namespace Common {
 class File;
 }
@@ -56,6 +61,7 @@ struct GuestSocketReadSource;
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();
+bool IsDiagnosticGcDeviceReady() noexcept;
 
 struct Lifecycle {
 	static constexpr const char* name        = "FileSystem";
@@ -65,14 +71,31 @@ struct Lifecycle {
 };
 
 void                  Mount(const std::filesystem::path& folder, const std::string& point);
+int KYTY_SYSV_ABI     KernelUmask(int mask);
 bool                  IsTmpfsDescriptor(int descriptor);
+int  MountTmpfs(const std::string& point, uint32_t mode, uint64_t byte_limit, uint32_t inode_limit);
+int  MountRegisteredExfatReadOnly(const std::string& device, const std::string& point);
+int  MountRegisteredBfs(const std::string& device, const std::string& point);
+int  MountNullfs(const std::string& source, const std::string& point, uint64_t flags = 0);
+int  MountDevfs(const std::string& point);
+bool HasCapturedPartitionPassthrough(const std::string& device);
+int  MountRegisteredPartitionPassthrough(const std::string& device, const std::string& point,
+                                         bool writable = false);
 void                  Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
+struct NativeSystemMbusState {
+	std::mutex              mutex;
+	std::condition_variable cv;
+	std::deque<uint8_t>     received;
+	std::deque<uint8_t>     priority;
+	bool                    shutting_down = false;
+};
 int KYTY_SYSV_ABI     KernelClose(int d);
 int                   CreateGuestSocketPair(int* fds);
+int KYTY_SYSV_ABI     KernelIoctl(int d, uint64_t request, void* arg);
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset);
@@ -89,6 +112,7 @@ int KYTY_SYSV_ABI     KernelGetdirentries(int fd, char* buf, int nbytes, int64_t
 int KYTY_SYSV_ABI     KernelGetdents(int fd, char* buf, int nbytes);
 int KYTY_SYSV_ABI     KernelMkdir(const char* path, uint16_t mode);
 int KYTY_SYSV_ABI     KernelRmdir(const char* path);
+int KYTY_SYSV_ABI     KernelUnmount(const char* path, int flags);
 int KYTY_SYSV_ABI     KernelCheckReachability(const char* path);
 
 } // namespace Libs::LibKernel::FileSystem

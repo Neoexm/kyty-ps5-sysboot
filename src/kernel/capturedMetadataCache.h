@@ -19,6 +19,16 @@ struct SourceStamp {
 	uint64_t              volume_id   = 0;
 	uint64_t              file_id     = 0;
 };
+struct Key {
+	std::filesystem::path    file;
+	std::string              kind;
+	std::string              discriminator;
+	std::string              build_id;
+	std::vector<SourceStamp> sources;
+	AuthInfo::Digest         digest {};
+	uint64_t                 payload_limit = 0;
+	bool                     enabled       = false;
+};
 class Writer {
 public:
 	void                        U8(uint8_t value);

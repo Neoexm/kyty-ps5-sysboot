@@ -56,6 +56,8 @@ int KYTY_SYSV_ABI         EpollDestroy(int eid);
 bool KYTY_SYSV_ABI        IsSocket(int s);
 int KYTY_SYSV_ABI         SocketClose(int s);
 int KYTY_SYSV_ABI         Socket(int family, int type, int protocol);
+int KYTY_SYSV_ABI         Ioctl(int s, uint64_t request, void* arg);
+int                       SetLocalSocketPolicy(int s, int32_t value);
 int KYTY_SYSV_ABI         Bind(int s, const void* addr, uint32_t addrlen);
 int KYTY_SYSV_ABI         Connect(int s, const void* addr, uint32_t addrlen);
 int KYTY_SYSV_ABI         Listen(int s, int backlog);

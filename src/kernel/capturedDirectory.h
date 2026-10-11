@@ -6,4 +6,28 @@
 #include <map>
 #include <string_view>
 
+namespace Libs::LibKernel::CapturedDirectory {
+struct Entry {
+	DirectoryPassthrough::NodeStat stat;
+	std::filesystem::path          file;
+	std::string                    sha256;
+	std::string                    name;
+	bool                           metadata = false;
+	bool                           complete = false;
+	uint8_t                        type     = 0;
+};
+struct Snapshot {
+	std::string                  point;
+	std::string                  manifest_sha256;
+	std::string                  supplement_sha256;
+	std::filesystem::path        root;
+	std::filesystem::path        storage;
+	bool                         case_sensitive = true;
+	std::map<std::string, Entry> entries;
+};
+std::shared_ptr<const Snapshot> ForRoot(const std::filesystem::path& root);
+std::shared_ptr<const Snapshot> ForPoint(std::string_view point);
+int Find(const Snapshot& snapshot, std::string_view path, const Entry** entry);
+int FindDirectory(const Snapshot& snapshot, std::string_view path, const Entry** entry);
+} // namespace Libs::LibKernel::CapturedDirectory
 #endif

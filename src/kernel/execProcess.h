@@ -6,4 +6,8 @@
 #include <string>
 #include <vector>
 
+namespace Libs::LibKernel::Process {
+bool     IsExecChildImagePath(const std::filesystem::path& host_path);
+std::string GetExecChildSandboxWord();
+} // namespace Libs::LibKernel::Process
 #endif
