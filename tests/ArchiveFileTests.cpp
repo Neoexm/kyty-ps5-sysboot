@@ -187,9 +187,13 @@ void CheckCancellation(const std::filesystem::path &path,
 }
 #endif
 
+#include "MemoryFileTests.inc"
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  CheckMemoryFileBounds();
+  if (argc == 2 && std::strcmp(argv[1], "--memory-only") == 0) return 0;
   TempDirectory temporary;
   const auto archive_path =
       temporary.Path() / std::filesystem::path(u8"game-テスト.zar");
