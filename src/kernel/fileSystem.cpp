@@ -968,6 +968,22 @@ struct LvdDevice {
 static std::mutex                                          g_lvd_mutex;
 static std::unordered_map<int, std::shared_ptr<LvdDevice>> g_lvd_devices;
 
+// Env-gated A53/NAND controller stand-in for mini-syscore cold storage init:
+//   open /dev/a53io O_RDONLY, NAND-init ioctl 0x80046101 (bit 0x10000 selects force-format), close;
+//   open /dev/nsid1.ctl O_RDWR, namespace-create ioctl 0x20003102 (no payload);
+//   reopen /dev/ssd0 until present;
+//   open /dev/a53io again, A53-enable ioctl 0x80046103 (payload ignored by the driver), close;
+//   open /dev/ssd0, partition-geometry ioctls 0x40086481 (u64 whole-media capacity) and 0x40043105
+//   (u32 is-nand-for-T).
+// Media state outlives the descriptors (NAND fd closes at 0x426402, enable fd at 0x402023).
+// /dev/ssd0 only opens once the namespace exists.
+struct A53StorageController {
+	std::mutex mutex;
+	bool       nand_initialized  = false;
+	bool       namespace_present = false;
+	bool       a53_enabled       = false;
+};
+static A53StorageController g_a53_controller;
 
 // 0x40086481 whole-media capacity. Minus the 0x4c9710 partition sum (0xab15c0000) this leaves the
 // user partition.
@@ -1168,6 +1184,24 @@ static int RefreshExfatDirectory(File* file) {
 	return OK;
 }
 
+static int RefreshBfsDirectory(File* file) {
+	std::vector<BfsMount::DirectoryEntry> entries;
+	const int                             result = BfsMount::Entries(file->bfs, &entries);
+	if (result != OK) return result;
+	std::vector<Common::File::DirEntry> directory;
+	for (const auto& entry: entries)
+		directory.push_back({entry.name, !entry.directory});
+	auto   packed = PackDirents(directory);
+	size_t offset = 0;
+	for (const auto& entry: entries) {
+		std::memcpy(packed.data() + offset, &entry.inode, sizeof(entry.inode));
+		uint16_t length = 0;
+		std::memcpy(&length, packed.data() + offset + 4, sizeof(length));
+		offset += length;
+	}
+	file->dirents = std::move(packed);
+	return OK;
+}
 
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 	const auto remaining =
@@ -1575,6 +1609,16 @@ static void FillBfsStat(const BfsMount::NodeStat& node, FileStat* stat) {
 	stat->st_blksize = 512;
 }
 
+static int64_t TransferBfs(File* file, void* bytes, size_t length, uint64_t offset,
+                           bool sequential) {
+	if (!file->readable) return KERNEL_ERROR_EBADF;
+	if (file->directory) return KERNEL_ERROR_EISDIR;
+	if (length > 16 * 1024 * 1024) return KERNEL_ERROR_EINVAL;
+	if (!GuestSocketBufferAccessible(bytes, length, true)) return KERNEL_ERROR_EFAULT;
+	if (length) Memory::InvalidateMemory(reinterpret_cast<uint64_t>(bytes), length);
+	return sequential ? BfsMount::Read(file->bfs, bytes, length)
+	                  : BfsMount::Pread(file->bfs, bytes, length, offset);
+}
 
 
 
@@ -1645,6 +1689,48 @@ static void ApplyIccnvs4NodeStat(FileStat* stat) {
 	stat->st_blocks = 0;
 }
 
+static int64_t TransferIccnvs4Snapshot(File* file, void* buf, size_t length, uint64_t offset,
+                                       bool sequential, bool write) {
+	if (write ? !file->writable : !file->readable) return KERNEL_ERROR_EBADF;
+	if (length > 16 * 1024 * 1024) return KERNEL_ERROR_EINVAL;
+	if (!length) return 0;
+	if (!GuestSocketBufferAccessible(buf, length, !write)) return KERNEL_ERROR_EFAULT;
+	Common::LockGuard lock(file->mutex);
+	const auto        position = file->f.Tell();
+	if (sequential) offset = position;
+	if (offset > file->iccnvs4_snapshot_bytes || length > file->iccnvs4_snapshot_bytes - offset) {
+		return KERNEL_ERROR_EIO;
+	}
+	if (file->f.IsInvalid()) return KERNEL_ERROR_EIO;
+	std::vector<uint8_t> data(write ? 0 : length);
+	const auto           result = write ? file->iccnvs4_backing->Write(offset, buf, length)
+	                                    : file->iccnvs4_backing->Read(offset, data.data(), length);
+	if (result != SectorBacking::Result::Ok) {
+		if (result == SectorBacking::Result::NoSpace) return KERNEL_ERROR_ENOSPC;
+		if (result == SectorBacking::Result::ReadOnly) return KERNEL_ERROR_EROFS;
+		return KERNEL_ERROR_EIO;
+	}
+	if (sequential && !file->f.Seek(offset + length)) return KERNEL_ERROR_EIO;
+	if (!write) {
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), length);
+		if (std::getenv("KYTY_DIAGNOSTIC_ICCNVS4_CLEAN_NVS") != nullptr) {
+			constexpr uint64_t patch_offset = 0x23;
+			if (offset <= patch_offset && patch_offset < offset + length) {
+				const auto    local    = static_cast<size_t>(patch_offset - offset);
+				const uint8_t original = data[local];
+				data[local]            = 0;
+				LOGF("FIRST_FRAME_AUDIT ICCNVS4_CLEAN_NVS_READ_OVERRIDE transfer_offset=%" PRIu64
+				     " requested=%zu patched_offset=0x%" PRIx64
+				     " original=0x%02x overridden_value=0x00 NON_AUTHENTIC\n",
+				     offset, length, patch_offset, original);
+			}
+		}
+		std::memcpy(buf, data.data(), length);
+	}
+	LOGF("ICCNVS4_SNAPSHOT_%s offset=%" PRIu64 " requested=%zu actual=%zu\n",
+	     write ? "WRITE" : "READ", offset, length, length);
+	return static_cast<int64_t>(length);
+}
 
 static std::atomic_bool g_guest_socket_fixture_trace {false};
 
@@ -3265,6 +3351,38 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		file->opened = true;
 		return descriptor;
 	}
+	if (BfsMount::Contains(path)) {
+		const int descriptor = g_files->CreateDescriptor();
+		auto*     file       = g_files->GetFile(descriptor);
+		const int result     = BfsMount::Open(path, flags, &file->bfs);
+		if (result != OK) {
+			g_files->DeleteDescriptor(descriptor);
+			return result;
+		}
+		BfsMount::NodeStat stat {};
+		const int          metadata = BfsMount::Fstat(file->bfs, &stat);
+		if (metadata != OK) {
+			file->bfs.reset();
+			g_files->DeleteDescriptor(descriptor);
+			return metadata;
+		}
+		file->name             = path;
+		file->real_name        = Common::PathFromUtf8(path);
+		file->directory        = (stat.mode & 0170000u) == 0040000u;
+		file->readable         = true;
+		file->writable         = false;
+		file->descriptor_flags = (flags & 0x00100000) != 0 ? 1 : 0;
+		if (file->directory) {
+			const int entries = RefreshBfsDirectory(file);
+			if (entries != OK) {
+				file->bfs.reset();
+				g_files->DeleteDescriptor(descriptor);
+				return entries;
+			}
+		}
+		file->opened = true;
+		return descriptor;
+	}
 	if (Tmpfs::Contains(path)) {
 		const int descriptor = g_files->CreateDescriptor();
 		auto*     file       = g_files->GetFile(descriptor);
@@ -3548,7 +3666,28 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	const auto info = Common::File::GetInfo(file->real_name);
-	const bool dir_exist = info && !info->is_file;
+	if (original_iccnvs4 && (!info || !info->is_file || info->size < 0x24)) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_ENOENT;
+	}
+	if (original_iccnvs4) {
+		const char*           hash = std::getenv("KYTY_PS5_ICCNVS4_SHA256");
+		SectorBacking::Result result;
+		file->iccnvs4_backing = SectorBacking::OpenCapturedPrefix(
+		    file->real_name,
+		    iccnvs4_has_overlay ? std::filesystem::path(iccnvs4_overlay) : std::filesystem::path {},
+		    hash ? hash : "", &result);
+		if (!file->iccnvs4_backing || file->iccnvs4_backing->SourceBytes() < 0x24) {
+			g_files->DeleteDescriptor(descriptor);
+			return result == SectorBacking::Result::Invalid ? KERNEL_ERROR_EINVAL
+			                                                : KERNEL_ERROR_EIO;
+		}
+		file->iccnvs4_snapshot       = true;
+		file->iccnvs4_snapshot_bytes = file->iccnvs4_backing->SourceBytes();
+		file->readable               = flags_u != 1;
+		file->writable               = flags_u != 0 && !file->iccnvs4_backing->ReadOnly();
+	}
+	const bool dir_exist  = info && !info->is_file;
 	const bool file_exist = info && info->is_file;
 
 	if (!creat && !dir_exist && !file_exist) {
@@ -4232,6 +4371,167 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 		LOGF("S3DA_DEVICE_IOCTL_UNSUPPORTED guest_pid=%d fd=%d request=0x%08" PRIx64
 		     " arg=0x%016" PRIx64 " error=ENOTTY\n",
 		     Process::GetPid(), d, request, reinterpret_cast<uint64_t>(arg));
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::NativeNsidCtl) {
+		if (request != 0x20003102u) return KERNEL_ERROR_ENOTTY;
+		std::lock_guard lock(g_a53_controller.mutex);
+		g_a53_controller.namespace_present = true;
+		LOGF("A53_STORAGE_NAMESPACE_CREATE fd=%d"
+		     " result=0 NON_AUTHENTIC\n",
+		     d);
+		return OK;
+	}
+	if (file->special == SpecialFile::NativeSsd) {
+		if (request == 0x40086481u) {
+			if (!GuestSocketBufferAccessible(arg, sizeof(uint64_t), true))
+				return KERNEL_ERROR_EFAULT;
+			uint64_t capacity = A53_WHOLE_MEDIA_CAPACITY;
+			if (file->name == "/dev/ssd0.bd_rvlist") capacity = A53_BD_RVLIST_CAPACITY;
+			if (file->name == "/dev/ssd0.swap") capacity = A53_SWAP_CAPACITY;
+			if (file->name == "/dev/ssd0.swapx0") capacity = A53_SWAPX0_CAPACITY;
+			if (file->name == "/dev/ssd0.swapx1") capacity = A53_SWAPX1_CAPACITY;
+			if (file->name == "/dev/ssd0.swapx2") capacity = A53_SWAPX2_CAPACITY;
+			if (file->name == "/dev/ssd0.system" || file->name == "/dev/ssd0.system_b")
+				capacity = A53_SYSTEM_CAPACITY;
+			if (file->name == "/dev/ssd0.system_ex" || file->name == "/dev/ssd0.system_ex_b")
+				capacity = A53_SYSTEM_EX_CAPACITY;
+			if (file->name == "/dev/ssd0.preinst") capacity = A53_PREINST_CAPACITY;
+			if (file->name == "/dev/ssd0.app_temp0") capacity = A53_APP_TEMP0_CAPACITY;
+			if (file->name == "/dev/ssd0.system_data") capacity = A53_SYSTEM_DATA_CAPACITY;
+			if (file->name == "/dev/ssd0.update") capacity = A53_UPDATE_CAPACITY;
+			if (file->name == "/dev/ssd0.app_swap") capacity = A53_APP_SWAP_CAPACITY;
+			if (file->name == "/dev/ssd0.hibernation") capacity = A53_HIBERNATION_CAPACITY;
+			if (file->name == "/dev/ssd0.user") capacity = A53_USER_CAPACITY;
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(capacity));
+			std::memcpy(arg, &capacity, sizeof(capacity));
+			LOGF("A53_STORAGE_GEOMETRY fd=%d request=0x%08" PRIx64 " capacity=%" PRIu64
+			     " firmware_table_or_console_sourced NON_AUTHENTIC\n",
+			     d, request, capacity);
+			return OK;
+		}
+		if (request == 0x40043105u) {
+			if (!GuestSocketBufferAccessible(arg, sizeof(uint32_t), true))
+				return KERNEL_ERROR_EFAULT;
+			const uint32_t nand_for_t = 0;
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(nand_for_t));
+			std::memcpy(arg, &nand_for_t, sizeof(nand_for_t));
+			LOGF("A53_STORAGE_GEOMETRY fd=%d request=0x%08" PRIx64
+			     " is_nand_for_t=0 NON_AUTHENTIC\n",
+			     d, request);
+			return OK;
+		}
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::BfsCtl) {
+		// SCFSTAT, 256 B out. sub_41A820 rejects qword 0 of 0 ("bad TLC block number"), so NSID1
+		// size goes at +0 and +128; SLC/TLC SB sizes at +2/+10 are one 64 KiB superblock.
+		if (request == 0x4100BF0Au) {
+			if (!GuestSocketBufferAccessible(arg, 256, true)) return KERNEL_ERROR_EFAULT;
+			auto       backing = FindSectorPayload("/dev/ssd0.user");
+			const bool probe_pass =
+			    std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_BFS_PROBE_PASS") != nullptr;
+			if (!backing && !probe_pass) return KERNEL_ERROR_ENXIO;
+			uint8_t        buffer[256] {};
+			const uint32_t sb_blocks = 1;
+			std::memcpy(buffer + 2, &sb_blocks, sizeof(sb_blocks));
+			std::memcpy(buffer + 10, &sb_blocks, sizeof(sb_blocks));
+			const uint64_t nsid1_blocks = backing ? backing->Capacity() / 0x10000 : 0x80000ull;
+			std::memcpy(buffer + 0, &nsid1_blocks, sizeof(nsid1_blocks));
+			std::memcpy(buffer + 128, &nsid1_blocks, sizeof(nsid1_blocks));
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(buffer));
+			std::memcpy(arg, buffer, sizeof(buffer));
+			LOGF("BFS_CTL_SCFSTAT fd=%d request=0x%08" PRIx64 " nsid1_blocks=%" PRIu64
+			     " sb_blocks=%u %s\n",
+			     d, request, nsid1_blocks, sb_blocks,
+			     backing ? "NON_AUTHENTIC" : "PROBE_PASS_STANDIN NON_AUTHENTIC");
+			return OK;
+		}
+		// A53IO_READ_BLOCK: 56 B descriptor in, 64 KiB iobuf to the pointer at +24. LBN at +16
+		// (byte_offset >> 16), selector at +0 must be 1 (NSID1).
+		if (request == 0xC03861A1u) {
+			if (!GuestSocketBufferAccessible(arg, 56, false)) return KERNEL_ERROR_EFAULT;
+			uint8_t descriptor_bytes[56];
+			std::memcpy(descriptor_bytes, arg, sizeof(descriptor_bytes));
+			uint32_t selector = 0;
+			std::memcpy(&selector, descriptor_bytes + 0, sizeof(selector));
+			if (selector != 0x1u) return KERNEL_ERROR_EINVAL;
+			int64_t lbn = 0;
+			std::memcpy(&lbn, descriptor_bytes + 16, sizeof(lbn));
+			if (lbn < 0) return KERNEL_ERROR_EINVAL;
+			uint64_t user_ptr = 0;
+			std::memcpy(&user_ptr, descriptor_bytes + 24, sizeof(user_ptr));
+			if (user_ptr == 0) return KERNEL_ERROR_EFAULT;
+			void* user_buf = reinterpret_cast<void*>(user_ptr);
+			if (!GuestSocketBufferAccessible(user_buf, 0x10000, true)) return KERNEL_ERROR_EFAULT;
+			auto backing = FindSectorPayload("/dev/ssd0.user");
+			if (backing) {
+				const uint64_t byte_offset = static_cast<uint64_t>(lbn) * 0x10000;
+				if (byte_offset + 0x10000 > backing->Capacity()) return KERNEL_ERROR_EIO;
+				const auto result = backing->Read(byte_offset, user_buf, 0x10000);
+				if (result != SectorBacking::Result::Ok) return KERNEL_ERROR_EIO;
+				Memory::InvalidateMemory(user_ptr, 0x10000);
+				LOGF("BFS_CTL_A53IO_READ_BLOCK fd=%d request=0x%08" PRIx64 " nsid=%u lbn=%" PRId64
+				     " iobuf=0x%016" PRIx64 " NON_AUTHENTIC\n",
+				     d, request, selector, lbn, user_ptr);
+				return OK;
+			}
+			if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_BFS_PROBE_PASS") == nullptr) {
+				return KERNEL_ERROR_ENXIO;
+			}
+			// probe pass: zero block with BFS magic 0x10f50bf520180705 at +0, so sub_41A140 matches
+			// and fsck returns 0x40
+			std::memset(user_buf, 0, 0x10000);
+			const uint64_t magic = 0x10f50bf520180705ull;
+			std::memcpy(user_buf, &magic, sizeof(magic));
+			Memory::InvalidateMemory(user_ptr, 0x10000);
+			LOGF("BFS_CTL_A53IO_READ_BLOCK_PROBE_PASS_MAGIC_STANDIN fd=%d request=0x%08" PRIx64
+			     " nsid=%u lbn=%" PRId64 " iobuf=0x%016" PRIx64 " magic=0x%016" PRIx64
+			     " NON_AUTHENTIC\n",
+			     d, request, selector, lbn, user_ptr, magic);
+			return OK;
+		}
+		// sub_41B090 metadata-location fast path, 64 B INOUT: metadata LBN at +0, mirror LBN at +8.
+		// Both 0, the fixture keeps metadata at LBN 0.
+		if (request == 0xC040BF5Bu) {
+			if (!GuestSocketBufferAccessible(arg, 64, true)) return KERNEL_ERROR_EFAULT;
+			if (!FindSectorPayload("/dev/ssd0.user")) return KERNEL_ERROR_ENXIO;
+			uint8_t        buffer[64] {};
+			const uint32_t metadata_lbn = 0;
+			const uint32_t mirror_lbn   = 0;
+			std::memcpy(buffer + 0, &metadata_lbn, sizeof(metadata_lbn));
+			std::memcpy(buffer + 8, &mirror_lbn, sizeof(mirror_lbn));
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(buffer));
+			std::memcpy(arg, buffer, sizeof(buffer));
+			LOGF("BFS_CTL_LOCATE_METADATA fd=%d request=0x%08" PRIx64
+			     " metadata_lbn=%u mirror_lbn=%u NON_AUTHENTIC\n",
+			     d, request, metadata_lbn, mirror_lbn);
+			return OK;
+		}
+		// 070-head fallback (sub_41B010), 1056 B keyed by path at +0. Caller takes ENOENT as soft
+		// success, so the fast path wins
+		if (request == 0xC420BF5Bu) {
+			if (!GuestSocketBufferAccessible(arg, 1056, false)) return KERNEL_ERROR_EFAULT;
+			char dev_path[1024] {};
+			std::memcpy(dev_path, arg, sizeof(dev_path) - 1);
+			if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_BFS_PROBE_PASS") != nullptr) {
+				LOGF("BFS_CTL_LOCATE_METADATA_070_PROBE_PASS_STANDIN fd=%d request=0x%08" PRIx64
+				     " path=\"%.1023s\" buffer_zeroed_except_path=1 NON_AUTHENTIC\n",
+				     d, request, dev_path);
+				return OK;
+			}
+			LOGF("BFS_CTL_LOCATE_METADATA_070_FALLBACK fd=%d request=0x%08" PRIx64
+			     " path=\"%.1023s\" result=ENOENT NON_AUTHENTIC\n",
+			     d, request, dev_path);
+			return KERNEL_ERROR_ENOENT;
+		}
+		const unsigned ioc_dir   = static_cast<unsigned>((request >> 30) & 0x3u);
+		const unsigned ioc_size  = static_cast<unsigned>((request >> 16) & 0x3fffu);
+		const unsigned ioc_group = static_cast<unsigned>((request >> 8) & 0xffu);
+		const unsigned ioc_nr    = static_cast<unsigned>(request & 0xffu);
+		LOGF("BFS_CTL_UNHANDLED fd=%d request=0x%08" PRIx64
+		     " dir=%u size=%u group=0x%02x nr=0x%02x result=ENOTTY\n",
+		     d, request, ioc_dir, ioc_size, ioc_group, ioc_nr);
 		return KERNEL_ERROR_ENOTTY;
 	}
 	if (file->special == SpecialFile::GcDiagnostic) {

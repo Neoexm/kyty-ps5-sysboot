@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace Libs::LibKernel {
+
 class BfsVolume {
 public:
 	enum class Result {
@@ -63,5 +64,6 @@ private:
 	explicit BfsVolume(std::unique_ptr<State> state);
 	std::unique_ptr<State> m_state;
 };
+
 } // namespace Libs::LibKernel
 #endif
