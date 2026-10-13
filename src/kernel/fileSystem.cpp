@@ -3100,6 +3100,23 @@ static int AttachSystemResourceArbitratorCapture(const std::string& device,
 	return OK;
 }
 
+int RegisterDiagnosticPartitionPassthrough(const std::string&           device,
+                                           const std::filesystem::path& host_root) try {
+	if (ReadOnlyProviderPoint(device).empty()) return KERNEL_ERROR_EINVAL;
+	PassthroughRegistration registration {device, host_root, {}, {}};
+	const int result = ReadProviderRoot(host_root, &registration.root, &registration.identity);
+	if (result != OK) return result;
+	std::lock_guard lock(g_passthrough_registration_mutex);
+	for (const auto& entry: g_passthrough_registrations)
+		if (entry.device == device) return KERNEL_ERROR_EEXIST;
+	g_passthrough_registrations.push_back(std::move(registration));
+	const auto u8 = host_root.u8string();
+	LOGF("STORAGE_PASSTHROUGH_REGISTERED device=%s host_root=%s NON_AUTHENTIC=1\n", device.c_str(),
+	     reinterpret_cast<const char*>(u8.c_str()));
+	return OK;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
 
 int MountRegisteredPartitionPassthrough(const std::string& device, const std::string& point,
                                         bool writable) try {
@@ -3149,6 +3166,55 @@ int MountRegisteredPartitionPassthrough(const std::string& device, const std::st
 	return KERNEL_ERROR_ENOMEM;
 }
 
+int ExportExecReadOnlyProviders(std::string* manifest) try {
+	if (!manifest) return KERNEL_ERROR_EFAULT;
+	std::lock_guard publication(g_mount_publication_mutex);
+	if (g_mount_points == nullptr) return KERNEL_ERROR_ENOSYS;
+	if (g_published_read_only_providers.size() > 16) return KERNEL_ERROR_E2BIG;
+	std::ostringstream output;
+	output << "KYTY_EXEC_RO_PROVIDERS 3\n";
+	for (const auto& binding: g_published_read_only_providers) {
+		PassthroughRegistration registration;
+		if (!FindPassthroughRegistration(binding.device, &registration)) return KERNEL_ERROR_ENOENT;
+		const int valid = ValidateProviderRegistration(registration);
+		if (valid != OK) return valid;
+		DirectoryPassthrough::MountInfo info;
+		const int described = DirectoryPassthrough::DescribeMount(binding.point, &info);
+		if (described != OK) return described;
+		const auto     guest_fstype = ReadOnlyProviderFileSystemType(binding.device);
+		const auto     guest_source = guest_fstype.empty() ? std::string {} : binding.device;
+		const uint64_t guest_flags  = guest_fstype.empty() || info.writable ? 0 : 1;
+		if (binding.point != ReadOnlyProviderPoint(binding.device) ||
+		    !SameProviderRoot(info.host_root, registration.root) ||
+		    info.guest_fstype != guest_fstype || info.guest_source != guest_source ||
+		    info.guest_flags != guest_flags)
+			return KERNEL_ERROR_EINVAL;
+		output << "P " << std::quoted(binding.device) << ' ' << std::quoted(binding.point) << ' '
+		       << std::quoted(Common::PathToString(registration.root)) << ' '
+		       << std::quoted(registration.identity) << ' ' << info.device << " G "
+		       << std::quoted(info.guest_fstype) << ' ' << std::quoted(info.guest_source) << ' '
+		       << info.guest_flags;
+		if (info.writable) output << " W";
+		if (!info.manifest_sha256.empty()) output << " C " << info.manifest_sha256;
+		if (!info.fallback_prefixes.empty()) {
+			if (info.fallback_manifest_sha256.empty()) return KERNEL_ERROR_EINVAL;
+			output << " F ";
+			for (const auto& prefix: info.fallback_prefixes)
+				output << std::quoted(prefix) << ' ';
+			output << info.fallback_manifest_sha256;
+		} else if (!info.fallback_manifest_sha256.empty()) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		output << '\n';
+	}
+	output << "END\n";
+	auto encoded = output.str();
+	if (encoded.size() > 65536) return KERNEL_ERROR_E2BIG;
+	*manifest = std::move(encoded);
+	return OK;
+} catch (const std::bad_alloc&) {
+	return KERNEL_ERROR_ENOMEM;
+}
 
 
 int ExportExecNullfsMounts(std::string* manifest) try {

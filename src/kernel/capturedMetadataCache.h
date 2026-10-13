@@ -11,6 +11,7 @@
 #include <vector>
 
 namespace Libs::LibKernel::CapturedMetadataCache {
+
 struct SourceStamp {
 	std::filesystem::path path;
 	uint64_t              size        = 0;
@@ -19,6 +20,7 @@ struct SourceStamp {
 	uint64_t              volume_id   = 0;
 	uint64_t              file_id     = 0;
 };
+
 struct Key {
 	std::filesystem::path    file;
 	std::string              kind;
@@ -29,6 +31,18 @@ struct Key {
 	uint64_t                 payload_limit = 0;
 	bool                     enabled       = false;
 };
+
+enum class ReadResult {
+	Disabled,
+	Miss,
+	Hit,
+};
+
+Key        Prepare(std::string kind, std::string discriminator,
+                   std::span<const std::filesystem::path> sources, uint64_t payload_limit);
+ReadResult Read(const Key& key, std::vector<uint8_t>* payload);
+bool       Write(const Key& key, std::span<const uint8_t> payload);
+
 class Writer {
 public:
 	void                        U8(uint8_t value);
@@ -42,5 +56,23 @@ public:
 private:
 	std::vector<uint8_t> bytes;
 };
+
+class Reader {
+public:
+	explicit Reader(std::span<const uint8_t> bytes): bytes(bytes) {}
+
+	bool U8(uint8_t* value);
+	bool U32(uint32_t* value);
+	bool U64(uint64_t* value);
+	bool I64(int64_t* value);
+	bool String(std::string* value, uint32_t limit);
+	bool Path(std::filesystem::path* value, uint32_t limit);
+	bool Done() const { return offset == bytes.size(); }
+
+private:
+	std::span<const uint8_t> bytes;
+	size_t                   offset = 0;
+};
+
 } // namespace Libs::LibKernel::CapturedMetadataCache
 #endif
