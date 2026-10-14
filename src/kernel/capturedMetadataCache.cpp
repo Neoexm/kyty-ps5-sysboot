@@ -15,11 +15,13 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
 #ifdef DeleteFile
+#undef DeleteFile
 #endif
 #else
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
 namespace Libs::LibKernel::CapturedMetadataCache {
 namespace {
 

@@ -75,4 +75,5 @@ private:
 };
 
 } // namespace Libs::LibKernel::CapturedMetadataCache
+
 #endif

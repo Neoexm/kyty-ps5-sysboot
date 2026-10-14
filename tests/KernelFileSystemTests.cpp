@@ -4,8 +4,10 @@
 #include "common/emulatorConfig.h"
 #include "common/archive.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/stringUtils.h"
@@ -15,6 +17,7 @@
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -32,6 +35,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -40,6 +44,7 @@ void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase *symbols);
+
 }
 
 namespace Libs::LibAmpr {
@@ -53,6 +58,10 @@ void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 namespace Libs::LibNpWebApi2 {
 void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
 }
+
+
+
+
 
 namespace {
 

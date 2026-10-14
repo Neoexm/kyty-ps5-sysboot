@@ -12,7 +12,11 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "graphics/presentation/window.h"
+#include "kernel/envelopeSecureProcessor.h"
 #include "kernel/fileSystem.h"
+#include "kernel/capturedRootMetadata.h"
+#include "kernel/capturedDirectory.h"
+#include "kernel/execProcess.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "kernel/sectorBacking.h"
@@ -237,6 +241,126 @@ void Run(const RunOptions& options) {
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 
 	MountSandboxDirs();
+	// writable trees live outside the sysroot so guest writes stay out of the dump
+	if (const char* state_dir = std::getenv("KYTY_DIAGNOSTIC_WRITABLE_STATE_DIR");
+	    state_dir != nullptr) {
+		// /<word>/priv/mms with an empty word; must precede /priv, first matching mount wins
+		MountOrCreateDir(std::filesystem::path(state_dir) / "system_data" / "priv" / "mms",
+		                 "/priv/mms");
+		for (const char* name: {"system_data", "priv", "user"}) {
+			MountOrCreateDir(std::filesystem::path(state_dir) / name, std::string("/") + name);
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_FSCK_PARTITION_PASSTHROUGH") != nullptr) {
+		static constexpr std::pair<const char*, const char*> entries[] = {
+		    {"SYSTEM", "/dev/ssd0.system"},
+		    {"SYSTEM_B", "/dev/ssd0.system_b"},
+		    {"SYSTEM_EX", "/dev/ssd0.system_ex"},
+		    {"SYSTEM_EX_B", "/dev/ssd0.system_ex_b"},
+		    {"SYSTEM_DATA", "/dev/ssd0.system_data"},
+		    {"SYSTEM_DATA_B", "/dev/ssd0.system_data_b"},
+		    {"UPDATE", "/dev/ssd0.update"},
+		    {"UPDATE_B", "/dev/ssd0.update_b"},
+		    {"PREINST", "/dev/ssd0.preinst"},
+		    {"PREINST_B", "/dev/ssd0.preinst_b"},
+		    {"RNPS", "/dev/lvd0"},
+		    {"USER", "/dev/ssd0.user"},
+		};
+		for (const auto& [suffix, device]: entries) {
+			std::string key = std::string("KYTY_DIAGNOSTIC_FSCK_PARTITION_PASSTHROUGH_") + suffix;
+			const char* host_root = std::getenv(key.c_str());
+			if (host_root == nullptr) continue;
+			const int result = Libs::LibKernel::FileSystem::RegisterDiagnosticPartitionPassthrough(
+			    device, Common::PathFromUtf8(host_root));
+			if (result != 0) {
+				EXIT("Diagnostic passthrough registration failed for %s host_root=%s "
+				     "result=0x%08x\n",
+				     device, host_root, static_cast<uint32_t>(result));
+			}
+		}
+	}
+	if (const char* fixture = std::getenv("KYTY_DIAGNOSTIC_BFS_USER_FIXTURE"); fixture != nullptr) {
+		// No SSD hash for a fixture: empty overlay and sha256 skip the check. Capacity() is the
+		// sector-aligned size SCFSTAT reports for NSID1.
+		Libs::LibKernel::SectorBacking::Result open_result;
+		auto backing = Libs::LibKernel::SectorBacking::OpenCapturedPrefix(
+		    Common::PathFromUtf8(fixture), {}, {}, &open_result);
+		if (!backing || open_result != Libs::LibKernel::SectorBacking::Result::Ok) {
+			EXIT("KYTY_DIAGNOSTIC_BFS_USER_FIXTURE open failed path=%s result=%d\n", fixture,
+			     static_cast<int>(open_result));
+		}
+		const uint64_t bytes  = backing->Capacity();
+		const int      result = Libs::LibKernel::FileSystem::RegisterDiagnosticSectorPayload(
+		    "/dev/ssd0.user", std::shared_ptr<Libs::LibKernel::SectorBacking>(std::move(backing)));
+		if (result != 0) {
+			EXIT("KYTY_DIAGNOSTIC_BFS_USER_FIXTURE registration failed path=%s result=0x%08x\n",
+			     fixture, static_cast<uint32_t>(result));
+		}
+		LOGF("NON_AUTHENTIC BFS fixture bound to /dev/ssd0.user path=%s bytes=%" PRIu64 "\n",
+		     fixture, bytes);
+	}
+	if (!options.sysroot_dir.empty()) {
+		Libs::LibKernel::FileSystem::MountReadOnly(options.sysroot_dir, "/");
+		LOGF("Mounted / -> %s\n", Common::PathToString(options.sysroot_dir).c_str());
+	}
+	if (const char* capture = std::getenv("KYTY_PS5_CAPTURED_ROOT_KERNEL"); capture != nullptr) {
+		if (options.sysroot_dir.empty()) EXIT("Captured root metadata requires --sysroot\n");
+		const auto load_started = std::chrono::steady_clock::now();
+		const int  result =
+		    Libs::LibKernel::CapturedRootMetadata::Load(Common::PathFromUtf8(capture));
+		const auto load_us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                         std::chrono::steady_clock::now() - load_started)
+		                         .count();
+		if (result != 0)
+			EXIT("Captured root metadata rejected: 0x%08x\n", static_cast<uint32_t>(result));
+		LOGF("CAPTURED_ROOT_METADATA_READY profile=13.60-live root_nodes=24 directories=17"
+		     " whole_kernel_sha256_verified=1"
+		     " startup_cache_hit=%u source_hash_revalidated=%u load_us=%" PRId64 "\n",
+		     Libs::LibKernel::CapturedRootMetadata::LastLoadUsedStartupCache() ? 1u : 0u,
+		     Libs::LibKernel::CapturedRootMetadata::LastLoadUsedStartupCache() ? 0u : 1u, load_us);
+	}
+	if (const char* directory = std::getenv("KYTY_PS5_INITIAL_SYSTEM_TMP_DIR");
+	    directory != nullptr) {
+		if (options.sysroot_dir.empty()) {
+			EXIT("KYTY_PS5_INITIAL_SYSTEM_TMP_DIR requires --sysroot\n");
+		}
+		const int result = Libs::LibKernel::FileSystem::MountInitialSystemTmpDirectory(
+		    options.sysroot_dir, Common::PathFromUtf8(directory));
+		if (result != 0) {
+			EXIT("Initial /system_tmp directory configuration failed: 0x%08x\n",
+			     static_cast<uint32_t>(result));
+		}
+	}
+	if (const char* manifest = std::getenv("KYTY_PS5_CAPTURED_STORAGE_MANIFEST");
+	    manifest != nullptr) {
+		const char* digest       = std::getenv("KYTY_PS5_CAPTURED_STORAGE_SHA256");
+		const auto  load_started = std::chrono::steady_clock::now();
+		const int  result = Libs::LibKernel::CapturedDirectory::Load(Common::PathFromUtf8(manifest),
+		                                                             digest ? digest : "");
+		const auto load_us = std::chrono::duration_cast<std::chrono::microseconds>(
+		                         std::chrono::steady_clock::now() - load_started)
+		                         .count();
+		if (result != 0)
+			EXIT("Captured storage manifest rejected: 0x%08x\n", static_cast<uint32_t>(result));
+		const bool  cache_hit = Libs::LibKernel::CapturedDirectory::LastLoadUsedStartupCache();
+		const char* relocated = std::getenv("KYTY_PS5_CAPTURED_STORAGE_ROOT");
+		LOGF("CAPTURED_STORAGE_READY manifest=%s whole_manifest_sha256_verified=1"
+		     " startup_cache_hit=%u source_hash_revalidated=%u load_us=%" PRId64
+		     " storage_root=%s\n",
+		     manifest, cache_hit ? 1u : 0u, cache_hit ? 0u : 1u, load_us,
+		     relocated != nullptr && relocated[0] != '\0' ? relocated : "recorded");
+	}
+	if (const char* supplement = std::getenv("KYTY_PS5_CAPTURED_STORAGE_SUPPLEMENT");
+	    supplement != nullptr) {
+		const char* digest = std::getenv("KYTY_PS5_CAPTURED_STORAGE_SUPPLEMENT_SHA256");
+		const int   result = Libs::LibKernel::CapturedDirectory::Supplement(
+		    Common::PathFromUtf8(supplement), digest ? digest : "");
+		if (result != 0)
+			EXIT("Captured storage supplement rejected: 0x%08x\n", static_cast<uint32_t>(result));
+		LOGF(
+		    "CAPTURED_STORAGE_SUPPLEMENT_READY supplement=%s sha256=%s console_observed_inodes=1\n",
+		    supplement, digest);
+	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());

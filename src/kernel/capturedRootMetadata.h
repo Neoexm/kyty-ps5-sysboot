@@ -11,6 +11,7 @@
 namespace Libs::LibKernel::FileSystem {
 struct FileStat;
 }
+
 namespace Libs::LibKernel::CapturedRootMetadata {
 
 struct Layout {
@@ -45,4 +46,5 @@ bool LastLoadUsedStartupCache();
 int  Stat(const std::string& path, FileSystem::FileStat* stat);
 
 } // namespace Libs::LibKernel::CapturedRootMetadata
+
 #endif

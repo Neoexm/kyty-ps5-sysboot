@@ -19,5 +19,11 @@ struct Entry {
 	Libs::LibKernel::AuthInfo::Digest elf_sha256 {};
 	std::filesystem::path             elf_path;
 };
+struct Manifest {
+	std::unordered_map<std::string, Entry> entries;
+};
+// true when the manifest lists a SELF for guest_path; the fs read side then serves it over the
+// decrypted host file
+bool ManifestCoversPath(const std::string& guest_path);
 } // namespace Loader::DecryptedModuleOverlay
 #endif

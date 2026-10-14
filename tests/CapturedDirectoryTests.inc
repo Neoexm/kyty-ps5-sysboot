@@ -112,6 +112,69 @@ void CheckCapturedDirectory(const std::filesystem::path& root) {
   directory.reset();
   Check(Mount::Open("/capture-fixture/Omitted", 0, &directory) == OK &&
             Mount::Entries(directory, &children) == KERNEL_ERROR_EIO, "excluded content is not an empty directory");
+  directory.reset();
+  Mount::MountInfo exported;
+  Check(Mount::DescribeMount("/capture-fixture", &exported) == OK && exported.manifest_sha256 == digest &&
+            Mount::Unmount("/capture-fixture") == OK && FileSystem::KernelFstat(fd, &stat) == OK &&
+            stat.st_mode == 0100640u && FileSystem::KernelClose(fd) == OK,
+        "open descriptors retain their captured metadata after namespace unmount");
+  CapturedDirectory::Clear();
+  Check(Mount::ImportReadOnlyMounts({exported}) == KERNEL_ERROR_EINVAL &&
+            CapturedDirectory::Load(path, digest) == OK && Mount::ImportReadOnlyMounts({exported}) == OK,
+        "provider replay requires the exact captured manifest instead of downgrading to a plain host tree");
+  auto changed = std::string(contents, sizeof(contents));
+  changed[0] ^= 1;
+  put("Movie.Bin", changed.data(), changed.size());
+  Check(FileSystem::KernelOpen("/capture-fixture/Movie.Bin", 0, 0) == KERNEL_ERROR_EIO,
+        "same-length backing corruption fails the captured file hash");
+  Check(Mount::Unmount("/capture-fixture") == OK, "release the disposable captured mount");
+  const auto supplement_path = storage / "supplement.json";
+  const auto known = nlohmann::json {{"path", "/knownlibs"}, {"inode", 399u}, {"mode", 0040755u}, {"size", 512u},
+      {"uid", 0u}, {"gid", 0u}, {"mtime", 315532800}};
+  const auto supplement_volume = [](const nlohmann::json& rows) {
+    return nlohmann::json {{"point", "/capture-fixture"}, {"entries", rows}};
+  };
+  const auto supplement_with = [&](nlohmann::json volumes, std::string base) {
+    return nlohmann::json {{"version", 1}, {"base_manifest_sha256", base}, {"volumes", volumes}};
+  };
+  auto supplement = supplement_with(nlohmann::json::array({supplement_volume(nlohmann::json::array({known}))}), digest);
+  auto supplement_digest = SaveCapturedDirectoryManifest(supplement_path, supplement);
+  Check(CapturedDirectory::Supplement(supplement_path, std::string(64, '0')) == KERNEL_ERROR_EINVAL,
+        "reject a supplement whose complete hash is wrong");
+  for (int kind = 0; kind < 6; ++kind) {
+    auto row = known;
+    auto volumes = nlohmann::json::array({supplement_volume(nlohmann::json::array({row}))});
+    auto base = digest;
+    if (kind == 0) base = std::string(64, '1');
+    if (kind == 1) volumes[0]["point"] = "/elsewhere";
+    if (kind == 2) volumes[0]["entries"].push_back(node("/Empty", 395u, 0040755u, 512u, true));
+    if (kind == 3) volumes[0]["entries"].push_back({{"path", "/NotCaptured"}, {"inode", 400u}, {"mode", 0040755u},
+        {"size", 512u}, {"uid", 0u}, {"gid", 0u}, {"mtime", 315532800}});
+    if (kind == 4) volumes[0]["entries"][0]["mode"] = 0100644u;
+    if (kind == 5) volumes.push_back(volumes[0]);
+    const auto bad = SaveCapturedDirectoryManifest(supplement_path, supplement_with(volumes, base));
+    Check(CapturedDirectory::Supplement(supplement_path, bad) == KERNEL_ERROR_EINVAL &&
+              CapturedDirectory::ForPoint("/capture-fixture")->supplement_sha256.empty(),
+          "a supplement for another manifest, point or entry, or one that layers twice, publishes nothing");
+  }
+  supplement_digest = SaveCapturedDirectoryManifest(supplement_path, supplement);
+  Check(CapturedDirectory::Supplement(supplement_path, supplement_digest) == OK &&
+            CapturedDirectory::ForPoint("/capture-fixture")->manifest_sha256 == digest &&
+            CapturedDirectory::ForPoint("/capture-fixture")->supplement_sha256 == supplement_digest &&
+            CapturedDirectory::Supplement(supplement_path, supplement_digest) == KERNEL_ERROR_EINVAL,
+        "a supplement applies once and keeps the base manifest identity used by the exec handoff");
+  Check(Mount::Mount("/capture-fixture", host) == OK && FileSystem::KernelStat("/capture-fixture/KnownLibs", &stat) == OK &&
+            stat.st_ino == 399 && stat.st_mode == 0040755u && stat.st_uid == 0 && stat.st_mtim.tv_sec == 315532800 &&
+            FileSystem::KernelStat("/capture-fixture/UnknownLibs", &stat) == KERNEL_ERROR_EIO,
+        "supplemented directory metadata reaches guest stat while unsupplemented entries stay unknown");
+  Check(Mount::Open("/capture-fixture", 0, &directory) == OK && Mount::Entries(directory, &children) == OK &&
+            std::any_of(children.begin(), children.end(), [](const auto& child) {
+              return child.name == "KnownLibs" && child.inode == 399 && child.type == 4;
+            }), "the parent listing reports the observed directory inode");
+  directory.reset();
+  Check(Mount::Unmount("/capture-fixture") == OK, "release the supplemented captured mount");
+  CapturedDirectory::Clear();
+  std::printf("CapturedDirectoryTests: observed_metadata=pass actual_bytes=pass missing_vs_unknown=pass empty_directories=pass casing=pass tamper=pass replay_binding=pass lifetime=pass supplement=pass\n");
 }
 
 void CheckCapturedDirectoryFallback(const std::filesystem::path& root) {
@@ -327,6 +390,38 @@ void CheckCapturedDirectoryFallback(const std::filesystem::path& root) {
         "out-of-root junction miss never reaches the captured fallback");
 #endif
   auto tampered = configuration;
+  tampered[0] ^= 1;
+  put(captured / "priv" / "resource_arbitrator_ro" / "ra-config.json", tampered);
+  Check(FileSystem::KernelOpen(
+            "system/priv/resource_arbitrator_ro/ra-config.json", 0, 0) ==
+                KERNEL_ERROR_EIO,
+        "captured fallback tamper fails before a descriptor is published");
+  put(captured / "priv" / "resource_arbitrator_ro" / "ra-config.json", configuration);
+  Check(Mount::Unmount("/system") == OK, "unmount captured fallback namespace");
+  CapturedDirectory::Clear();
+  Check(Mount::ImportReadOnlyMounts({exported}) == KERNEL_ERROR_EINVAL &&
+            CapturedDirectory::Load(path, digest) == OK &&
+            Mount::ImportReadOnlyMounts({exported}) == OK &&
+            FileSystem::KernelStat(
+                "system/priv/resource_arbitrator_ro/ra-config.json", &relative) == OK &&
+            relative.st_ino == 103u,
+        "exec replay requires and restores the exact captured fallback manifest");
+  Check(FileSystem::KernelStat("/system/sys/vsh_prefetch_list.dat", &relative) == OK &&
+            relative.st_ino == 114u &&
+            FileSystem::KernelStat("/system/sys/other.dat", &relative) == KERNEL_ERROR_ENOENT,
+        "exec replay restores every admitted prefix and nothing more");
+  auto overlapping = exported;
+  overlapping.fallback_prefixes.push_back("/priv/psnow_ro/psnow-config.env");
+  auto unnormalized = exported;
+  unnormalized.fallback_prefixes.push_back("/sys//other.dat");
+  Check(Mount::Unmount("/system") == OK &&
+            Mount::ImportReadOnlyMounts({overlapping}) == KERNEL_ERROR_EBUSY &&
+            !Mount::Contains("/system") &&
+            Mount::ImportReadOnlyMounts({unnormalized}) == KERNEL_ERROR_EINVAL &&
+            !Mount::Contains("/system"),
+        "exec replay rejects overlapping or unnormalized prefixes atomically");
+  CapturedDirectory::Clear();
+  std::printf("CapturedDirectoryTests: fallback_provenance=pass primary_collision=pass relative_resource_arbitrator=pass replay_binding=pass data_prefixes=pass merged_listing=pass\n");
 }
 
 void AuditResourceArbitratorCapture(const std::filesystem::path& primary,
@@ -370,6 +465,114 @@ void AuditResourceArbitratorCapture(const std::filesystem::path& primary,
   const auto rejected_path = rejected_storage / "manifest.json";
   const auto rejected_digest = SaveCapturedDirectoryManifest(
       rejected_path, rejected_manifest);
+  std::string after_rejection;
+  Check(CapturedDirectory::Load(rejected_path, rejected_digest) == OK &&
+            FileSystem::MountRegisteredPartitionPassthrough(
+                "/dev/ssd0.system", "/system") == KERNEL_ERROR_EINVAL &&
+            !Mount::Contains("/system") &&
+            FileSystem::ExportExecReadOnlyProviders(&after_rejection) == OK &&
+            after_rejection == "KYTY_EXEC_RO_PROVIDERS 3\nEND\n",
+        "wrong captured-system identity rolls back mount and provider publication atomically");
+  CapturedDirectory::Clear();
+  Check(CapturedDirectory::Load(manifest, digest) == OK,
+        "load the exact retained captured-storage manifest");
+  const int mounted = FileSystem::MountRegisteredPartitionPassthrough(
+      "/dev/ssd0.system", "/system");
+  Check(mounted == OK,
+        "mount the exact decrypted system tree with bounded captured fallback");
+  Mount::MountInfo info;
+  Check(Mount::DescribeMount("/system", &info) == OK &&
+            info.manifest_sha256.empty() &&
+            info.fallback_prefixes.size() == 37 &&
+            info.fallback_prefixes.front() == "/priv/resource_arbitrator_ro" &&
+            info.fallback_prefixes.back() == "/vsh/app" &&
+            info.fallback_manifest_sha256 == digest,
+        "production system mount records the exact captured fallback provenance");
+  FileSystem::FileStat stat {};
+  const int envelope = FileSystem::KernelOpen("/system/priv/psnow_ro/psnow-config.env", 0, 0);
+  Check(envelope >= 3 && FileSystem::KernelFstat(envelope, &stat) == OK && stat.st_size == 534 &&
+            FileSystem::KernelClose(envelope) == OK &&
+            FileSystem::KernelStat("/system/vsh/app", &stat) == OK,
+        "production data prefixes serve the captured PS Now envelope");
+  const int config = FileSystem::KernelOpen(
+      "system/priv/resource_arbitrator_ro/ra-config.json", 0, 0);
+  std::vector<uint8_t> bytes(10333);
+  Check(config >= 3 &&
+            FileSystem::KernelStat(
+                "system/priv/resource_arbitrator_ro/ra-config.json", &stat) == OK &&
+            stat.st_size == bytes.size() &&
+            FileSystem::KernelPread(config, bytes.data(), bytes.size(), 0) ==
+                static_cast<int64_t>(bytes.size()) &&
+            AuthInfo::DigestHex(AuthInfo::Sha256(bytes.data(), bytes.size())) == expected_file,
+        "production ResourceArbitrator path reads the exact configuration bytes");
+  std::filesystem::path resolved;
+  Mount::FileSnapshot library;
+  Check(Mount::ResolveHostPath(
+            "/system/priv/resource_arbitrator_ro/ra-config.json", &resolved) ==
+                KERNEL_ERROR_ENOENT &&
+            Mount::ResolveHostPath("/system/priv/psnow_ro/psnow-config.env", &resolved) ==
+                KERNEL_ERROR_ENOENT &&
+            Mount::OpenFileSnapshot("/system/common/lib/libSceJson2.sprx", &library) == OK &&
+            AuthInfo::DigestHex(AuthInfo::Sha256(library.bytes.data(), library.bytes.size())) ==
+                expected_primary &&
+            Mount::ResolveHostPath("/system/common/lib/libSceJson2.sprx", &resolved) == OK &&
+            resolved == std::filesystem::canonical(primary / "common/lib/libSceJson2.sprx"),
+        "host exec resolution remains primary-only and decrypted collisions remain primary");
+  library.handle.reset();
+  std::string exported;
+  Check(FileSystem::ExportExecReadOnlyProviders(&exported) == OK &&
+            exported.find(" F \"/priv/resource_arbitrator_ro\" \"/common/cert\" ") !=
+                std::string::npos &&
+            exported.find(" \"/vsh/app\" " + digest + "\n") != std::string::npos,
+        "exec handoff explicitly carries every fallback prefix and the manifest digest");
+  FileSystem::Umount("/system");
+  Check(!Mount::Contains("/system"), "unmount production fallback before replay checks");
+  CapturedDirectory::Clear();
+  bytes.assign(bytes.size(), 0);
+  Check(FileSystem::KernelFstat(config, &stat) == OK && stat.st_size == bytes.size() &&
+            FileSystem::KernelPread(config, bytes.data(), bytes.size(), 0) ==
+                static_cast<int64_t>(bytes.size()) &&
+            AuthInfo::DigestHex(AuthInfo::Sha256(bytes.data(), bytes.size())) == expected_file &&
+            FileSystem::KernelClose(config) == OK,
+        "open fallback descriptor retains verified backing after unmount and manifest clear");
+  Check(CapturedDirectory::Load(manifest, digest) == OK,
+        "reload the exact capture for exec replay checks");
+  auto without_fallback = exported;
+  const auto fallback_at = without_fallback.find(" F \"/priv/resource_arbitrator_ro\" ");
+  Check(fallback_at != std::string::npos, "locate the explicit fallback handoff tuple");
+  without_fallback.erase(fallback_at, without_fallback.find(digest, fallback_at) + digest.size() - fallback_at);
+  Check(FileSystem::ImportExecReadOnlyProviders(without_fallback) == OK &&
+            FileSystem::KernelOpen(
+                "system/priv/resource_arbitrator_ro/ra-config.json", 0, 0) ==
+                KERNEL_ERROR_ENOENT,
+        "handoff without fallback remains primary-only and never attaches implicitly");
+  FileSystem::Umount("/system");
+  Check(!Mount::Contains("/system"), "release the primary-only replay mount");
+  auto wrong_hash = exported;
+  wrong_hash.replace(wrong_hash.find(digest), digest.size(), std::string(64, '0'));
+  auto wrong_prefix = exported;
+  wrong_prefix.replace(wrong_prefix.find("/priv/resource_arbitrator_ro"),
+                       std::string_view("/priv/resource_arbitrator_ro").size(),
+                       "/priv/wrong");
+  auto missing_fallback_digest = exported;
+  missing_fallback_digest.erase(missing_fallback_digest.find(digest), digest.size());
+  Check(FileSystem::ImportExecReadOnlyProviders(wrong_hash) == KERNEL_ERROR_EINVAL &&
+            !Mount::Contains("/system") &&
+            FileSystem::ImportExecReadOnlyProviders(wrong_prefix) == KERNEL_ERROR_ENOENT &&
+            !Mount::Contains("/system") &&
+            FileSystem::ImportExecReadOnlyProviders(missing_fallback_digest) ==
+                KERNEL_ERROR_EINVAL &&
+            !Mount::Contains("/system") &&
+            FileSystem::ImportExecReadOnlyProviders(exported) == OK &&
+            FileSystem::KernelStat(
+                "system/priv/resource_arbitrator_ro/ra-config.json", &stat) == OK &&
+            stat.st_size == 10333,
+        "exec replay rejects altered fallback identity atomically and accepts exact bytes");
+  FileSystem::Umount("/system");
+  FileSystem::Umount("/");
+  Check(!Mount::Contains("/system"), "release the production ResourceArbitrator audit mounts");
+  CapturedDirectory::Clear();
+  std::printf("ResourceArbitratorCaptureAudit: relative_stat_open=pass original_hash=pass primary_collision=pass host_exec_primary_only=pass handoff=pass lifetime=pass\n");
 }
 
 void AuditCapturedStorage(const std::filesystem::path& manifest, const std::string& digest) {

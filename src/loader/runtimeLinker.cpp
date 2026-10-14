@@ -13,6 +13,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "kernel/directoryPassthrough.h"
 #include "kernel/fileSystem.h"
 #include "kernel/eventQueue.h"
 #include "kernel/execProcess.h"
@@ -594,6 +595,12 @@ static constexpr std::array<uint32_t, 116> g_mini_native_syscall_offsets {{
 }};
 static std::atomic<bool>                   g_mini_native_syscall_traps_installed {false};
 static std::atomic<uint64_t>               g_mini_updatemode_return_site {0};
+static std::atomic<uint64_t>               g_mini_preinst_stat_return_site {0};
+static std::atomic<uint64_t>               g_mini_preinst_mount_return_site {0};
+static std::atomic<uint64_t>               g_mini_rescue_path_site {0};
+static std::atomic<uint64_t>               g_mini_updatemode_spawn_passthru_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_hdd_rescue_site {0};
+static std::atomic<uint64_t>               g_mini_safe_mode_ext_rescue_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_r14d_jle_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_mount_result_jz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_global_flag_jz_site {0};
@@ -602,6 +609,9 @@ static std::atomic<uint64_t>               g_mini_safe_mode_dword_4d7520_addr {0
 static std::atomic<uint64_t>               g_mini_safe_mode_system_mount_jnz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_system_ex_mount_jz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_ssd0_open_jnz_site {0};
+static std::atomic<uint64_t>               g_mini_sub471250_entry_site {0};
+static std::atomic<uint32_t>               g_mini_sub471250_v788_value {1u};
+static std::atomic<uint64_t>               g_mini_sub419930_entry_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_sub402340_ssd0_user_jnz_site {0};
 static std::atomic<uint64_t>               g_mini_cold_boot_progress_site {0};
 
@@ -2127,6 +2137,52 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     " site=0x%016" PRIx64 " test_eax_eax=1\n",
 			     program->base_vaddr + offset);
 		}
+		if (std::getenv("KYTY_DIAGNOSTIC_UPDATEMODE_SPAWN_PASSTHRU") != nullptr) {
+			constexpr uint32_t offset = 0x5031;
+			auto*              code   = reinterpret_cast<uint8_t*>(program->base_vaddr + offset);
+			constexpr uint8_t  original_call[] = {0xe8, 0x9a, 0x7c, 0x00, 0x00};
+			EXIT_IF(std::memcmp(code, original_call, sizeof(original_call)) != 0);
+			code[0] = 0x0f;
+			code[1] = 0x0b;
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr + offset,
+			                                                      sizeof(original_call)));
+			g_mini_updatemode_spawn_passthru_site.store(program->base_vaddr + offset,
+			                                            std::memory_order_release);
+			LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_UPDATEMODE_SPAWN_PASSTHRU_PROBE"
+			     " site=0x%016" PRIx64 " call_rel32=e8_9a_7c_00_00"
+			     " target_sub_40ccd0\n",
+			     program->base_vaddr + offset);
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_RESCUE_DISCRIMINATOR") != nullptr) {
+			constexpr uint32_t hdd_offset   = 0x49ba;
+			constexpr uint32_t ext_offset   = 0x5d06;
+			constexpr uint8_t  mov_edi_f0[] = {0xbf, 0xf0, 0x00, 0x00, 0x00};
+			auto*              hdd = reinterpret_cast<uint8_t*>(program->base_vaddr + hdd_offset);
+			auto*              ext = reinterpret_cast<uint8_t*>(program->base_vaddr + ext_offset);
+			EXIT_IF(std::memcmp(hdd, mov_edi_f0, sizeof(mov_edi_f0)) != 0);
+			EXIT_IF(std::memcmp(ext, mov_edi_f0, sizeof(mov_edi_f0)) != 0);
+			hdd[0] = 0x0f;
+			hdd[1] = 0x0b;
+			hdd[2] = 0x00;
+			hdd[3] = 0x00;
+			hdd[4] = 0x00;
+			ext[0] = 0x0f;
+			ext[1] = 0x0b;
+			ext[2] = 0x00;
+			ext[3] = 0x00;
+			ext[4] = 0x00;
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr + hdd_offset,
+			                                                      sizeof(mov_edi_f0)));
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr + ext_offset,
+			                                                      sizeof(mov_edi_f0)));
+			g_mini_safe_mode_hdd_rescue_site.store(program->base_vaddr + hdd_offset,
+			                                       std::memory_order_release);
+			g_mini_safe_mode_ext_rescue_site.store(program->base_vaddr + ext_offset,
+			                                       std::memory_order_release);
+			LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_RESCUE_PROBES"
+			     " hdd=0x%016" PRIx64 " ext=0x%016" PRIx64 " mov_edi_f0_signature\n",
+			     program->base_vaddr + hdd_offset, program->base_vaddr + ext_offset);
+		}
 		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SSD0_OPEN_RESULT_DISCRIMINATOR") != nullptr) {
 			constexpr uint32_t ssd0_open_jnz_offset = 0x438a;
 			constexpr uint8_t  ssd0_open_jnz_sig[]  = {0x0f, 0x85, 0x99, 0x00, 0x00, 0x00};
@@ -2279,6 +2335,79 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     " cold_boot_progress=0x%016" PRIx64 " mov_edi_1_signature\n",
 				     program->base_vaddr + cold_boot_progress_offset);
 			}
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_MINI_REBOOT_PATH_AUDIT") != nullptr) {
+			constexpr std::array<uint32_t, 2> test_offsets = {0x91ea, 0x5b9f};
+			for (const uint32_t offset: test_offsets) {
+				auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + offset);
+				EXIT_IF(code[0] != 0x85 || code[1] != 0xc0);
+				code[0] = 0x0f;
+				code[1] = 0x0b;
+			}
+			constexpr uint32_t rescue_offset = 0x5cee;
+			auto* rescue = reinterpret_cast<uint8_t*>(program->base_vaddr + rescue_offset);
+			constexpr uint8_t rescue_bytes[] = {0x48, 0x8d, 0x3d, 0xa2, 0x28, 0x0a, 0x00};
+			EXIT_IF(std::memcmp(rescue, rescue_bytes, sizeof(rescue_bytes)) != 0);
+			rescue[0] = 0x0f;
+			rescue[1] = 0x0b;
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+			    program->base_vaddr + test_offsets[0], 2));
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+			    program->base_vaddr + test_offsets[1], 2));
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+			    program->base_vaddr + rescue_offset, sizeof(rescue_bytes)));
+			g_mini_preinst_stat_return_site.store(program->base_vaddr + test_offsets[0],
+			                                      std::memory_order_release);
+			g_mini_preinst_mount_return_site.store(program->base_vaddr + test_offsets[1],
+			                                       std::memory_order_release);
+			g_mini_rescue_path_site.store(program->base_vaddr + rescue_offset,
+			                              std::memory_order_release);
+			const char* sub471250_env =
+			    std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SUB471250_PASSTHROUGH_VERDICT");
+			if (sub471250_env != nullptr) {
+				constexpr uint32_t entry_offset = 0x71250;
+				constexpr uint8_t  entry_sig[]  = {0x55, 0x48, 0x89, 0xe5};
+				auto* entry_site = reinterpret_cast<uint8_t*>(program->base_vaddr + entry_offset);
+				EXIT_IF(std::memcmp(entry_site, entry_sig, sizeof(entry_sig)) != 0);
+				entry_site[0] = 0x0f;
+				entry_site[1] = 0x0b;
+				entry_site[2] = 0x90;
+				entry_site[3] = 0x90;
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + entry_offset, sizeof(entry_sig)));
+				const uint32_t v788_value = (sub471250_env[0] == '0') ? 0u : 1u;
+				g_mini_sub471250_v788_value.store(v788_value, std::memory_order_release);
+				g_mini_sub471250_entry_site.store(program->base_vaddr + entry_offset,
+				                                  std::memory_order_release);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SUB471250_ENTRY_PROBE_INSTALLED"
+				     " entry=0x%016" PRIx64 " v788_stand_in=%u"
+				     " machdep_bootparams_is_main_on_standby_passthrough NON_AUTHENTIC\n",
+				     program->base_vaddr + entry_offset, v788_value);
+			}
+			const char* sub419930_env =
+			    std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SUB419930_PASSTHROUGH_VERDICT");
+			if (sub419930_env != nullptr) {
+				constexpr uint32_t entry_offset = 0x19930;
+				constexpr uint8_t  entry_sig[]  = {0x55, 0x48, 0x89, 0xe5};
+				auto* entry_site = reinterpret_cast<uint8_t*>(program->base_vaddr + entry_offset);
+				EXIT_IF(std::memcmp(entry_site, entry_sig, sizeof(entry_sig)) != 0);
+				entry_site[0] = 0x0f;
+				entry_site[1] = 0x0b;
+				entry_site[2] = 0x90;
+				entry_site[3] = 0x90;
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + entry_offset, sizeof(entry_sig)));
+				g_mini_sub419930_entry_site.store(program->base_vaddr + entry_offset,
+				                                  std::memory_order_release);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SUB419930_ENTRY_PROBE_INSTALLED"
+				     " entry=0x%016" PRIx64 " verdict=1 bfs_preflight_mountable_passthrough"
+				     " NON_AUTHENTIC\n",
+				     program->base_vaddr + entry_offset);
+			}
+			LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_REBOOT_PATH_PROBES"
+			     " stat=0x%016" PRIx64 " mount=0x%016" PRIx64 " rescue=0x%016" PRIx64 "\n",
+			     program->base_vaddr + test_offsets[0], program->base_vaddr + test_offsets[1],
+			     program->base_vaddr + rescue_offset);
 		}
 	}
 	LOGF("entry = 0x%016" PRIx64 "\n", program->elf->GetEntry() + program->base_vaddr);
