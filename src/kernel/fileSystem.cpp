@@ -2560,6 +2560,149 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
+	// PSM's Mono loads /common_ex/lib/mono/2.1/<assembly>.dll.sprx, but the AOT ELF is at
+	// /system_ex/common_ex/lib/<assembly>.dll.sprx
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_NATIVE_AOT_MOUNT") != nullptr) {
+		auto guest = Common::FixFilenameSlash(mounted_name);
+		while (!guest.empty() && guest[0] == '/') {
+			guest.erase(0, 1);
+		}
+		// P/Invoke looks for the already loaded libmonosgen under these names; same ELF so the
+		// program handle is reused
+		if (guest == "common_ex/lib/mono/2.1/libmonosgen-2.0.sprx" ||
+		    guest == "libmonosgen-2.0.sprx") {
+			for (const auto& mount: m_mount_pairs) {
+				if (mount.point != "/") {
+					continue;
+				}
+				const auto native =
+				    mount.dir / "system_ex" / "common_ex" / "lib" / "libmonosgen-2.0.sprx";
+				if (Common::File::IsFileExisting(native)) {
+					static std::atomic_uint32_t count {0};
+					if (count.fetch_add(1) < 12) {
+						LOGF("FIRST_FRAME_AUDIT PSM_MONO_NATIVE_ALIAS guest=%s sony=%s\n",
+						     Log::EscapeField(mounted_name).c_str(), EscapeLogPath(native).c_str());
+					}
+					return native;
+				}
+			}
+		}
+		constexpr const char* aot_prefix        = "common_ex/lib/mono/2.1/";
+		constexpr const char* shared_aot_prefix = "common_ex/lib/";
+		const char* accepted_prefix = guest.starts_with(aot_prefix)          ? aot_prefix
+		                              : guest.starts_with(shared_aot_prefix) ? shared_aot_prefix
+		                                                                     : nullptr;
+		if (accepted_prefix != nullptr) {
+			const auto name = guest.substr(std::strlen(accepted_prefix));
+			bool safe_name  = name.size() >= 9 && name.size() <= 128 && name.ends_with(".sprx") &&
+			                  name.find("..") == std::string::npos;
+			for (const char ch: name) {
+				if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+				      (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.')) {
+					safe_name = false;
+					break;
+				}
+			}
+			if (safe_name) {
+				for (const auto& mount: m_mount_pairs) {
+					if (mount.point != "/") {
+						continue;
+					}
+					const auto native =
+					    mount.dir / "system_ex" / "common_ex" / "lib" / Common::PathFromUtf8(name);
+					if (!Common::File::IsFileExisting(native)) {
+						break;
+					}
+					static std::atomic_uint32_t trace_count {0};
+					if (trace_count.fetch_add(1) < 30) {
+						LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_MOUNT guest=%s native=%s\n",
+						     Log::EscapeField(mounted_name).c_str(), EscapeLogPath(native).c_str());
+					}
+					return native;
+				}
+			}
+		}
+	}
+	if (const char* mscorlib_pe = std::getenv("KYTY_DIAGNOSTIC_SONY_MSCORLIB_PE");
+	    mscorlib_pe != nullptr && mscorlib_pe[0] != '\0') {
+		if (mounted_name == "/common_ex/lib/mono/2.1/mscorlib.dll") {
+			const auto original_pe = std::filesystem::path(mscorlib_pe);
+			if (!Common::File::IsFileExisting(original_pe)) {
+				return {};
+			}
+			LOGF("FIRST_FRAME_AUDIT SONY_MSCORLIB_PE_MAP guest=%s host=%s\n",
+			     Log::EscapeField(mounted_name).c_str(), EscapeLogPath(original_pe).c_str());
+			return original_pe;
+		}
+	}
+	// managed PEs live inside the *.dll.sprx ELFs, but PSM looks up /common_ex/lib/mono/2.1/*.dll
+	if (const char* pe_dir = std::getenv("KYTY_DIAGNOSTIC_SONY_MANAGED_PE_DIR");
+	    pe_dir != nullptr && pe_dir[0] != '\0') {
+		auto guest = Common::FixFilenameSlash(mounted_name);
+		while (!guest.empty() && guest[0] == '/') {
+			guest.erase(0, 1);
+		}
+		constexpr const char* prefixes[] = {
+		    "common_ex/lib/mono/2.1/",
+		    "system_ex/common_ex/lib/mono/2.1/",
+		    "common_ex/lib/",
+		};
+		for (const char* prefix: prefixes) {
+			if (!guest.starts_with(prefix)) {
+				continue;
+			}
+			const auto filename = guest.substr(std::strlen(prefix));
+			if (!filename.empty() && filename.size() <= 128 &&
+			    filename.find_first_of("/\\:") == std::string::npos && filename != "." &&
+			    filename != ".." && filename.ends_with(".dll")) {
+				auto staged = std::filesystem::path(pe_dir) / Common::PathFromUtf8(filename);
+				if (Common::File::IsFileExisting(staged)) {
+					static std::atomic_uint32_t trace_count {0};
+					if (trace_count.fetch_add(1) < 24) {
+						LOGF("FIRST_FRAME_AUDIT SONY_MANAGED_PE_MAP guest=%s host=%s\n",
+						     Log::EscapeField(mounted_name).c_str(), EscapeLogPath(staged).c_str());
+					}
+					return staged;
+				}
+			}
+			break;
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_COMMON_LIB_ALIAS") != nullptr) {
+		auto guest = Common::FixFilenameSlash(mounted_name);
+		while (!guest.empty() && guest[0] == '/') {
+			guest.erase(0, 1);
+		}
+		constexpr const char* prefix = "common/lib";
+		if (guest == prefix || guest.starts_with("common/lib/")) {
+			// a tail with its leading slash would join onto the host drive root
+			auto tail = guest.substr(std::strlen(prefix));
+			while (tail.starts_with('/')) {
+				tail.erase(0, 1);
+			}
+			const auto relative = Common::PathFromUtf8(tail);
+			bool safe = tail.find(':') == std::string::npos && tail.find('\\') == std::string::npos;
+			for (const auto& component: relative) {
+				if (component == "..") {
+					safe = false;
+				}
+			}
+			if (safe) {
+				for (const auto& mount: m_mount_pairs) {
+					if (mount.point != "/") {
+						continue;
+					}
+					const auto actual = mount.dir / "system" / "common" / "lib" / relative;
+					static std::atomic_uint32_t trace_count {0};
+					if (trace_count.fetch_add(1) < 20) {
+						LOGF("FIRST_FRAME_AUDIT PSM_COMMON_LIB_ALIAS guest=%s native=%s\n",
+						     Log::EscapeField(mounted_name).c_str(), EscapeLogPath(actual).c_str());
+					}
+					return actual;
+				}
+			}
+		}
+	}
 
 	// Repeated leading slashes count as one, //priv/mms has to reach the /priv mount.
 	auto guest_name = Common::FixFilenameSlash(mounted_name);

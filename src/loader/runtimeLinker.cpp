@@ -570,6 +570,12 @@ struct GuestStackFrame {
 };
 
 static bool IsReadableRange(uint64_t addr, uint64_t size);
+static std::atomic<uint64_t>                g_syscore_native_launch_entry_site {0};
+static std::atomic<uint64_t>                g_syscore_native_rfork_child_entry_site {0};
+static std::atomic<uint64_t>                g_syscore_native_child_setup_result_site {0};
+static std::atomic<uint64_t>                g_syscore_native_kqueue_result_site {0};
+static std::atomic<uint64_t>                g_agc_native_kevent_syscall_site {0};
+static std::atomic<uint64_t>                g_syscore_original_vfprintf_probe {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 struct NativeLibkernelTrap {
 	Program* owner;
@@ -609,6 +615,13 @@ static std::atomic<uint64_t>               g_mini_safe_mode_dword_4d7520_addr {0
 static std::atomic<uint64_t>               g_mini_safe_mode_system_mount_jnz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_system_ex_mount_jz_site {0};
 static std::atomic<uint64_t>               g_mini_safe_mode_ssd0_open_jnz_site {0};
+static std::atomic<uint64_t>               g_mini_dword4d7520_store_a_site {0};
+static std::atomic<uint64_t>               g_mini_dword4d7520_store_b_site {0};
+static std::atomic<uint64_t>               g_mini_dword4d7520_store_c_site {0};
+static std::atomic<uint64_t>               g_mini_dword4d7520_target_vaddr {0};
+static std::atomic<uint64_t>               g_mini_dword4d7520_helper_a_site {0};
+static std::atomic<uint64_t>               g_mini_dword4d7520_helper_b_site {0};
+static std::atomic<uint64_t>               g_mini_sub426190_entry_site {0};
 static std::atomic<uint64_t>               g_mini_sub471250_entry_site {0};
 static std::atomic<uint32_t>               g_mini_sub471250_v788_value {1u};
 static std::atomic<uint64_t>               g_mini_sub419930_entry_site {0};
@@ -1368,6 +1381,84 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	}
 }
 
+static std::vector<std::string> NeededModuleCandidates(const std::string& name) {
+	if (name.empty() || name == "." || name == ".." || name.find_first_of("/\\") != name.npos) {
+		return {};
+	}
+	const std::vector<std::string> directories = {
+	    "/app0/sce_module",      "/hostapp/sce_module",      "/system/common/lib",
+	    "/system/priv/lib",      "/system_ex/common_ex/lib", "/system_ex/priv_ex/lib",
+	    "/system/vsh/sce_module"};
+	std::vector<std::string> names = {name};
+	if (name.ends_with(".prx")) {
+		names.push_back(name.substr(0, name.size() - 4) + ".sprx");
+	} else if (!name.ends_with(".sprx")) {
+		names.push_back(name + ".sprx");
+	}
+	std::vector<std::string> candidates;
+	candidates.reserve(directories.size() * names.size());
+	for (const auto& directory: directories) {
+		for (const auto& file_name: names) {
+			candidates.push_back(directory + "/" + file_name);
+		}
+	}
+	return candidates;
+}
+struct NeededModuleSource {
+	std::filesystem::path                                          file_name;
+	std::shared_ptr<Libs::LibKernel::DirectoryPassthrough::Handle> provider_handle;
+	std::vector<uint8_t>                                           image;
+	int result = Libs::LibKernel::KERNEL_ERROR_ENOENT;
+};
+static NeededModuleSource FindNeededModuleSource(const std::string& name) {
+	NeededModuleSource source;
+	for (const auto& guest_path: NeededModuleCandidates(name)) {
+		auto path = Libs::LibKernel::FileSystem::GetRealFilename(guest_path);
+		if (!path.empty()) {
+			if (Common::File::IsFileExisting(path)) {
+				source.file_name = std::move(path);
+				source.result    = OK;
+				return source;
+			}
+			continue;
+		}
+		Libs::LibKernel::DirectoryPassthrough::FileSnapshot snapshot;
+		const int                                           result =
+		    Libs::LibKernel::DirectoryPassthrough::OpenFileSnapshot(guest_path, &snapshot);
+		if (result == Libs::LibKernel::KERNEL_ERROR_ENOENT) {
+			continue;
+		}
+		source.result = result;
+		if (result != OK) {
+			return source;
+		}
+		if (snapshot.bytes.empty()) {
+			source.result = Libs::LibKernel::KERNEL_ERROR_ENOEXEC;
+			return source;
+		}
+		source.file_name       = std::move(snapshot.host_path);
+		source.provider_handle = std::move(snapshot.handle);
+		source.image           = std::move(snapshot.bytes);
+		std::vector<uint8_t> decrypted;
+		std::string          detail;
+		switch (DecryptedModuleOverlay::ResolveDecryptedModuleImage(guest_path, source.image,
+		                                                            &decrypted, &detail)) {
+			case DecryptedModuleOverlay::Resolution::Substituted:
+				LOGF("SYSTEM_EX_DECRYPTED_OVERLAY guest_path=%s result=substituted %s\n",
+				     guest_path.c_str(), detail.c_str());
+				source.image = std::move(decrypted);
+				break;
+			case DecryptedModuleOverlay::Resolution::RejectedMissing:
+			case DecryptedModuleOverlay::Resolution::RejectedMismatch:
+				LOGF("SYSTEM_EX_DECRYPTED_OVERLAY guest_path=%s result=rejected %s\n",
+				     guest_path.c_str(), detail.c_str());
+				break;
+			case DecryptedModuleOverlay::Resolution::NotApplicable: break;
+		}
+		return source;
+	}
+	return source;
+}
 void RuntimeLinker::UnloadProgram(Program* program) {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 
@@ -2105,6 +2196,102 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		SetupTlsHandler(program);
 	}
 
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_KQUEUE_RESULT_AUDIT") != nullptr &&
+	    program->file_name.filename() == "SceSysCore.elf") {
+		constexpr uint64_t site = 0x326e;
+		EXIT_IF(site + 2 > program->base_size_aligned);
+		auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + site);
+		EXIT_IF(code[0] != 0x85 || code[1] != 0xc0);
+		code[0] = 0x0f;
+		code[1] = 0x0b;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_syscore_native_kqueue_result_site.store(program->base_vaddr + site,
+		                                          std::memory_order_release);
+		LOGF("SYSCORE_KQUEUE_RETURN_PROBE_VALIDATED"
+		     " site=%016" PRIx64 " test_eax_eax\n",
+		     program->base_vaddr + site);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_RFORK_GUEST_ENTRY_AUDIT") != nullptr &&
+	    program->file_name.filename() == "SceSysCore.elf") {
+		constexpr uint64_t site = 0x3a31;
+		EXIT_IF(site + 3 > program->base_size_aligned);
+		auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + site);
+		EXIT_IF(code[0] != 0x48 || code[1] != 0x89 || code[2] != 0xe5);
+		code[0] = 0x0f;
+		code[1] = 0x0b;
+		code[2] = 0x90;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_syscore_native_rfork_child_entry_site.store(program->base_vaddr + site,
+		                                              std::memory_order_release);
+		LOGF("SYSCORE_RFORK_GUEST_ENTRY_PROBE_VALIDATED"
+		     " entry=0x900003a30 prologue_match\n");
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_RFORK_CHILD_SETUP_AUDIT") != nullptr &&
+	    program->file_name.filename() == "SceSysCore.elf") {
+		constexpr uint64_t site = 0x3b31;
+		EXIT_IF(site + 2 > program->base_size_aligned);
+		auto* op = reinterpret_cast<uint8_t*>(program->base_vaddr + site);
+		EXIT_IF(op[0] != 0x85 || op[1] != 0xc0);
+		op[0] = 0x0f;
+		op[1] = 0x0b;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_syscore_native_child_setup_result_site.store(program->base_vaddr + site,
+		                                               std::memory_order_release);
+		LOGF("SYSCORE_CHILD_SETUP_RESULT_PROBE_VALIDATED"
+		     " site=0x900003b31 test_match\n");
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_ENTRY_AUDIT") != nullptr &&
+	    program->file_name.filename() == "SceSysCore.elf") {
+		constexpr uint64_t site = 0x31c1;
+		EXIT_IF(site + 3 > program->base_size_aligned);
+		auto* op = reinterpret_cast<uint8_t*>(program->base_vaddr + site);
+		EXIT_IF(op[0] != 0x48 || op[1] != 0x89 || op[2] != 0xe5);
+		op[0] = 0x0f;
+		op[1] = 0x0b;
+		op[2] = 0x90;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_syscore_native_launch_entry_site.store(program->base_vaddr + site,
+		                                         std::memory_order_release);
+		LOGF("SYSCORE_LOWER_LAUNCH_ENTRY_VALIDATED"
+		     " site=%016" PRIx64 " mov_rbp_rsp\n",
+		     program->base_vaddr + site);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_VFPRINTF_AUDIT") != nullptr &&
+	    program->file_name.filename() == "libSceLibcInternal.sprx") {
+		constexpr uint64_t vfprintf_push_r15_offset = 0x35224;
+		EXIT_IF(vfprintf_push_r15_offset + 2 > program->base_size_aligned);
+		auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + vfprintf_push_r15_offset);
+		EXIT_IF(code[0] != 0x41 || code[1] != 0x57);
+		code[0] = 0x0f;
+		code[1] = 0x0b;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_syscore_original_vfprintf_probe.store(program->base_vaddr + vfprintf_push_r15_offset,
+		                                        std::memory_order_release);
+		LOGF("SYSCORE_VFPRINTF_VALIDATED_IN_MEMORY_PROBE"
+		     " site=%016" PRIx64 " push_r15=4157\n",
+		     program->base_vaddr + vfprintf_push_r15_offset);
+	}
+
+	if (std::getenv("KYTY_DIAGNOSTIC_AGC_NATIVE_KEVENT_AUDIT") != nullptr &&
+	    program->file_name.filename() == "libkernel.sprx") {
+		constexpr uint64_t syscall_offset = 0x144a;
+		EXIT_IF(syscall_offset + 2 > program->base_size_aligned);
+		auto* site = reinterpret_cast<uint8_t*>(program->base_vaddr + syscall_offset);
+		EXIT_IF(site[0] != 0x0f || site[1] != 0x05);
+		site[1] = 0x0b;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_agc_native_kevent_syscall_site.store(program->base_vaddr + syscall_offset,
+		                                       std::memory_order_release);
+		LOGF("AGC_NATIVE_KEVENT_TRAP_VALIDATED"
+		     " site=%016" PRIx64 " number=0x16b\n",
+		     program->base_vaddr + syscall_offset);
+	}
 	if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr &&
 	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr &&
 	    program->file_name.filename() == "mini-syscore.elf") {
@@ -2182,6 +2369,40 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_RESCUE_PROBES"
 			     " hdd=0x%016" PRIx64 " ext=0x%016" PRIx64 " mov_edi_f0_signature\n",
 			     program->base_vaddr + hdd_offset, program->base_vaddr + ext_offset);
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SYSTEM_MOUNT_RESULT_DISCRIMINATOR") != nullptr) {
+			constexpr uint32_t system_mount_jnz_offset   = 0x43ed;
+			constexpr uint32_t system_ex_mount_jz_offset = 0x4415;
+			constexpr uint8_t  system_mount_jnz_sig[]    = {0x75, 0x3a};
+			constexpr uint8_t  system_ex_mount_jz_sig[]  = {0x0f, 0x84, 0xfc, 0x03, 0x00, 0x00};
+			auto*              sys_site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + system_mount_jnz_offset);
+			auto* ex_site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + system_ex_mount_jz_offset);
+			EXIT_IF(std::memcmp(sys_site, system_mount_jnz_sig, sizeof(system_mount_jnz_sig)) != 0);
+			EXIT_IF(std::memcmp(ex_site, system_ex_mount_jz_sig, sizeof(system_ex_mount_jz_sig)) !=
+			        0);
+			sys_site[0] = 0x0f;
+			sys_site[1] = 0x0b;
+			ex_site[0]  = 0x0f;
+			ex_site[1]  = 0x0b;
+			ex_site[2]  = 0x00;
+			ex_site[3]  = 0x00;
+			ex_site[4]  = 0x00;
+			ex_site[5]  = 0x00;
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+			    program->base_vaddr + system_mount_jnz_offset, sizeof(system_mount_jnz_sig)));
+			EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+			    program->base_vaddr + system_ex_mount_jz_offset, sizeof(system_ex_mount_jz_sig)));
+			g_mini_safe_mode_system_mount_jnz_site.store(
+			    program->base_vaddr + system_mount_jnz_offset, std::memory_order_release);
+			g_mini_safe_mode_system_ex_mount_jz_site.store(
+			    program->base_vaddr + system_ex_mount_jz_offset, std::memory_order_release);
+			LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SAFE_MODE_SYSTEM_MOUNT_RESULT_PROBES"
+			     " system_jnz=0x%016" PRIx64 " system_ex_jz=0x%016" PRIx64
+			     " two_branch_signatures\n",
+			     program->base_vaddr + system_mount_jnz_offset,
+			     program->base_vaddr + system_ex_mount_jz_offset);
 		}
 		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SSD0_OPEN_RESULT_DISCRIMINATOR") != nullptr) {
 			constexpr uint32_t ssd0_open_jnz_offset = 0x438a;
@@ -2334,6 +2555,126 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_COLD_BOOT_PROGRESS_PROBE_INSTALLED"
 				     " cold_boot_progress=0x%016" PRIx64 " mov_edi_1_signature\n",
 				     program->base_vaddr + cold_boot_progress_offset);
+			}
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SUB426550_PROBE") != nullptr) {
+			constexpr uint32_t ioctl_ret_jz_offset        = 0x26830;
+			constexpr uint32_t errno_translated_jz_offset = 0x26840;
+			constexpr uint32_t errno_sign_js_offset       = 0x26853;
+			constexpr uint32_t open_ssd0_js_offset        = 0x2686e;
+			constexpr uint32_t case7_marker_offset        = 0x26ba4;
+			constexpr uint8_t  ioctl_ret_jz_sig[]         = {0x74, 0x27};
+			constexpr uint8_t  errno_translated_jz_sig[]  = {0x74, 0x17};
+			constexpr uint8_t  errno_sign_js_sig[]        = {0x0f, 0x88, 0x45, 0xfd, 0xff, 0xff};
+			constexpr uint8_t  open_ssd0_js_sig[]         = {0x0f, 0x88, 0x85, 0x00, 0x00, 0x00};
+			constexpr uint8_t  case7_marker_sig[]         = {0xe8, 0x77, 0x15, 0x00, 0x00};
+			auto*              ioctl_ret_jz_site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + ioctl_ret_jz_offset);
+			auto* errno_translated_jz_site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + errno_translated_jz_offset);
+			auto* errno_sign_js_site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + errno_sign_js_offset);
+			auto* open_ssd0_js_site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + open_ssd0_js_offset);
+			auto* case7_marker_site =
+			    reinterpret_cast<uint8_t*>(program->base_vaddr + case7_marker_offset);
+			if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_DWORD4D7520_PROBE") != nullptr) {
+				constexpr uint32_t store_a_offset = 0x2387;
+				constexpr uint32_t store_b_offset = 0x248c;
+				constexpr uint32_t store_c_offset = 0x4ae6;
+				constexpr uint32_t target_offset  = 0xd7520;
+				constexpr uint8_t  store_a_sig[]  = {0xc7, 0x05, 0x8f, 0x51, 0x0d,
+				                                     0x00, 0x01, 0x00, 0x00, 0x00};
+				constexpr uint8_t  store_b_sig[]  = {0xc7, 0x05, 0x8a, 0x50, 0x0d,
+				                                     0x00, 0x01, 0x00, 0x00, 0x00};
+				constexpr uint8_t  store_c_sig[]  = {0xc7, 0x05, 0x30, 0x2a, 0x0d,
+				                                     0x00, 0x01, 0x00, 0x00, 0x00};
+				auto*              store_a_site =
+				    reinterpret_cast<uint8_t*>(program->base_vaddr + store_a_offset);
+				auto* store_b_site =
+				    reinterpret_cast<uint8_t*>(program->base_vaddr + store_b_offset);
+				auto* store_c_site =
+				    reinterpret_cast<uint8_t*>(program->base_vaddr + store_c_offset);
+				EXIT_IF(std::memcmp(store_a_site, store_a_sig, sizeof(store_a_sig)) != 0);
+				EXIT_IF(std::memcmp(store_b_site, store_b_sig, sizeof(store_b_sig)) != 0);
+				EXIT_IF(std::memcmp(store_c_site, store_c_sig, sizeof(store_c_sig)) != 0);
+				auto overlay = [](uint8_t* site) {
+					site[0] = 0x0f;
+					site[1] = 0x0b;
+					for (int i = 2; i < 10; ++i)
+						site[i] = 0x90;
+				};
+				overlay(store_a_site);
+				overlay(store_b_site);
+				overlay(store_c_site);
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + store_a_offset, sizeof(store_a_sig)));
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + store_b_offset, sizeof(store_b_sig)));
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + store_c_offset, sizeof(store_c_sig)));
+				g_mini_dword4d7520_store_a_site.store(program->base_vaddr + store_a_offset,
+				                                      std::memory_order_release);
+				g_mini_dword4d7520_store_b_site.store(program->base_vaddr + store_b_offset,
+				                                      std::memory_order_release);
+				g_mini_dword4d7520_store_c_site.store(program->base_vaddr + store_c_offset,
+				                                      std::memory_order_release);
+				g_mini_dword4d7520_target_vaddr.store(program->base_vaddr + target_offset,
+				                                      std::memory_order_release);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_DWORD4D7520_STORE_PROBES_INSTALLED"
+				     " store_a=0x%016" PRIx64 " store_b=0x%016" PRIx64 " store_c=0x%016" PRIx64
+				     " target=0x%016" PRIx64 " NON_AUTHENTIC\n",
+				     program->base_vaddr + store_a_offset, program->base_vaddr + store_b_offset,
+				     program->base_vaddr + store_c_offset, program->base_vaddr + target_offset);
+			}
+			if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_DWORD4D7520_HELPER_PROBE") != nullptr) {
+				constexpr uint32_t helper_a_offset = 0xa42f;
+				constexpr uint32_t helper_b_offset = 0xa47d;
+				constexpr uint8_t  helper_sig[]    = {0x41, 0xc7, 0x07, 0x01, 0x00, 0x00, 0x00};
+				auto*              helper_a_site =
+				    reinterpret_cast<uint8_t*>(program->base_vaddr + helper_a_offset);
+				auto* helper_b_site =
+				    reinterpret_cast<uint8_t*>(program->base_vaddr + helper_b_offset);
+				EXIT_IF(std::memcmp(helper_a_site, helper_sig, sizeof(helper_sig)) != 0);
+				EXIT_IF(std::memcmp(helper_b_site, helper_sig, sizeof(helper_sig)) != 0);
+				auto overlay = [](uint8_t* site) {
+					site[0] = 0x0f;
+					site[1] = 0x0b;
+					for (int i = 2; i < 7; ++i)
+						site[i] = 0x90;
+				};
+				overlay(helper_a_site);
+				overlay(helper_b_site);
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + helper_a_offset, sizeof(helper_sig)));
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + helper_b_offset, sizeof(helper_sig)));
+				g_mini_dword4d7520_helper_a_site.store(program->base_vaddr + helper_a_offset,
+				                                       std::memory_order_release);
+				g_mini_dword4d7520_helper_b_site.store(program->base_vaddr + helper_b_offset,
+				                                       std::memory_order_release);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_DWORD4D7520_HELPER_PROBES_INSTALLED"
+				     " helper_a=0x%016" PRIx64 " helper_b=0x%016" PRIx64
+				     " inside_sub_40a320 NON_AUTHENTIC\n",
+				     program->base_vaddr + helper_a_offset, program->base_vaddr + helper_b_offset);
+			}
+			if (std::getenv("KYTY_DIAGNOSTIC_SAFE_MODE_SUB426190_PASSTHROUGH_VERDICT") != nullptr) {
+				constexpr uint32_t entry_offset = 0x26190;
+				constexpr uint8_t  entry_sig[]  = {0x55, 0x48, 0x89, 0xe5};
+				auto* entry_site = reinterpret_cast<uint8_t*>(program->base_vaddr + entry_offset);
+				EXIT_IF(std::memcmp(entry_site, entry_sig, sizeof(entry_sig)) != 0);
+				entry_site[0] = 0x0f;
+				entry_site[1] = 0x0b;
+				entry_site[2] = 0x90;
+				entry_site[3] = 0x90;
+				EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(
+				    program->base_vaddr + entry_offset, sizeof(entry_sig)));
+				g_mini_sub426190_entry_site.store(program->base_vaddr + entry_offset,
+				                                  std::memory_order_release);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SUB426190_ENTRY_PROBE_INSTALLED"
+				     " entry=0x%016" PRIx64
+				     " partition_magic_check_shortcircuit_for_ssd0 NON_AUTHENTIC\n",
+				     program->base_vaddr + entry_offset);
 			}
 		}
 		if (std::getenv("KYTY_DIAGNOSTIC_MINI_REBOOT_PATH_AUDIT") != nullptr) {

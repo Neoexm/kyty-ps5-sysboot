@@ -64,6 +64,35 @@ int          GetArgc();
 const char** GetArgv();
 } // namespace LibC
 
+struct NativeModuleSource {
+	std::filesystem::path                                    file_name;
+	std::shared_ptr<LibKernel::DirectoryPassthrough::Handle> provider_handle;
+	std::vector<uint8_t>                                     image;
+	int result = LibKernel::KERNEL_ERROR_ENOENT;
+};
+static void ApplyNativeModuleOverlay(const std::string& guest_path, NativeModuleSource* source) {
+	if (source == nullptr || source->result != OK || source->image.empty()) return;
+
+	std::vector<uint8_t> decrypted;
+	std::string          detail;
+	switch (Loader::DecryptedModuleOverlay::ResolveDecryptedModuleImage(guest_path, source->image,
+	                                                                    &decrypted, &detail)) {
+		case Loader::DecryptedModuleOverlay::Resolution::Substituted:
+			LOGF("SYSTEM_EX_DECRYPTED_OVERLAY guest_path=%s route=native_module result=substituted "
+			     "%s\n",
+			     guest_path.c_str(), detail.c_str());
+			source->image = std::move(decrypted);
+			break;
+		case Loader::DecryptedModuleOverlay::Resolution::RejectedMissing:
+		case Loader::DecryptedModuleOverlay::Resolution::RejectedMismatch:
+			LOGF("SYSTEM_EX_DECRYPTED_OVERLAY guest_path=%s route=native_module result=rejected "
+			     "%s\n",
+			     guest_path.c_str(), detail.c_str());
+			source->result = LibKernel::KERNEL_ERROR_ENOEXEC;
+			break;
+		case Loader::DecryptedModuleOverlay::Resolution::NotApplicable: break;
+	}
+}
 LIB_VERSION("libkernel", 1, "libkernel", 1, 1);
 
 namespace LibKernelApr {
@@ -3004,6 +3033,46 @@ int chmod(const char* path, int mode) {
 	return OK;
 }
 
+// processSpawn gate: Prospero SDK word from PT_OS_PROCPARAM, taken from the decrypted overlay
+static int SdkVersionByPath(const char* path, uint64_t shift, uint32_t* out, const char* tag) {
+	if (path == nullptr || out == nullptr) {
+		LOGF("%s path=%s out=%s result=0x%x reason=null_arg\n", tag,
+		     path != nullptr ? path : "(null)", out != nullptr ? "set" : "(null)",
+		     LibKernel::KERNEL_ERROR_EINVAL);
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	LibKernel::DirectoryPassthrough::FileSnapshot snapshot;
+	const int result = LibKernel::DirectoryPassthrough::OpenFileSnapshot(path, &snapshot);
+	if (result != OK || snapshot.bytes.empty()) {
+		LOGF("%s path=%s result=0x%x reason=open\n", tag, path, result);
+		return result != OK ? result : LibKernel::KERNEL_ERROR_ENOENT;
+	}
+	std::vector<uint8_t> decrypted;
+	std::string          detail;
+	if (Loader::DecryptedModuleOverlay::ResolveDecryptedModuleImage(path, snapshot.bytes,
+	                                                                &decrypted, &detail) !=
+	        Loader::DecryptedModuleOverlay::Resolution::Substituted ||
+	    decrypted.size() < 0x1000) {
+		LOGF("%s path=%s result=0x%x reason=no_decrypted_image %s\n", tag, path,
+		     LibKernel::KERNEL_ERROR_ENOENT, detail.c_str());
+		return LibKernel::KERNEL_ERROR_ENOENT;
+	}
+	const auto*    phdr  = reinterpret_cast<const Loader::Elf64_Phdr*>(decrypted.data() + 0x40);
+	const uint16_t phnum = *reinterpret_cast<const uint16_t*>(decrypted.data() + 0x38);
+	for (uint16_t i = 0; i < phnum; i++) {
+		const uint64_t off = phdr[i].p_offset;
+		if (phdr[i].p_type != Loader::PT_OS_PROCPARAM || phdr[i].p_filesz < 0x18 ||
+		    off + phdr[i].p_filesz > decrypted.size()) {
+			continue;
+		}
+		*out = static_cast<uint32_t>(
+		    *reinterpret_cast<const uint64_t*>(decrypted.data() + off + 0x10) >> shift);
+		LOGF("%s path=%s value=0x%08x result=0\n", tag, path, *out);
+		return 0;
+	}
+	LOGF("%s path=%s result=0x%x reason=no_procparam\n", tag, path, LibKernel::KERNEL_ERROR_ENOENT);
+	return LibKernel::KERNEL_ERROR_ENOENT;
+}
 int KYTY_SYSV_ABI KernelAioInitializeImpl(void* param, int32_t size) {
 	PRINT_NAME();
 

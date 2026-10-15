@@ -586,6 +586,26 @@ void CheckTmpfsMounts(const std::filesystem::path& root) {
   request.Set(duplicate_exfat);
   Check(request.Invoke(1).posix_errno == Posix::POSIX_EINVAL,
         "exfat nmount rejects duplicate options");
+  auto altered_exfat = exfat_options;
+  altered_exfat.back() = "755";
+  request.Set(altered_exfat);
+  Check(request.Invoke(1).posix_errno == Posix::POSIX_EINVAL,
+        "exfat nmount rejects altered firmware options");
+
+  const auto exfat_image = root / "nmount-exfat.bin";
+  const auto exfat_bytes = ExfatTestFixture::Fixture();
+  { std::ofstream output(exfat_image, std::ios::binary);
+    output.write(reinterpret_cast<const char*>(exfat_bytes.data()), exfat_bytes.size());
+    Check(output.good(), "write exfat nmount fixture"); }
+  Kernel::SectorBacking::Result media;
+  std::shared_ptr<Kernel::SectorBacking> exfat_backing = Kernel::SectorBacking::Open(
+      exfat_image, {}, 512, 2048 * 512,
+      "0157195d5d05a1f7ba4707292771a374b9356ad00d85288988f0ca54ada1c63a", &media);
+  Check(exfat_backing && media == Kernel::SectorBacking::Result::Ok &&
+        FileSystem::RegisterDiagnosticSectorPayload("/dev/ssd0.system", exfat_backing) == OK,
+        "register explicitly selected logical system provider");
+  request.Set(exfat_options);
+  exfat_reply = request.Invoke(1);
   Check(exfat_reply.value == 0 && exfat_reply.posix_errno == 0 &&
         Kernel::ExfatMount::Contains("/system/hello.bin"),
         "exact exfat nmount vector mounts explicit sector backing");
