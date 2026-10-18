@@ -93,8 +93,13 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
+// host object for a guest pthread handle, or the argument if it isn't one
+Pthread PthreadHostObjectFor(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);
+int PthreadCreateGuestRfork(Pthread* thread, const PthreadAttr* attr, pthread_entry_func_t entry,
+                            void* arg, const char* name, int guest_process_pid,
+                            uint64_t rfork_stack_top);
 int KYTY_SYSV_ABI     PthreadDetach(Pthread thread);
 int KYTY_SYSV_ABI     PthreadJoin(Pthread thread, void** value);
 int KYTY_SYSV_ABI     PthreadCancel(Pthread thread);
@@ -112,6 +117,11 @@ void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
+struct PthreadSignalMask {
+	uint64_t words[2] {};
+};
+PthreadSignalMask     PthreadGetSignalMask(Pthread thread);
+void                  PthreadSetSignalMask(Pthread thread, PthreadSignalMask mask);
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);

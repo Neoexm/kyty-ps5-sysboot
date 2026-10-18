@@ -556,6 +556,42 @@ struct SharedGuestPipe {
 		return Open(name, true);
 	}
 
+	int64_t Read(void* buffer, size_t length) {
+		if (length == 0) {
+			return 0;
+		}
+		for (;;) {
+			if (!Lock()) {
+				return KERNEL_ERROR_EIO;
+			}
+			if (!Valid()) {
+				ReleaseMutex(mutex);
+				return KERNEL_ERROR_EIO;
+			}
+			const auto [readers, writers] = Owners(true);
+			if (state->size != 0) {
+				const size_t count = std::min(length, static_cast<size_t>(state->size));
+				const size_t first = std::min(count, static_cast<size_t>(capacity - state->head));
+				Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer), count);
+				std::memcpy(buffer, state->bytes + state->head, first);
+				std::memcpy(static_cast<uint8_t*>(buffer) + first, state->bytes, count - first);
+				state->head = (state->head + static_cast<uint32_t>(count)) % capacity;
+				state->size -= static_cast<uint32_t>(count);
+				Notify(readers, writers);
+				ReleaseMutex(mutex);
+				return static_cast<int64_t>(count);
+			}
+			Notify(readers, writers);
+			ReleaseMutex(mutex);
+			if (writers == 0) {
+				return 0;
+			}
+			if (WaitForSingleObject(readable, 100) == WAIT_FAILED) {
+				return KERNEL_ERROR_EIO;
+			}
+		}
+	}
+
 };
 #endif
 
@@ -1010,10 +1046,12 @@ public:
 	void  BindStandardConsole(int fd);
 	bool  HasStandardDeci(int fd);
 	bool  CloseStandardDeci(int fd);
+	int   CloneGuestSocketPairInto(FileDescriptors* child, int source_fd);
 	void  DeleteDescriptor(int d);
 	File* GetFile(int d);
 	File* GetFile(const std::filesystem::path& real_name);
 	void  CloseAll();
+	std::shared_ptr<GuestSocketReadSource>  PinSocketReadSource(int fd);
 	int  GetFlags(int fd);
 	int  SetFlags(int fd, int flags);
 	int  Export(std::string* manifest);
@@ -1200,6 +1238,28 @@ static int ReferenceGuestPipe(const std::shared_ptr<GuestPipe>& pipe, bool read,
 
 
 
+static int64_t ReadGuestPipe(const std::shared_ptr<GuestPipe>& pipe, void* buf, size_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (pipe->shared) {
+		return pipe->shared->Read(buf, size);
+	}
+#endif
+	if (size == 0) {
+		return 0;
+	}
+	std::unique_lock lock(pipe->mutex);
+	pipe->cv.wait(lock, [&] { return !pipe->data.empty() || pipe->writers == 0; });
+	const auto count = std::min(size, pipe->data.size());
+	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), count);
+	auto* output = static_cast<uint8_t*>(buf);
+	for (size_t i = 0; i < count; ++i) {
+		output[i] = pipe->data.front();
+		pipe->data.pop_front();
+	}
+	lock.unlock();
+	pipe->cv.notify_all();
+	return static_cast<int64_t>(count);
+}
 
 static std::atomic_bool g_diagnostic_gc_device_ready = false;
 static Common::Mutex    g_hmd_shm_mutex;
@@ -1464,9 +1524,70 @@ bool FileDescriptors::CloseStandardDeci(int fd) {
 	return true;
 }
 
+// __sys_rdup: copy an open endpoint from the parent into the RFCFDG table, byte queues stay shared
+int FileDescriptors::CloneGuestSocketPairInto(FileDescriptors* child, int source_fd) {
+	if (child == nullptr || child == this || source_fd < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+	Common::LockGuard lock(m_mutex);
+	const size_t      index = static_cast<size_t>(source_fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size()) {
+		return KERNEL_ERROR_EBADF;
+	}
+	const auto* source = m_files[index];
+	if (source == nullptr || !source->opened || source->special != SpecialFile::GuestSocketPair ||
+	    !source->pipe || !source->socket_send || source->pipe == source->socket_send) {
+		return KERNEL_ERROR_EBADF;
+	}
+	const int guest_fd = child->CreateDescriptor();
+	auto*     cloned   = child->GetFile(guest_fd);
+	EXIT_IF(cloned == nullptr || cloned->opened);
+	const int retain_read = ReferenceGuestPipe(source->pipe, true, 1);
+	if (retain_read != OK) {
+		child->DeleteDescriptor(guest_fd);
+		return retain_read;
+	}
+	const int retain_write = ReferenceGuestPipe(source->socket_send, false, 1);
+	if (retain_write != OK) {
+		ReferenceGuestPipe(source->pipe, true, -1);
+		child->DeleteDescriptor(guest_fd);
+		return retain_write;
+	}
+	cloned->name               = source->name;
+	cloned->real_name          = source->real_name;
+	cloned->special            = SpecialFile::GuestSocketPair;
+	cloned->readable           = source->readable.load();
+	cloned->writable           = source->writable.load();
+	cloned->pipe               = source->pipe;
+	cloned->socket_send        = source->socket_send;
+	cloned->socket_read_source = std::make_shared<GuestSocketReadSource>(cloned->pipe);
+	cloned->opened             = true;
+	LOGF("SYSCORE_GUEST_RDUP_SOCKET_ENDPOINT"
+	     " source_parent_fd=%d child_fd=%d"
+	     " shared_socket_queues=1\n",
+	     source_fd, guest_fd);
+	return guest_fd;
+}
 
 
+std::shared_ptr<GuestSocketReadSource> FileDescriptors::PinSocketReadSource(int fd) {
+	if (fd < DESCRIPTOR_MIN) {
+		return {};
+	}
+	Common::LockGuard lock(m_mutex);
+	const size_t      index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size()) {
+		return {};
+	}
+	const auto* file = m_files[index];
+	return file != nullptr && file->opened && file->special == SpecialFile::GuestSocketPair
+	           ? file->socket_read_source
+			   : nullptr;
+}
 
+std::shared_ptr<GuestSocketReadSource> PinGuestSocketReadSource(int fd) {
+	return g_files == nullptr ? nullptr : g_files->PinSocketReadSource(fd);
+}
 
 
 
@@ -1955,6 +2076,40 @@ static std::atomic_bool g_guest_socket_fixture_trace {false};
 
 
 
+int QueryGuestSocketReadSource(const std::shared_ptr<GuestSocketReadSource>& source,
+                               int64_t* pending, bool* eof) {
+	if (pending == nullptr || eof == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (!source) {
+		return KERNEL_ERROR_EBADF;
+	}
+	std::lock_guard source_lock(source->mutex);
+	if (source->closed || !source->pipe) {
+		return KERNEL_ERROR_EBADF;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (const auto shared = source->pipe->shared) {
+		if (!shared->Lock()) {
+			return KERNEL_ERROR_EIO;
+		}
+		if (!shared->Valid()) {
+			ReleaseMutex(shared->mutex);
+			return KERNEL_ERROR_EIO;
+		}
+		const auto [readers, writers] = shared->Owners(true);
+		*pending                      = shared->state->size;
+		*eof                          = writers == 0;
+		shared->Notify(readers, writers);
+		ReleaseMutex(shared->mutex);
+		return OK;
+	}
+#endif
+	std::lock_guard queue_lock(source->pipe->mutex);
+	*pending = static_cast<int64_t>(source->pipe->data.size());
+	*eof     = source->pipe->writers == 0;
+	return OK;
+}
 
 int FileDescriptors::GetFlags(int fd) {
 	if (fd < 0) {
@@ -2395,6 +2550,8 @@ static constexpr PsmShellUiApplicationRoute kPsmShellUiApplicationRoutes[] = {
 	 "31fe344c9b7570fd3a49c8d2031d88db5c90e050f261bad866463894ecc55426"},
 };
 
+static constexpr size_t kPsmShellUiPackageSelfLease = std::size(kPsmShellUiApplicationRoutes);
+
 struct PsmShellUiApplicationLease {
 	std::filesystem::path source;
 	std::vector<uint8_t>  bytes;
@@ -2446,7 +2603,31 @@ static void ReleasePsmShellUiApplicationLeases() {
 
 
 
+bool OpenPsmShellUiApplicationSnapshot(const std::string& guest_path, Common::File* file) {
+	if (file == nullptr || !file->IsInvalid()) return false;
+	bool        exact = false;
+	const auto* route = ClassifyPsmShellUiApplicationRoute(guest_path, &exact);
+	if (route == nullptr || !exact) return false;
+	const auto      slot = static_cast<size_t>(route - kPsmShellUiApplicationRoutes);
+	std::lock_guard lock(g_psm_shellui_application_lease_mutex);
+	const auto&     lease = g_psm_shellui_application_leases[slot];
+	return lease.active && !lease.bytes.empty() &&
+	       file->OpenInMem(const_cast<uint8_t*>(lease.bytes.data()),
+	                       static_cast<uint32_t>(lease.bytes.size()));
+}
 
+bool ReadPsmShellUiApplicationSnapshot(const std::string& guest_path, std::vector<uint8_t>* image) {
+	if (image == nullptr) return false;
+	bool        exact = false;
+	const auto* route = ClassifyPsmShellUiApplicationRoute(guest_path, &exact);
+	if (route == nullptr || !exact) return false;
+	const auto      slot = static_cast<size_t>(route - kPsmShellUiApplicationRoutes);
+	std::lock_guard lock(g_psm_shellui_application_lease_mutex);
+	const auto&     lease = g_psm_shellui_application_leases[slot];
+	if (!lease.active || lease.bytes.empty()) return false;
+	*image = lease.bytes;
+	return true;
+}
 
 static bool IsPsmShellUiApplicationHostPath(const std::filesystem::path& path) {
 	if (path.empty()) return false;
@@ -4399,6 +4580,36 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	EXIT_NOT_IMPLEMENTED(directory && rw_mode != Common::File::Mode::Read);
 	EXIT_NOT_IMPLEMENTED(directory && (trunc || creat));
 
+	// child opens the DECI streams as 0-2 before importing the socketpair at fd 3, so they go in
+	// its RFCFDG table
+	if (!directory && g_files->HasExplicitStandardTable() &&
+	    (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr ||
+	     std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_LIVE_RFORK") != nullptr) &&
+	    (std::strcmp(path, "/dev/deci_stdin") == 0 || std::strcmp(path, "/dev/deci_stdout") == 0 ||
+	     std::strcmp(path, "/dev/deci_stderr") == 0)) {
+		const bool input  = std::strcmp(path, "/dev/deci_stdin") == 0;
+		const int  std_fd = input ? 0 : (std::strcmp(path, "/dev/deci_stdout") == 0 ? 1 : 2);
+		if ((input && deci_access != 0) || (!input && deci_access != 1)) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (g_files->OpenStandardDeci(std_fd)) {
+			g_files->SetFlags(std_fd, descriptor_flags);
+			LOGF("SYSCORE_CHILD_DECI_STDIO"
+			     " guest_fd=%d path=%s host_stream_backing=1"
+			     " child_scoped_RFCFDG=1\n",
+			     std_fd, path);
+			return std_fd;
+		}
+	}
+	if (!directory && g_files->HasExplicitStandardTable() && IsConsoleDevice(path) && flags == 2 &&
+	    std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_LIVE_RFORK") != nullptr) {
+		const int standard = g_files->OpenStandardConsole(descriptor_flags);
+		if (standard >= 0) {
+			LOGF("MINI_CONSOLE_STANDARD_OPEN pid=%d fd=%d host_stdio=1\n", Process::GetPid(),
+			     standard);
+			return standard;
+		}
+	}
 	int   descriptor = g_files->CreateDescriptor();
 	auto* file       = g_files->GetFile(descriptor);
 
@@ -4670,6 +4881,76 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	return descriptor;
 }
 
+int KYTY_SYSV_ABI KernelPhyshmOpen(const char* path, int flags, uint16_t mode, int memory_type) {
+	constexpr size_t   MAX_PATH_BYTES  = 0x400;
+	constexpr char     NAMESPACE[]     = "/.physhm";
+	constexpr uint32_t O_ACCMODE_GUEST = 0x3;
+	constexpr uint32_t O_WRONLY_GUEST  = 0x1;
+	constexpr uint32_t O_RDWR_GUEST    = 0x2;
+	constexpr uint32_t O_CREAT_GUEST   = 0x200;
+	constexpr uint32_t O_TRUNC_GUEST   = 0x400;
+	constexpr uint32_t O_EXCL_GUEST    = 0x800;
+	constexpr uint32_t O_CLOEXEC_GUEST = 0x100000;
+	constexpr uint32_t ALLOWED_FLAGS =
+	    O_ACCMODE_GUEST | O_CREAT_GUEST | O_TRUNC_GUEST | O_EXCL_GUEST | O_CLOEXEC_GUEST;
+	constexpr int AUDIO_MEMORY_TYPE = 12;
+
+	auto fail = [](int error) {
+		*Posix::GetErrorAddr() = error;
+		return -1;
+	};
+	if (path == nullptr) return fail(Posix::POSIX_EFAULT);
+
+	std::array<char, MAX_PATH_BYTES> copied {};
+	size_t                           length = 0;
+	for (; length < copied.size(); ++length) {
+		if (!GuestSocketBufferAccessible(path + length, 1, false)) {
+			return fail(Posix::POSIX_EFAULT);
+		}
+		std::memcpy(&copied[length], path + length, 1);
+		if (copied[length] == '\0') break;
+	}
+	if (length == copied.size()) return fail(Posix::POSIX_ENAMETOOLONG);
+	if (length < 2 || copied[0] != '/') return fail(Posix::POSIX_EINVAL);
+	if (length + sizeof(NAMESPACE) > 64) return fail(Posix::POSIX_ENAMETOOLONG);
+
+	const auto flags_u = static_cast<uint32_t>(flags);
+	const auto access  = flags_u & O_ACCMODE_GUEST;
+	if (access == O_ACCMODE_GUEST || (flags_u & ~ALLOWED_FLAGS) != 0 ||
+	    ((flags_u & O_EXCL_GUEST) != 0 && (flags_u & O_CREAT_GUEST) == 0) ||
+	    ((flags_u & O_TRUNC_GUEST) != 0 && access == 0) || (mode & ~0777u) != 0) {
+		return fail(Posix::POSIX_EINVAL);
+	}
+	if (memory_type != AUDIO_MEMORY_TYPE) return fail(Posix::POSIX_ENOTSUP);
+
+	const std::string name(copied.data(), length);
+	const std::string scope_name   = std::string(NAMESPACE) + name;
+	int               scope_shared = -1;
+	uint64_t          scope_size   = 0;
+	const int         error =
+	    Memory::OpenScopeSharedMemory(scope_name.c_str(), flags, &scope_shared, &scope_size);
+	if (error != 0) return fail(error);
+
+	const int descriptor = g_files->CreateDescriptor();
+	auto*     file       = g_files->GetFile(descriptor);
+	EXIT_IF(file == nullptr || file->opened || file->directory);
+	file->name             = name;
+	file->real_name        = name;
+	file->readable         = access != O_WRONLY_GUEST;
+	file->writable         = access == O_WRONLY_GUEST || access == O_RDWR_GUEST;
+	file->append           = false;
+	file->sync_writes      = false;
+	file->special          = SpecialFile::SharedMemory;
+	file->descriptor_flags = (flags_u & O_CLOEXEC_GUEST) != 0 ? 1 : 0;
+	file->special_size     = scope_size;
+	file->scope_shared     = scope_shared;
+	file->opened           = true;
+	LOGF("PHYSHM_OPEN guest_pid=%d name=%s flags=0x%x mode=0%o memory_type=%d"
+	     " size=0x%016" PRIx64 " fd=%d\n",
+	     Process::GetPid(), Log::EscapeField(name).c_str(), flags_u, mode, memory_type, scope_size,
+	     descriptor);
+	return descriptor;
+}
 
 static bool IsReservedPhyshmBackendName(const char* path) {
 	constexpr char Root[] = "/.physhm";
@@ -4966,8 +5247,9 @@ int KYTY_SYSV_ABI KernelPipe(int* fds) {
 	return OK;
 }
 
-int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+int KYTY_SYSV_ABI KernelDup2(int oldd, int newd) {
 	PRINT_NAME();
+}
 
 // Windows-only. Guest ranges must be committed before memcpy or a VideoOut flip
 static bool NativeDceReadable(uint64_t addr, uint64_t size, bool need_write = false) {
@@ -5234,6 +5516,7 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
+	}
 
 	if (::Libs::Network::Net::IsSocket(d)) {
 		const auto result = ::Libs::Network::Net::Ioctl(d, request, arg);
@@ -5533,6 +5816,32 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 
 
 
+static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {
+	if (d < DESCRIPTOR_MIN) {
+		if (g_files != nullptr &&
+		    (g_files->HasStandardConsole(d) || (d == 0 && g_files->HasStandardDeci(d)))) {
+			if (buf == nullptr) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), nbytes);
+			const size_t bytes = std::fread(buf, 1, nbytes, stdin);
+			return std::ferror(stdin) ? KERNEL_ERROR_EIO : static_cast<int64_t>(bytes);
+		}
+		if (g_files != nullptr && g_files->HasExplicitStandardTable()) {
+			return KERNEL_ERROR_EBADF;
+		}
+		if (d >= 0) {
+			std::shared_ptr<GuestPipe> pipe;
+			SpecialFile                role;
+			{
+				std::lock_guard lock(g_standard_pipe_mutex);
+				pipe = g_standard_pipes[d];
+				role = g_standard_pipe_types[d];
+			}
+			if (pipe && role == SpecialFile::PipeRead) {
+				return buf != nullptr ? ReadGuestPipe(pipe, buf, nbytes) : KERNEL_ERROR_EFAULT;
+			}
+		}
 		return KERNEL_ERROR_EPERM;
 	}
 
@@ -5593,7 +5902,19 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
 
-	return bytes_read;
+	return bytes_read != 0 || !host_error ? static_cast<int64_t>(bytes_read) : KERNEL_ERROR_EIO;
+}
+
+int64_t ReadWithStatus(int d, void* buf, size_t nbytes, int* read_error) {
+	if (read_error != nullptr) *read_error = OK;
+	const int64_t result = ReadInternal(d, buf, nbytes, read_error);
+	if (result < 0 && read_error != nullptr) *read_error = static_cast<int>(result);
+	return result;
+}
+
+int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
+	PRINT_NAME();
+	return ReadWithStatus(d, buf, nbytes, nullptr);
 }
 
 int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
@@ -7008,6 +7329,252 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 	return KERNEL_ERROR_ENOENT;
 }
 
+static void DiagnosticVerifyScopedConsole() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const int prior = GetDescriptorFlags(0);
+	{
+		ScopedGuestDescriptorTable scope;
+		EXIT_IF(KernelDup2(0, 1) != KERNEL_ERROR_EBADF);
+		EXIT_IF(g_files->OpenStandardConsole(1) != 0);
+		EXIT_IF(KernelDup2(0, 0) != 0 || GetDescriptorFlags(0) != 1);
+		EXIT_IF(KernelDup2(0, 1) != 1 || KernelDup2(0, 2) != 2);
+		EXIT_IF(GetDescriptorFlags(1) != 0 || GetDescriptorFlags(2) != 0);
+		EXIT_IF(KernelClose(0) != OK || KernelDup2(0, 1) != KERNEL_ERROR_EBADF);
+		std::string manifest;
+		EXIT_IF(g_files->Export(&manifest) != OK ||
+		        manifest != "KYTY_EXEC_FDS 1\nC 1 0 1\nC 2 0 2\nEND\n");
+		EXIT_IF(g_files->Import("KYTY_EXEC_FDS 1\nC 1 0 2\nEND\n") != KERNEL_ERROR_EINVAL);
+		EXIT_IF(!g_files->HasStandardConsole(1) || !g_files->HasStandardConsole(2));
+		EXIT_IF(g_files->Import(manifest) != OK || g_files->HasStandardConsole(0));
+		const char bytes[] = "host-console-fixture\n";
+		EXIT_IF(KernelWrite(1, bytes, sizeof(bytes) - 1) != sizeof(bytes) - 1);
+		EXIT_IF(KernelClose(1) != OK || !g_files->HasStandardConsole(2));
+		EXIT_IF(KernelWrite(1, bytes, 1) != KERNEL_ERROR_EBADF || KernelClose(2) != OK);
+	}
+	EXIT_IF(GetDescriptorFlags(0) != prior);
+	LOGF("PS5_SCOPED_CONSOLE_SELFTEST PASS lowest_fd=0 stdout_bytes=1 aliases=1 cloexec=1 "
+	     "malformed_import_rollback=1 parent_untouched=1\n");
+#endif
+}
 
+static void DiagnosticVerifyExecDescriptorTransfer() {
+	DiagnosticVerifyScopedConsole();
+	if (std::getenv("KYTY_DIAGNOSTIC_GUEST_EXEC_DESCRIPTOR_SELFTEST") == nullptr) {
+		return;
+	}
+	LOGF("PS5_GUEST_EXEC_DESCRIPTOR_SELFTEST_BEGIN\n");
+	EXIT_IF(g_guest_files_override != nullptr || g_primary_files == nullptr);
+	int pair[2] {-1, -1};
+	EXIT_IF(CreateGuestSocketPair(pair) != OK);
+	constexpr char queued[] = "exec-descriptor-real-queued-before-replacement";
+	constexpr char reply[]  = "exec-descriptor-real-reply-through-retained-alias";
+	EXIT_IF(KernelWrite(pair[0], queued, sizeof(queued)) != static_cast<int64_t>(sizeof(queued)));
+	std::atomic_bool replacement_ready {false};
+	std::atomic_bool parent_copy_closed {false};
+	std::thread      worker([&] {
+		ScopedGuestDescriptorTable source;
+		EXIT_IF(KernelOpen("/dev/deci_stdin", 0, 0) != 0);
+		EXIT_IF(KernelOpen("/dev/deci_stdout", 1, 0) != 1);
+		EXIT_IF(KernelOpen("/dev/deci_stderr", 1, 0) != 2);
+		const int stream_alias = KernelOpen("/dev/deci_stdout", 1, 0);
+		const int cloexec      = KernelOpen("/dev/random", 0x00100000, 0);
+		const int socket =
+		    g_primary_files->CloneGuestSocketPairInto(g_guest_files_override, pair[1]);
+		EXIT_IF(stream_alias != 3 || cloexec != 4 || socket != 5);
+		EXIT_IF(GetDescriptorFlags(-1) != KERNEL_ERROR_EBADF);
+		EXIT_IF(SetDescriptorFlags(-1, 0) != KERNEL_ERROR_EBADF);
+		EXIT_IF(GetDescriptorFlags(cloexec) != 1);
+		EXIT_IF(SetDescriptorFlags(cloexec, 2) != KERNEL_ERROR_EINVAL);
+		EXIT_IF(GetDescriptorFlags(cloexec) != 1);
+		const auto original_watch = PinGuestSocketReadSource(socket);
+		int64_t    pending        = -1;
+		bool       eof            = true;
+		EXIT_IF(!original_watch ||
+		        QueryGuestSocketReadSource(original_watch, &pending, &eof) != OK ||
+		        pending != sizeof(queued) || eof);
+		std::string manifest;
+		EXIT_IF(ExportExecDescriptors(&manifest) != OK);
+		EXIT_IF(SetDescriptorFlags(cloexec, 0) != OK);
+		std::string unchanged = "unchanged-export-output";
+		EXIT_IF(ExportExecDescriptors(&unchanged) != KERNEL_ERROR_ENOSYS);
+		EXIT_IF(unchanged != "unchanged-export-output");
+		EXIT_IF(SetDescriptorFlags(cloexec, 1) != OK);
+		EXIT_IF(ImportExecDescriptors(manifest + "invalid-trailing-record\n") !=
+		        KERNEL_ERROR_EINVAL);
+		FileStat stat {};
+		EXIT_IF(KernelFstat(cloexec, &stat) != OK || GetDescriptorFlags(cloexec) != 1);
+		EXIT_IF(KernelFstat(socket, &stat) != OK);
+		EXIT_IF(QueryGuestSocketReadSource(original_watch, &pending, &eof) != OK ||
+		        pending != sizeof(queued) || eof);
+		for (int attempt = 0; attempt < 3; ++attempt) {
+			EXIT_IF(ImportExecDescriptors(manifest) != OK);
+			EXIT_IF(QueryGuestSocketReadSource(original_watch, &pending, &eof) !=
+			        KERNEL_ERROR_EBADF);
+			const auto imported_watch = PinGuestSocketReadSource(socket);
+			EXIT_IF(!imported_watch ||
+			        QueryGuestSocketReadSource(imported_watch, &pending, &eof) != OK ||
+			        pending != sizeof(queued) || eof);
+			EXIT_IF(KernelFstat(cloexec, &stat) != KERNEL_ERROR_EBADF);
+			EXIT_IF(GetDescriptorFlags(cloexec) != KERNEL_ERROR_EBADF);
+			EXIT_IF(KernelFstat(stream_alias, &stat) != OK);
+			EXIT_IF(KernelFstat(socket, &stat) != OK);
+			EXIT_IF(GetDescriptorFlags(0) != 0 || GetDescriptorFlags(1) != 0 ||
+			        GetDescriptorFlags(2) != 0);
+		}
+		replacement_ready.store(true, std::memory_order_release);
+		while (!parent_copy_closed.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		FileDescriptors* prior_table = g_files;
+		const auto       prior_watch = PinGuestSocketReadSource(socket);
+		{
+			ScopedGuestDescriptorTable alias;
+			EXIT_IF(ImportExecDescriptors(manifest) != OK);
+			const auto alias_watch = PinGuestSocketReadSource(socket);
+			prior_table->CloseAll();
+			EXIT_IF(QueryGuestSocketReadSource(prior_watch, &pending, &eof) != KERNEL_ERROR_EBADF);
+			EXIT_IF(!alias_watch || QueryGuestSocketReadSource(alias_watch, &pending, &eof) != OK ||
+			        pending != sizeof(queued) || eof);
+			char received[sizeof(queued)] {};
+			EXIT_IF(KernelRead(socket, received, sizeof(received)) !=
+			        static_cast<int64_t>(sizeof(received)));
+			EXIT_IF(std::memcmp(received, queued, sizeof(queued)) != 0);
+			EXIT_IF(KernelWrite(socket, reply, sizeof(reply)) !=
+			        static_cast<int64_t>(sizeof(reply)));
+			EXIT_IF(KernelClose(socket) != OK);
+			EXIT_IF(QueryGuestSocketReadSource(alias_watch, &pending, &eof) != KERNEL_ERROR_EBADF);
+		}
+	});
+	while (!replacement_ready.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+	EXIT_IF(KernelClose(pair[1]) != OK);
+	parent_copy_closed.store(true, std::memory_order_release);
+	char received[sizeof(reply)] {};
+	EXIT_IF(KernelRead(pair[0], received, sizeof(received)) !=
+	        static_cast<int64_t>(sizeof(received)));
+	EXIT_IF(std::memcmp(received, reply, sizeof(reply)) != 0);
+	worker.join();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const auto* endpoint = g_primary_files->GetFile(pair[0]);
+	EXIT_IF(endpoint == nullptr || !endpoint->pipe->shared || !endpoint->socket_send->shared);
+	const auto receive = endpoint->pipe->shared;
+	const auto send    = endpoint->socket_send->shared;
+	EXIT_IF(!receive->Lock());
+	const auto receive_owners = receive->Owners(true);
+	ReleaseMutex(receive->mutex);
+	EXIT_IF(receive_owners.first != 1 || receive_owners.second != 0);
+	EXIT_IF(!send->Lock());
+	const auto send_owners = send->Owners(true);
+	ReleaseMutex(send->mutex);
+	EXIT_IF(send_owners.first != 0 || send_owners.second != 1);
+#endif
+	char eof = 0;
+	EXIT_IF(KernelRead(pair[0], &eof, 1) != 0);
+	EXIT_IF(KernelWrite(pair[0], &eof, 1) != KERNEL_ERROR_EPIPE);
+	EXIT_IF(KernelClose(pair[0]) != OK);
+	LOGF("PS5_GUEST_EXEC_DESCRIPTOR_SELFTEST PASS"
+	     " arbitrary_socket_fd5=1 queued_bytes_preserved=1"
+	     " unsupported_descriptor_rejected=1 cloexec_filtered=1"
+	     " malformed_import_rollback=1 repeated_imports=3"
+	     " alias_survived_original_table_close=1 EOF_and_EPIPE=1"
+	     " readiness_nonconsuming=1 closed_token_isolated=1 pin_does_not_retain_endpoint=1"
+	     "\n");
+}
+
+#include "kernel/execDescriptorSelftest.inc"
+
+void DiagnosticVerifyGuestDescriptorIsolation() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DiagnosticExecDescriptorFixtureChild();
+#endif
+	if (std::getenv("KYTY_DIAGNOSTIC_GUEST_DESCRIPTOR_TABLE_SELFTEST") == nullptr) {
+		return;
+	}
+	DiagnosticVerifyExecDescriptorTransfer();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DiagnosticVerifyExecDescriptorCrossHost();
+#endif
+	const int parent_pid = Process::GetPid();
+	const int parent_fd0 = KernelOpen("/dev/random", 0, 0);
+	const int parent_fd1 = KernelOpen("/dev/random", 0, 0);
+	EXIT_IF(parent_fd0 < DESCRIPTOR_MIN || parent_fd1 <= parent_fd0);
+	FileStat parent_stat {};
+	EXIT_IF(KernelFstat(parent_fd1, &parent_stat) != OK);
+
+	std::thread guest([&] {
+		Process::ScopedGuestProcessPid process_scope(parent_pid + 313);
+		ScopedGuestDescriptorTable     child_table;
+		const int                      guest_fd = KernelOpen("/dev/random", 0, 0);
+		EXIT_IF(guest_fd != DESCRIPTOR_MIN);
+		FileStat child_stat {};
+		EXIT_IF(KernelFstat(parent_fd1, &child_stat) != KERNEL_ERROR_EBADF);
+		EXIT_IF(KernelFstat(guest_fd, &child_stat) != OK);
+		{
+			ScopedGuestDescriptorTable nested;
+			const int                  nested_fd = KernelOpen("/dev/random", 0, 0);
+			EXIT_IF(nested_fd != DESCRIPTOR_MIN);
+			EXIT_IF(KernelClose(nested_fd) != OK);
+		}
+		EXIT_IF(KernelFstat(guest_fd, &child_stat) != OK);
+		EXIT_IF(KernelClose(guest_fd) != OK);
+	});
+	guest.join();
+	EXIT_IF(KernelFstat(parent_fd0, &parent_stat) != OK);
+	EXIT_IF(KernelFstat(parent_fd1, &parent_stat) != OK);
+	EXIT_IF(KernelClose(parent_fd1) != OK);
+	EXIT_IF(KernelClose(parent_fd0) != OK);
+	LOGF("PS5_GUEST_DESCRIPTOR_TABLE_SELFTEST"
+	     " isolated_guest_fd_table=1 nested_switch_restored=1"
+	     " parent_descriptors_untouched=1\n");
+	if (std::getenv("KYTY_DIAGNOSTIC_GUEST_RDUP_SOCKET_SELFTEST") != nullptr &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr) {
+		int pair[2] {-1, -1};
+		EXIT_IF(CreateGuestSocketPair(pair) != OK);
+		constexpr char   to_child[]  = "rdup-selftest-parent-to-child";
+		constexpr char   to_parent[] = "rdup-selftest-child-to-parent";
+		std::atomic_bool child_endpoint_attached {false};
+		std::thread      worker([&] {
+			ScopedGuestDescriptorTable child;
+			EXIT_IF(KernelOpen("/dev/deci_stdin", 0, 0) != 0);
+			EXIT_IF(KernelOpen("/dev/deci_stdout", 1, 0) != 1);
+			EXIT_IF(KernelOpen("/dev/deci_stderr", 1, 0) != 2);
+			const int fd =
+			    g_primary_files->CloneGuestSocketPairInto(g_guest_files_override, pair[1]);
+			EXIT_IF(fd != DESCRIPTOR_MIN);
+			child_endpoint_attached.store(true, std::memory_order_release);
+			char received[sizeof(to_child)] {};
+			EXIT_IF(KernelRead(fd, received, sizeof(to_child)) !=
+			        static_cast<int64_t>(sizeof(to_child)));
+			EXIT_IF(std::memcmp(received, to_child, sizeof(to_child)) != 0);
+			EXIT_IF(KernelWrite(fd, to_parent, sizeof(to_parent)) !=
+			        static_cast<int64_t>(sizeof(to_parent)));
+			EXIT_IF(KernelClose(fd) != OK);
+			EXIT_IF(KernelClose(2) != OK || KernelClose(1) != OK || KernelClose(0) != OK);
+		});
+		while (!child_endpoint_attached.load(std::memory_order_acquire)) {
+			std::this_thread::yield();
+		}
+		EXIT_IF(KernelClose(pair[1]) != OK);
+		FileStat closed_parent_source {};
+		EXIT_IF(KernelFstat(pair[1], &closed_parent_source) != KERNEL_ERROR_EBADF);
+		EXIT_IF(KernelWrite(pair[0], to_child, sizeof(to_child)) !=
+		        static_cast<int64_t>(sizeof(to_child)));
+		char actual[sizeof(to_parent)] {};
+		EXIT_IF(KernelRead(pair[0], actual, sizeof(actual)) !=
+		        static_cast<int64_t>(sizeof(actual)));
+		EXIT_IF(std::memcmp(actual, to_parent, sizeof(actual)) != 0);
+		worker.join();
+		EXIT_IF(KernelClose(pair[0]) != OK);
+		LOGF("PS5_GUEST_RDUP_SOCKET_SELFTEST PASS"
+		     " parent_to_child_bytes=%zu"
+		     " child_to_parent_bytes=%zu"
+		     " child_stdio_0_1_2=1 inherited_socket_fd3=1"
+		     " per_thread_descriptor_isolation=1"
+		     " closed_parent_source_before_transfer=1"
+		     " child_endpoint_remained_live_after_parent_close=1\n",
+		     sizeof(to_child), sizeof(to_parent));
+	}
+}
 
 } // namespace Libs::LibKernel::FileSystem

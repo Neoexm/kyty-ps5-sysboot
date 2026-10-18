@@ -5,6 +5,7 @@
 #include <cstdint>
 
 namespace Libs::LibKernel::EventQueue {
+struct KernelEvent;
 }
 
 namespace Libs::NativeKernelBridge {

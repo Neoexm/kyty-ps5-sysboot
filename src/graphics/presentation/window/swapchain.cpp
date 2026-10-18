@@ -1,11 +1,13 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -17,10 +19,27 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
+#include <unordered_set>
 #include <vector>
 #include <vulkan/vk_platform.h>
+#include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
 
 // IWYU pragma: no_include <intrin.h>
 

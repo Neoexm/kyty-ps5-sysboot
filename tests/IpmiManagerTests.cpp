@@ -17,3 +17,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+
+namespace {
+thread_local int test_pid = 101;
+}
+namespace Libs::LibKernel::Process {
+int GetPid() { return test_pid; }
+}
+#else
+#endif

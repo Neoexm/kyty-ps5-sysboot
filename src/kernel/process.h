@@ -41,8 +41,29 @@ private:
 	int previous_pid = 0;
 };
 int GetPid();
+// Pid for an in-process RFPROC child; kernel error if the scope allocator is unavailable or full.
+int  AllocateRforkChildPid();
+void RegisterRforkChild(int pid, int parent_pid);
+// an app child's sc_spawn carries its /app0 sandbox alias (a[0]) and package path (a[1])
+void SetRforkChildAppExec(int pid, const std::string& alias, const std::string& real);
+bool ResolveAppExecPath(const std::string& path, std::string* out);
+bool IsTrackedRforkChild(int pid);
+bool MarkRforkChildExecCommitted(int pid, uint32_t host_pid, const std::string& path);
+bool IsRforkChildExecCommitted(int pid);
+bool IsRforkChildContextRetired(int pid);
+bool GetRforkChildExitStatus(int pid, uint32_t* status);
+void NotifyRforkChildExited(int pid, uint32_t exit_status);
 bool GetScope(std::string* scope);
+void InstallVerifiedOriginalSelf(const AuthInfo::ImageIdentity& identity);
+void ClearVerifiedOriginalSelf();
+bool GetVerifiedOriginalSelfIdentity(AuthInfo::ImageIdentity* identity);
 AuthInfo::AuthorizationFacts GetCurrentAuthorizationFacts();
+bool InstallVerifiedAuthorizationObservation(const AuthInfo::Observation& observation);
+bool InstallVerifiedAuthInfo(const AuthInfo::Capture& capture);
+bool GetVerifiedAuthInfoForImage(const AuthInfo::ImageIdentity& identity,
+                                 AuthInfo::Capture*             capture);
+void ClearVerifiedAuthInfo();
 bool FindPeerByHostPid(uint32_t host_pid, PeerProcess* peer);
+void SetName(const std::string& name);
 } // namespace Libs::LibKernel::Process
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_PROCESS_H_ */

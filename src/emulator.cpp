@@ -158,6 +158,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	Libs::LibKernel::Process::MarkExecChildStartupStage(4);
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
@@ -210,6 +211,7 @@ static void Execute(const std::filesystem::path& game_patch) {
 }
 
 void Run(const RunOptions& options) {
+	Libs::LibKernel::Process::ConfigureExecRuntime(options);
 	if (options.app0_dir.empty()) {
 		EXIT("app0 directory is required\n");
 	}
@@ -220,9 +222,12 @@ void Run(const RunOptions& options) {
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
 	Common::Subsystems subsystems(true);
+	Libs::LibKernel::Process::MarkExecChildStartupStage(3);
 	Init(options.config, param_json, subsystems);
 
-	ClearDebugTextureFolder();
+	if (!Libs::LibKernel::Process::IsExecChild()) {
+		ClearDebugTextureFolder();
+	}
 
 	PrintSystemInfo();
 	std::string title_id;
@@ -237,8 +242,13 @@ void Run(const RunOptions& options) {
 	ok = at_quick_exit(Common::Subsystems::EmergencyShutdownActive);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
-	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
-	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
+	if (Libs::LibKernel::Process::IsExecChild()) {
+		Libs::LibKernel::FileSystem::MountReadOnly(options.app0_dir, "/app0");
+		Libs::LibKernel::FileSystem::MountReadOnly(options.app0_dir, "/hostapp");
+	} else {
+		Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
+		Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
+	}
 
 	MountSandboxDirs();
 	// writable trees live outside the sysroot so guest writes stay out of the dump
@@ -363,10 +373,68 @@ void Run(const RunOptions& options) {
 	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	if (Libs::LibKernel::Process::IsExecChild() &&
+	    !Libs::LibKernel::Process::InstallExecChildReadOnlyProviders()) {
+		return;
+	}
 	Libs::InitAll(rt->Symbols());
+	if (Libs::LibKernel::Process::IsExecChild() &&
+	    !Libs::LibKernel::Process::InstallExecChildDescriptors()) {
+		return;
+	}
+	Libs::LibKernel::Process::MarkExecChildStartupStage(6);
 
-	LoadElf(options.elf);
+	if (!Libs::LibKernel::Process::IsExecChild() &&
+	    std::getenv("KYTY_DIAGNOSTIC_ORIGINAL_SELF") != nullptr) {
+		// validated before /app0 was mounted; recheck against what the loader resolved
+		const auto loaded =
+		    Libs::LibKernel::FileSystem::GetRealFilename(Common::PathToGenericString(options.elf));
+		if (!Libs::LibKernel::Process::RootOriginalSelfIsLoadedFile(loaded)) {
+			LOGF("ROOT_ORIGINAL_SELF_LOAD_MISMATCH elf=%s loaded=%s\n",
+			     Common::PathToGenericString(options.elf).c_str(),
+			     Common::PathToString(loaded).c_str());
+			EXIT("root original SELF is not the loaded ELF\n");
+		}
+		LOGF("ROOT_ORIGINAL_SELF_LOAD_MATCH elf=%s loaded=%s\n",
+		     Common::PathToGenericString(options.elf).c_str(),
+		     Common::PathToString(loaded).c_str());
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_ROOT_SELF_VALIDATE_ONLY") != nullptr) {
+		LOGF("ROOT_SELF_VALIDATE_ONLY\n");
+		return;
+	}
 
+	auto* main_program = LoadElf(options.elf);
+	Libs::LibKernel::Process::MarkExecChildStartupStage(7);
+	// Needed modules and relocation are the child's own rtld work; the parent's spawn doesn't wait
+	// for them.
+	Libs::LibKernel::Process::SignalExecChildImageCommitted(rt->GetEntry());
+	if (!options.sysroot_dir.empty() && !main_program->elf->IsStaticExec()) {
+		rt->LoadNeededModules(main_program);
+	}
+	Libs::LibKernel::Process::MarkExecChildStartupStage(8);
+
+	const bool relocate_only = std::getenv("KYTY_DIAGNOSTIC_MODULE_RELOCATE_ONLY") != nullptr;
+	if (relocate_only || std::getenv("KYTY_DIAGNOSTIC_MODULE_LOAD_ONLY") != nullptr) {
+		if (relocate_only) rt->RelocateAll();
+		rt->LogExecLoadPhases("load_only");
+		LOGF("MODULE_LOAD_ONLY entry=0x%016" PRIx64 " relocated=%u"
+		     "\n",
+		     main_program->elf->GetEntry(), relocate_only ? 1u : 0u);
+		rt->Clear();
+		return;
+	}
+
+	if (main_program->elf->IsStaticExec() &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_LOAD_ONLY") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT STATIC_EXEC_LOAD_ONLY entry=0x%016" PRIx64 "\n",
+		     main_program->elf->GetEntry());
+		return;
+	}
+	if (main_program->elf->IsStaticExec() &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr) {
+		EXIT("Unintercepted native static PS5 syscalls cannot execute safely on Windows\n");
+	}
 	Execute(options.game_patch);
 }
 

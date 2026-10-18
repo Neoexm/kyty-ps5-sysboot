@@ -19,6 +19,7 @@ constexpr int16_t KERNEL_EVFILT_READ      = -1;
 constexpr int16_t KERNEL_EVFILT_WRITE     = -2;
 constexpr int16_t KERNEL_EVFILT_USER      = -11;
 constexpr int16_t KERNEL_EVFILT_FILE      = -4;
+constexpr int16_t KERNEL_EVFILT_PROC      = -5;
 constexpr int16_t KERNEL_EVFILT_GRAPHICS  = -14;
 constexpr int16_t KERNEL_EVFILT_VIDEO_OUT = -13;
 constexpr int16_t KERNEL_EVFILT_HRTIMER   = -15;
@@ -75,6 +76,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
                                    const KernelUseconds* timo);
 int KYTY_SYSV_ABI KernelAddUserEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id);
+void              KernelNotifyNativeProcExitForAll(int pid, uint32_t exit_status);
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata);
 int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata);
 int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id);

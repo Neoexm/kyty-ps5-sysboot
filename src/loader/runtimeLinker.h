@@ -112,9 +112,25 @@ struct Program {
 	Program();
 	~Program();
 
+	enum class ModuleState { NotStarted, Starting, Started, StartFailed, Stopping, Stopped };
+
+	struct NeededModule {
+		std::string name;
+		Program*    provider = nullptr;
+	};
 	int32_t                      unique_id = -1;
 	RuntimeLinker*               rt        = nullptr;
 	uint32_t                     load_count = 0; // Successful sceKernelLoadStartModule calls.
+	bool                            process_owned = false;
+	std::vector<NeededModule>       needed_modules;
+	ModuleState                     module_state           = ModuleState::NotStarted;
+	bool                            native_init_attempted  = false;
+	bool                            original_font_provider = false;
+	uint32_t                        active_module_calls    = 0;
+	uint32_t                        pending_thread_atexit  = 0;
+	bool                            module_unload_pending  = false;
+	int                             module_start_result    = 0;
+	int                             module_stop_result     = 0;
 	std::filesystem::path        file_name;
 	std::unique_ptr<Elf64>       elf;
 	std::unique_ptr<DynamicInfo> dynamic_info;
@@ -123,6 +139,7 @@ struct Program {
 	uint64_t                     base_size_aligned = 0;
 	uint64_t                     mapped_size       = 0;
 	uint64_t instruction_trampoline_size = 0;
+	std::vector<uint64_t>           original_ud2_sites;
 	std::unique_ptr<SymbolDatabase> export_symbols;
 	std::unique_ptr<SymbolDatabase> import_symbols;
 	ThreadLocalStorage              tls;
@@ -143,10 +160,16 @@ public:
 	void DbgDump(const std::string& folder);
 
 	Program* LoadProgram(const std::filesystem::path& elf_name);
+	Program* LoadProgram(const std::filesystem::path& elf_name, std::vector<uint8_t> image);
 	void     LoadNeededModules(Program* program);
 	void     SaveMainProgram(const std::filesystem::path& elf_name);
 	void     SaveProgram(Program* program, const std::filesystem::path& elf_name);
-	void     UnloadProgram(Program* program);
+	int      AcquireProgram(Program* program);
+	int      ReleaseProgram(Program* program, bool* retained);
+	int      UnloadProgram(Program* program);
+	int32_t  AcquireThreadAtexit(uint64_t address, bool* mapped_owner = nullptr);
+	void     ReleaseThreadAtexit(int32_t owner);
+	void     ReleaseThreadAtexitByAddr(uint64_t address);
 
 	[[nodiscard]] uint64_t GetEntry();
 	[[nodiscard]] uint64_t GetProcParam();
@@ -160,6 +183,7 @@ public:
 	int   StopModule(Program* program, size_t args, const void* argp, module_func_t func);
 	void  StopAllModules();
 	void  DeleteTlss(int thread_id);
+	void  DiscardTlssForExec(int thread_id);
 	void  SetApplicationHeapApi(void* const api[10]);
 	void* ApplicationHeapMalloc(uint64_t size);
 	void* ApplicationHeapMemalign(uint64_t alignment, uint64_t size);
@@ -171,6 +195,8 @@ public:
 
 	static uint64_t ReadFromElf(Program* program, uint64_t vaddr);
 	Program*        FindProgramByAddr(uint64_t vaddr);
+	bool            GetOriginalUd2ProgramInfo(uint64_t vaddr, uint64_t* base_vaddr,
+	                                          std::filesystem::path* file_name);
 	Program*        FindProgramById(int32_t id);
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
 
@@ -180,17 +206,32 @@ public:
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
 private:
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	friend bool TestAgcPoolMallocOutcomeDiagnostic();
+	friend bool TestOriginalPadProviderDiagnosticRouting();
+#endif
+	Program*    LoadProgramImpl(const std::filesystem::path& elf_name, std::vector<uint8_t>* image);
 	static void LoadProgramToMemory(Program* program);
 	static void ParseProgramDynamicInfo(Program* program);
 	static void CreateSymbolDatabase(Program* program);
 	static void Relocate(Program* program);
 	static void DeleteProgram(Program* program);
 	static void SetupTlsHandler(Program* program);
+	void        WriteUnresolvedSymbols();
+	bool        IsProgramReferenced(Program* program);
+	bool        IsThreadAtexitReferenced(Program* program);
+	int         AcquireShellUiNpCommonPool();
+	int         ReleaseShellUiNpCommonPool();
 
 	static const ModuleId*  FindModule(const Program& program, const std::string& id);
 	static const LibraryId* FindLibrary(const Program& program, const std::string& id);
 
 	std::vector<Program*>           m_programs;
+	std::vector<Program*>           m_needed_modules;
+	std::vector<int32_t>            m_module_start_order;
+	Program*                        m_shellui_npcommon_pool_provider = nullptr;
+	uint64_t                        m_shellui_npcommon_pool_release  = 0;
+	bool                            m_shellui_npcommon_pool_owned    = false;
 	std::unique_ptr<SymbolDatabase> m_symbols;
 	Common::Mutex                   m_mutex;
 

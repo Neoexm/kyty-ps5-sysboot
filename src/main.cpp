@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
+#include "kernel/execProcess.h"
 #include "kytyGitVersion.h"
 
 #include <charconv>
@@ -492,6 +493,13 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	if (!options.exec_endpoint.empty() &&
+	    !Libs::LibKernel::Process::InitializeExecChild(options.exec_endpoint)) {
+		return 1;
+	}
+	if (!options.exec_endpoint.empty()) {
+		Libs::LibKernel::Process::ApplyExecChildOptions(&options);
+	}
 	Run(options);
 
 	return 0;

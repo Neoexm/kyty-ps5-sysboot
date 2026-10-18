@@ -703,6 +703,7 @@ struct ScopeMemory {
 };
 
 static ScopeMemory* g_scope_memory    = nullptr;
+static uint32_t     g_scope_memory_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 static HANDLE g_scope_memory_lock = nullptr;
 // views don't keep the section name; the state only survives while some process holds this
@@ -2671,6 +2672,54 @@ static ScopeMemory::SharedObject* FindScopeSharedMemory(const char* name) {
 		}
 	}
 	return nullptr;
+}
+int OpenScopeSharedMemory(const char* name, int flags, int* object, uint64_t* size) {
+	constexpr int O_CREAT_GUEST = 0x200;
+	constexpr int O_TRUNC_GUEST = 0x400;
+	constexpr int O_EXCL_GUEST  = 0x800;
+
+	const auto audit = [&](const char* outcome, int error) {
+		if (std::strcmp(name, "/SceAo2TVCorP") == 0) {
+			LOGF("FIRST_FRAME_AUDIT SCOPE_SHM_OPEN outcome=%s name=%.64s flags=0x%x pid=%d "
+			     "scope=%08" PRIx32 " objects=%u object=%d size=0x%016" PRIx64 " errno=%d\n",
+			     outcome, name, flags, Process::GetPid(), g_scope_memory_id,
+			     g_scope_memory != nullptr ? g_scope_memory->shared_count : 0u,
+			     error == 0 ? *object : -1, error == 0 ? *size : 0, error);
+		}
+		return error;
+	};
+
+	if (g_scope_memory == nullptr) {
+		return audit("failed_no_scope_state", Posix::POSIX_ENOENT);
+	}
+	if (std::strlen(name) >= sizeof(ScopeMemory::SharedObject::name)) {
+		return audit("failed", Posix::POSIX_ENAMETOOLONG);
+	}
+
+	ScopeMemoryLock lock;
+	auto*           shared  = FindScopeSharedMemory(name);
+	const bool      created = shared == nullptr;
+	if (shared != nullptr) {
+		if ((flags & (O_CREAT_GUEST | O_EXCL_GUEST)) == (O_CREAT_GUEST | O_EXCL_GUEST)) {
+			return audit("failed", Posix::POSIX_EEXIST);
+		}
+		if ((flags & O_TRUNC_GUEST) != 0) {
+			shared->size = 0;
+		}
+	} else {
+		if ((flags & O_CREAT_GUEST) == 0) {
+			return audit("failed", Posix::POSIX_ENOENT);
+		}
+		if (g_scope_memory->shared_count == ScopeMemory::MaxSharedObjects) {
+			return audit("failed", Posix::POSIX_ENFILE);
+		}
+		shared = &g_scope_memory->shared[g_scope_memory->shared_count++];
+		std::strcpy(shared->name, name);
+		shared->linked = true;
+	}
+	*object = static_cast<int>(shared - g_scope_memory->shared);
+	*size   = shared->size;
+	return audit(created ? "created" : "opened", 0);
 }
 int UnlinkScopeSharedMemory(const char* name) {
 	if (g_scope_memory == nullptr) {

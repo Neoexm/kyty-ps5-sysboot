@@ -295,6 +295,118 @@ int ReadExecveGuestVector(uint64_t address, bool optional, std::vector<std::stri
 	}
 	return LibKernel::KERNEL_ERROR_E2BIG;
 }
+Reply SyscoreExecvePreflight(const SyscallRequest& request) {
+	std::string path;
+	const int   path_rc =
+	    ReadExecveGuestString(request.args[0], 4096, LibKernel::KERNEL_ERROR_ENAMETOOLONG, &path);
+	if (path_rc != 0) return {path_rc, 0};
+	if (path.empty()) return {LibKernel::KERNEL_ERROR_ENOENT, 0};
+
+	// app children exec the /app0 alias; rebase it onto the package path sc_spawn recorded
+	const std::string requested_path = path;
+	std::string       app_resolved;
+	bool              app_remapped = false;
+	if (LibKernel::Process::ResolveAppExecPath(path, &app_resolved)) {
+		LOGF("SYSCORE_GUEST_EXECVE_APP0_REMAP guest_pid=%d from=%s to=%s\n",
+		     LibKernel::Process::GetPid(), path.c_str(), app_resolved.c_str());
+		path         = std::move(app_resolved);
+		app_remapped = true;
+	}
+
+	std::vector<std::string> argv;
+	std::vector<std::string> envp;
+	const int                argv_rc = ReadExecveGuestVector(request.args[1], false, &argv);
+	if (argv_rc != 0) return {argv_rc, 0};
+	const int envp_rc = ReadExecveGuestVector(request.args[2], true, &envp);
+	if (envp_rc != 0) return {envp_rc, 0};
+
+	auto host_path            = LibKernel::FileSystem::GetRealFilename(path);
+	bool passthrough_resolved = false;
+	if (host_path.empty() &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_EXECVE_PASSTHROUGH_RESOLVE") != nullptr) {
+		std::filesystem::path via_passthrough;
+		if (LibKernel::DirectoryPassthrough::ResolveHostPath(path, &via_passthrough) == 0) {
+			host_path            = std::move(via_passthrough);
+			passthrough_resolved = true;
+		}
+	}
+	std::error_code error;
+	if (host_path.empty() || !std::filesystem::is_regular_file(host_path, error)) {
+		return {LibKernel::KERNEL_ERROR_ENOENT, 0};
+	}
+	std::filesystem::path app0_dir;
+	std::string           app0_elf;
+	if (app_remapped) {
+		app0_dir = std::filesystem::weakly_canonical(host_path.parent_path(), error);
+		if (error || app0_dir.empty() || !std::filesystem::is_directory(app0_dir, error) || error ||
+		    !requested_path.starts_with("/app0/") ||
+		    requested_path.find("..") != std::string::npos ||
+		    requested_path.find('\\') != std::string::npos) {
+			return {LibKernel::KERNEL_ERROR_ENOEXEC, 0};
+		}
+		app0_elf = requested_path;
+		LOGF("SYSCORE_GUEST_EXECVE_APP0_PROVIDER guest_pid=%d root=%s elf=%s "
+		     "source=pre_overlay_package\n",
+		     LibKernel::Process::GetPid(), Common::PathToString(app0_dir).c_str(),
+		     app0_elf.c_str());
+	}
+	// exec_check_permissions tests the entered vnode's mount before the image header is read
+	if (LibKernel::FileSystem::IsNullfsNoExec(path)) {
+		LOGF("SYSCORE_GUEST_EXECVE_REJECTED guest_pid=%d path=%s reason=mnt_noexec errno=EACCES\n",
+		     LibKernel::Process::GetPid(), path.c_str());
+		return {LibKernel::KERNEL_ERROR_EACCES, 0};
+	}
+	// encrypted /system_ex SELF -> its decrypted ELF, as module loads do; the header check takes
+	// only a bare ELF
+	if (path.rfind("/system_ex/", 0) == 0 || path.rfind("/system/vsh/app/", 0) == 0) {
+		std::ifstream        self_input(host_path, std::ios::binary | std::ios::ate);
+		std::vector<uint8_t> self_image;
+		if (self_input) {
+			const std::streamoff self_size = self_input.tellg();
+			if (self_size > 0) {
+				self_image.resize(static_cast<size_t>(self_size));
+				self_input.seekg(0);
+				self_input.read(reinterpret_cast<char*>(self_image.data()),
+				                static_cast<std::streamsize>(self_size));
+			}
+		}
+		std::vector<uint8_t>  decrypted;
+		std::filesystem::path decrypted_path;
+		std::string           detail;
+		const auto resolution = Loader::DecryptedModuleOverlay::ResolveDecryptedModuleImage(
+		    path, self_image, &decrypted, &detail, &decrypted_path);
+		if (resolution == Loader::DecryptedModuleOverlay::Resolution::Substituted) {
+			LOGF("SYSCORE_GUEST_EXECVE_DECRYPTED_OVERLAY guest_pid=%d path=%s %s\n",
+			     LibKernel::Process::GetPid(), path.c_str(), detail.c_str());
+			host_path = std::move(decrypted_path);
+		} else if (resolution != Loader::DecryptedModuleOverlay::Resolution::NotApplicable) {
+			LOGF("SYSCORE_GUEST_EXECVE_DECRYPTED_OVERLAY guest_pid=%d path=%s result=rejected %s\n",
+			     LibKernel::Process::GetPid(), path.c_str(), detail.c_str());
+		}
+	}
+	std::array<uint8_t, 64> header {};
+	std::ifstream           input(host_path, std::ios::binary);
+	if (!input) return {LibKernel::KERNEL_ERROR_EACCES, 0};
+	input.read(reinterpret_cast<char*>(header.data()), header.size());
+	if (input.gcount() != static_cast<std::streamsize>(header.size()) || header[0] != 0x7f ||
+	    header[1] != 'E' || header[2] != 'L' || header[3] != 'F' || header[4] != 2 ||
+	    header[5] != 1 ||
+	    !((header[16] == 0x10 && header[17] == 0xfe) || (header[16] == 2 && header[17] == 0)) ||
+	    header[18] != 0x3e || header[19] != 0) {
+		return {LibKernel::KERNEL_ERROR_ENOEXEC, 0};
+	}
+	size_t total_bytes = 0;
+	for (const auto* values: {&argv, &envp}) {
+		for (const auto& value: *values)
+			total_bytes += value.size() + 1;
+	}
+	if (total_bytes > 262144) return {LibKernel::KERNEL_ERROR_E2BIG, 0};
+	LOGF("SYSCORE_GUEST_EXECVE_VALIDATED_REQUEST"
+	     " guest_pid=%d path=%s argc=%zu envc=%zu passthrough_resolved=%d\n",
+	     LibKernel::Process::GetPid(), path.c_str(), argv.size(), envp.size(),
+	     passthrough_resolved ? 1 : 0);
+	return {LibKernel::Process::ExecImage(path, host_path, argv, envp, app0_dir, app0_elf), 0};
+}
 Reply MiniSyscoreWrite(const SyscallRequest& request) {
 	const uint64_t fd      = request.args[0];
 	const uint64_t address = request.args[1];
@@ -974,6 +1086,82 @@ Reply SysctlPageSize(const SyscallRequest& request) {
 	}
 	std::string name;
 }
+enum class ExecutableImageKind {
+	Invalid,
+	Self,
+	Elf,
+};
+ExecutableImageKind ExecutableImageHeaderKind(const uint8_t* data, size_t size, uint64_t file_size,
+                                              size_t* required_bytes = nullptr) {
+	if (required_bytes != nullptr) *required_bytes = 0;
+	if (data == nullptr || size < 4 || file_size < 4) return ExecutableImageKind::Invalid;
+	const bool self = data[0] == 0x54 && data[1] == 0x14 && data[2] == 0xf5 && data[3] == 0xee;
+	const bool elf  = data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F';
+	if (self) {
+		if (size < sizeof(Loader::SelfHeader) || file_size < sizeof(Loader::SelfHeader)) {
+			return ExecutableImageKind::Invalid;
+		}
+		Loader::SelfHeader header {};
+		std::memcpy(&header, data, sizeof(header));
+		const uint64_t segment_bytes = uint64_t {header.segments_num} * sizeof(Loader::SelfSegment);
+		const uint64_t elf_offset    = sizeof(header) + segment_bytes;
+		if (header.file_size != file_size || header.size1 > file_size ||
+		    header.size2 > file_size - header.size1 || elf_offset > header.size1 ||
+		    sizeof(Loader::Elf64_Ehdr) > header.size1 - elf_offset) {
+			return ExecutableImageKind::Invalid;
+		}
+		const size_t prefix_size = static_cast<size_t>(elf_offset + sizeof(Loader::Elf64_Ehdr));
+		if (required_bytes != nullptr) *required_bytes = prefix_size;
+		if (size < prefix_size) return ExecutableImageKind::Self;
+		for (uint16_t i = 0; i != header.segments_num; ++i) {
+			Loader::SelfSegment segment {};
+			std::memcpy(&segment, data + sizeof(header) + uint64_t {i} * sizeof(segment),
+			            sizeof(segment));
+			if (segment.offset > file_size ||
+			    segment.compressed_size > file_size - segment.offset) {
+				return ExecutableImageKind::Invalid;
+			}
+		}
+		const auto         elf_size = static_cast<size_t>(header.size1 - elf_offset);
+		const auto*        elf_data = data + elf_offset;
+		Loader::Elf64_Ehdr elf_header {};
+		std::memcpy(&elf_header, elf_data, sizeof(elf_header));
+		if (std::memcmp(elf_header.e_ident, "\177ELF", 4) != 0 ||
+		    elf_header.e_ident[Loader::EI_CLASS] != Loader::ELFCLASS64 ||
+		    elf_header.e_ident[Loader::EI_DATA] != Loader::ELFDATA2LSB ||
+		    elf_header.e_ehsize != sizeof(elf_header) ||
+		    elf_header.e_phentsize != sizeof(Loader::Elf64_Phdr) || elf_header.e_phnum == 0) {
+			return ExecutableImageKind::Invalid;
+		}
+		const uint64_t table_size = uint64_t {elf_header.e_phnum} * sizeof(Loader::Elf64_Phdr);
+		if (elf_header.e_phoff < sizeof(elf_header) || elf_header.e_phoff > elf_size ||
+		    table_size > elf_size - elf_header.e_phoff) {
+			return ExecutableImageKind::Invalid;
+		}
+		return ExecutableImageKind::Self;
+	}
+	if (elf) {
+		if (size < sizeof(Loader::Elf64_Ehdr) || file_size < sizeof(Loader::Elf64_Ehdr)) {
+			return ExecutableImageKind::Invalid;
+		}
+		Loader::Elf64_Ehdr header {};
+		std::memcpy(&header, data, sizeof(header));
+		if (header.e_ident[Loader::EI_CLASS] != Loader::ELFCLASS64 ||
+		    header.e_ident[Loader::EI_DATA] != Loader::ELFDATA2LSB ||
+		    header.e_ehsize != sizeof(header) || header.e_phentsize != sizeof(Loader::Elf64_Phdr) ||
+		    header.e_phnum == 0) {
+			return ExecutableImageKind::Invalid;
+		}
+		const uint64_t table_size = uint64_t {header.e_phnum} * sizeof(Loader::Elf64_Phdr);
+		if (header.e_phoff < sizeof(header) || header.e_phoff > file_size ||
+		    table_size > file_size - header.e_phoff) {
+			return ExecutableImageKind::Invalid;
+		}
+		if (required_bytes != nullptr) *required_bytes = sizeof(header);
+		return ExecutableImageKind::Elf;
+	}
+	return ExecutableImageKind::Invalid;
+}
 Reply RegMgrCall(const SyscallRequest& request) {
 	// 0x214 (op, key, int* status, void* value, size); *status is the answer when the call returns
 	// 0. Only what the guest stored this run reads back
@@ -1009,6 +1197,11 @@ Reply RegMgrCall(const SyscallRequest& request) {
 		if (seen[line]++ == 0)
 			LOGF("FIRST_FRAME_AUDIT REGMGR %s pid=%d\n", line, LibKernel::Process::GetPid());
 	};
+}
+bool UseNativeEventFlags() {
+	return std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr ||
+	       (LibKernel::Process::IsExecChild() &&
+	        std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr);
 }
 struct NativeNamedObject {
 	std::string name;
@@ -1057,6 +1250,9 @@ Reply NativeNamedObjectOperation(const SyscallRequest& request) {
 } // namespace
 bool ShouldLogMiniSyscallTrace(uint64_t ordinal) {
 	return ordinal != 0 && (ordinal <= 64 || (ordinal & (ordinal - 1)) == 0);
+}
+Reply PreflightSyscoreExecve(const SyscallRequest& request) {
+	return SyscoreExecvePreflight(request);
 }
 Reply DispatchSyscall(const SyscallRequest& request) {
 	Reply result {LibKernel::KERNEL_ERROR_ENOSYS, 0};

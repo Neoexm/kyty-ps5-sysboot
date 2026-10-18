@@ -62,6 +62,22 @@ public:
 private:
 	T* m_value;
 };
+template <typename Buffer>
+class WipeBufferOnExit final {
+public:
+	explicit WipeBufferOnExit(Buffer* buffer): m_buffer(buffer) {}
+	~WipeBufferOnExit() {
+		using Value = typename Buffer::value_type;
+		static_assert(std::is_trivially_copyable_v<Value>);
+		if (!m_buffer->empty()) SecureWipe(m_buffer->data(), m_buffer->size() * sizeof(Value));
+	}
+
+	WipeBufferOnExit(const WipeBufferOnExit&)            = delete;
+	WipeBufferOnExit& operator=(const WipeBufferOnExit&) = delete;
+
+private:
+	Buffer* m_buffer;
+};
 uint32_t RotateRight(uint32_t value, uint32_t count) {
 	return (value >> count) | (value << (32 - count));
 }
@@ -251,6 +267,92 @@ bool DecodeHex(std::string_view text, uint8_t* data, size_t size) {
 	}
 	return true;
 }
+enum class CaptureSnapshotResult {
+	Read,
+	Unavailable,
+	WrongSize,
+	Changed,
+};
+template <size_t Size>
+CaptureSnapshotResult ReadCaptureSnapshot(const std::filesystem::path& path,
+                                          std::array<uint8_t, Size>*   encoded) {
+	if (encoded == nullptr) return CaptureSnapshotResult::Unavailable;
+#if defined(_WIN32)
+	HANDLE file = CreateFileW(
+	    path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+	    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (file == INVALID_HANDLE_VALUE) return CaptureSnapshotResult::Unavailable;
+	FILE_ATTRIBUTE_TAG_INFO attributes {};
+	LARGE_INTEGER           before {};
+	CaptureSnapshotResult   result = CaptureSnapshotResult::Unavailable;
+	if (GetFileInformationByHandleEx(file, FileAttributeTagInfo, &attributes, sizeof(attributes)) &&
+	    (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ==
+	        0 &&
+	    GetFileSizeEx(file, &before)) {
+		if (before.QuadPart != static_cast<LONGLONG>(encoded->size())) {
+			result = CaptureSnapshotResult::WrongSize;
+		} else {
+			result        = CaptureSnapshotResult::Read;
+			size_t offset = 0;
+			while (result == CaptureSnapshotResult::Read && offset != encoded->size()) {
+				const DWORD requested = static_cast<DWORD>(
+				    std::min<size_t>(encoded->size() - offset, std::numeric_limits<DWORD>::max()));
+				DWORD count = 0;
+				if (!ReadFile(file, encoded->data() + offset, requested, &count, nullptr) ||
+				    count != requested) {
+					result = CaptureSnapshotResult::Changed;
+				} else {
+					offset += count;
+				}
+			}
+			LARGE_INTEGER after {};
+			if (result == CaptureSnapshotResult::Read &&
+			    (!GetFileSizeEx(file, &after) || after.QuadPart != before.QuadPart)) {
+				result = CaptureSnapshotResult::Changed;
+			}
+		}
+	}
+	CloseHandle(file);
+	return result;
+#else
+	int flags = O_RDONLY;
+#if defined(O_CLOEXEC)
+	flags |= O_CLOEXEC;
+#endif
+#if defined(O_NOFOLLOW)
+	flags |= O_NOFOLLOW;
+#endif
+	const int file = open(path.c_str(), flags);
+	if (file < 0) return CaptureSnapshotResult::Unavailable;
+	struct stat           before {};
+	CaptureSnapshotResult result = CaptureSnapshotResult::Unavailable;
+	if (fstat(file, &before) == 0 && S_ISREG(before.st_mode) && before.st_size >= 0) {
+		if (static_cast<uint64_t>(before.st_size) != encoded->size()) {
+			result = CaptureSnapshotResult::WrongSize;
+		} else {
+			result        = CaptureSnapshotResult::Read;
+			size_t offset = 0;
+			while (result == CaptureSnapshotResult::Read && offset != encoded->size()) {
+				const auto count = read(file, encoded->data() + offset, encoded->size() - offset);
+				if (count < 0 && errno == EINTR) continue;
+				if (count <= 0) {
+					result = CaptureSnapshotResult::Changed;
+				} else {
+					offset += static_cast<size_t>(count);
+				}
+			}
+			struct stat after {};
+			if (result == CaptureSnapshotResult::Read &&
+			    (fstat(file, &after) != 0 || after.st_size != before.st_size ||
+			     after.st_dev != before.st_dev || after.st_ino != before.st_ino)) {
+				result = CaptureSnapshotResult::Changed;
+			}
+		}
+	}
+	close(file);
+	return result;
+#endif
+}
 } // namespace
 uint64_t AuthorityId(const Record& record) {
 	uint64_t value = 0;
@@ -297,6 +399,86 @@ bool ParseDigestHex(std::string_view text, Digest* digest) {
 	*digest = parsed;
 	return true;
 }
+std::string CapturePathEnvironmentName(const Digest& self_sha256) {
+	return std::string(kCapturePathEnvironment) + '_' + DigestHex(self_sha256);
+}
+std::string CaptureSha256EnvironmentName(const Digest& self_sha256) {
+	return std::string(kCaptureSha256Environment) + '_' + DigestHex(self_sha256);
+}
+bool ValidateImageIdentity(const uint8_t* self_data, size_t self_size, const uint8_t* elf_data,
+                           size_t elf_size, ImageIdentity* identity, std::string* reason) {
+	if (identity == nullptr) return Fail(reason, "image identity arguments invalid");
+	*identity = {};
+	if ((self_data == nullptr && self_size != 0) || (elf_data == nullptr && elf_size != 0))
+		return Fail(reason, "image identity arguments invalid");
+	auto read_self = [&](uint64_t offset, void* data, size_t bytes) {
+		if (offset > self_size || bytes > self_size - offset) return false;
+		std::memcpy(data, self_data + offset, bytes);
+		return true;
+	};
+	auto read_elf = [&](uint64_t offset, void* data, size_t bytes) {
+		if (offset > elf_size || bytes > elf_size - offset) return false;
+		std::memcpy(data, elf_data + offset, bytes);
+		return true;
+	};
+	Loader::SelfHeader header {};
+	if (!read_self(0, &header, sizeof(header))) return Fail(reason, "truncated SELF header");
+	if (std::memcmp(header.ident, "\x54\x14\xf5\xee", 4) != 0)
+		return Fail(reason, "invalid SELF magic");
+	const uint64_t elf_offset =
+	    sizeof(header) + uint64_t {header.segments_num} * sizeof(Loader::SelfSegment);
+	if (header.file_size != self_size || header.size1 > self_size ||
+	    header.size2 > self_size - header.size1 || elf_offset > header.size1 ||
+	    sizeof(Loader::Elf64_Ehdr) > header.size1 - elf_offset)
+		return Fail(reason, "invalid SELF header bounds");
+	for (uint16_t i = 0; i < header.segments_num; ++i) {
+		Loader::SelfSegment segment {};
+		if (!read_self(sizeof(header) + uint64_t {i} * sizeof(segment), &segment,
+		               sizeof(segment)) ||
+		    segment.offset > self_size || segment.compressed_size > self_size - segment.offset) {
+			return Fail(reason, "invalid SELF segment bounds");
+		}
+	}
+	Loader::Elf64_Ehdr embedded {};
+	Loader::Elf64_Ehdr actual {};
+	if (!read_self(elf_offset, &embedded, sizeof(embedded)) ||
+	    !read_elf(0, &actual, sizeof(actual)))
+		return Fail(reason, "truncated ELF header");
+	if (std::memcmp(embedded.e_ident, "\177ELF", 4) != 0 ||
+	    embedded.e_ident[Loader::EI_CLASS] != Loader::ELFCLASS64 ||
+	    embedded.e_ident[Loader::EI_DATA] != Loader::ELFDATA2LSB ||
+	    embedded.e_ehsize != sizeof(embedded) ||
+	    embedded.e_phentsize != sizeof(Loader::Elf64_Phdr) || embedded.e_phnum == 0) {
+		return Fail(reason, "invalid embedded ELF header");
+	}
+	if (std::memcmp(&embedded, &actual, sizeof(actual)) != 0)
+		return Fail(reason, "ELF header mismatch");
+	const uint64_t table_bytes = uint64_t {embedded.e_phnum} * sizeof(Loader::Elf64_Phdr);
+	if (embedded.e_phoff < sizeof(embedded) || embedded.e_phoff > header.size1 - elf_offset ||
+	    table_bytes > header.size1 - elf_offset - embedded.e_phoff || embedded.e_phoff > elf_size ||
+	    table_bytes > elf_size - embedded.e_phoff)
+		return Fail(reason, "invalid ELF program header bounds");
+	const uint64_t extended = (elf_offset + embedded.e_phoff + table_bytes + 15) & ~uint64_t {15};
+	if (extended > header.size1 || sizeof(uint64_t) > header.size1 - extended)
+		return Fail(reason, "missing SELF authority field");
+	for (uint16_t i = 0; i < embedded.e_phnum; ++i) {
+		Loader::Elf64_Phdr original_phdr {};
+		Loader::Elf64_Phdr actual_phdr {};
+		const auto         offset = embedded.e_phoff + uint64_t {i} * sizeof(original_phdr);
+		if (!read_self(elf_offset + offset, &original_phdr, sizeof(original_phdr)) ||
+		    !read_elf(offset, &actual_phdr, sizeof(actual_phdr)))
+			return Fail(reason, "truncated ELF program headers");
+		if (std::memcmp(&original_phdr, &actual_phdr, sizeof(actual_phdr)) != 0)
+			return Fail(reason, "ELF program header mismatch");
+	}
+	std::memcpy(&identity->authority_id, self_data + extended, sizeof(identity->authority_id));
+	identity->self_size   = self_size;
+	identity->elf_size    = elf_size;
+	identity->self_sha256 = Sha256(self_data, self_size);
+	identity->elf_sha256  = Sha256(elf_data, elf_size);
+	if (reason != nullptr) *reason = "verified";
+	return true;
+}
 bool BuildCaptureEnvelope(const Record& record, const ImageIdentity& identity, Capture* capture,
                           std::string* reason) {
 	if (capture == nullptr) return Fail(reason, "capture builder arguments invalid");
@@ -334,5 +516,143 @@ bool ParseCaptureEnvelope(const uint8_t* data, size_t size, const Digest& expect
                           uint64_t expected_authority_id, Capture* capture, std::string* reason) {
 	return ParseCaptureInternal(data, size, &expected_envelope_sha256, &expected_self_sha256,
 	                            &expected_elf_sha256, &expected_authority_id, capture, reason);
+}
+CaptureLoadResult LoadCaptureFromEnvironment(const Digest& expected_self_sha256,
+                                             const Digest& expected_elf_sha256,
+                                             uint64_t expected_authority_id, Capture* capture,
+                                             std::string* reason) {
+	if (capture == nullptr) {
+		if (reason != nullptr) *reason = "capture output unavailable";
+		return CaptureLoadResult::Rejected;
+	}
+	*capture              = {};
+	const auto  path_name = CapturePathEnvironmentName(expected_self_sha256);
+	const auto  hash_name = CaptureSha256EnvironmentName(expected_self_sha256);
+	const char* path_text = std::getenv(path_name.c_str());
+	const char* hash_text = std::getenv(hash_name.c_str());
+	const bool  has_path  = path_text != nullptr && path_text[0] != 0;
+	const bool  has_hash  = hash_text != nullptr && hash_text[0] != 0;
+	if (!has_path && !has_hash) {
+		if (reason != nullptr) *reason = "absent";
+		return CaptureLoadResult::Absent;
+	}
+	if (!has_path || !has_hash) {
+		if (reason != nullptr) *reason = "capture path/hash pair incomplete";
+		return CaptureLoadResult::Rejected;
+	}
+	Digest expected_envelope_sha256 {};
+	if (!ParseDigestHex(hash_text, &expected_envelope_sha256)) {
+		if (reason != nullptr) *reason = "capture hash malformed";
+		return CaptureLoadResult::Rejected;
+	}
+	try {
+		const auto path = std::filesystem::u8path(path_text);
+		if (!path.is_absolute()) {
+			if (reason != nullptr) *reason = "capture path is not absolute";
+			return CaptureLoadResult::Rejected;
+		}
+		std::array<uint8_t, kCaptureEnvelopeSize> encoded {};
+		WipeBufferOnExit                          wipe_encoded(&encoded);
+		const auto                                snapshot = ReadCaptureSnapshot(path, &encoded);
+		if (snapshot != CaptureSnapshotResult::Read) {
+			if (reason != nullptr) {
+				*reason = snapshot == CaptureSnapshotResult::WrongSize ? "capture wrong size"
+				          : snapshot == CaptureSnapshotResult::Changed
+				              ? "capture size changed while reading"
+				              : "capture file unavailable";
+			}
+			return CaptureLoadResult::Rejected;
+		}
+		if (!ParseCaptureEnvelope(encoded.data(), encoded.size(), expected_envelope_sha256,
+		                          expected_self_sha256, expected_elf_sha256, expected_authority_id,
+		                          capture, reason)) {
+			return CaptureLoadResult::Rejected;
+		}
+		return CaptureLoadResult::Verified;
+	} catch (...) {
+		if (reason != nullptr) *reason = "capture path invalid";
+		return CaptureLoadResult::Rejected;
+	}
+}
+bool ParseObservation(const uint8_t* data, size_t size, const Digest& envelope_sha256,
+                      const ImageIdentity& image, Observation* observation, std::string* reason) {
+	if (observation == nullptr) return Fail(reason, "observation output unavailable");
+	*observation = {};
+	if (data == nullptr || size != kObservationSize) return Fail(reason, "observation wrong size");
+	if (Sha256(data, size) != envelope_sha256) return Fail(reason, "observation hash mismatch");
+	const uint32_t version = Load32Little(data + 8);
+	const bool     v1      = std::memcmp(data, "KytyAO01", 8) == 0 && version == 1;
+	const bool     v2      = std::memcmp(data, "KytyAO02", 8) == 0 && version == 2;
+	if ((!v1 && !v2) || Load32Little(data + 12) != kObservationSize)
+		return Fail(reason, "observation header malformed");
+	if (Load64Little(data + 16) != image.authority_id ||
+	    !std::equal(image.self_sha256.begin(), image.self_sha256.end(), data + 40) ||
+	    !std::equal(image.elf_sha256.begin(), image.elf_sha256.end(), data + 72))
+		return Fail(reason, "observation image mismatch");
+	const uint64_t capability = Load64Little(data + 24);
+	const uint64_t known      = Load64Little(data + 32);
+	if (known == 0 || (known & ~kFilteredCapabilityMask) != 0 || (capability & ~known) != 0)
+		return Fail(reason, "observation exceeds native filtered fields");
+	const uint32_t authorization_flags = Load32Little(data + 156);
+	if ((v1 && authorization_flags != 0) ||
+	    (v2 && ((authorization_flags & ~3u) != 0 ||
+	            ((authorization_flags & 2u) != 0 && (authorization_flags & 1u) == 0))))
+		return Fail(reason, "observation authorization flags malformed");
+	if (Load32Little(data + 136) != 0x13600007u || Load32Little(data + 140) == 0 ||
+	    Load32Little(data + 140) > INT32_MAX || Load64Little(data + 144) == 0 ||
+	    Load32Little(data + 152) >= 1000000 || Load64Little(data + 160) < Load64Little(data + 144))
+		return Fail(reason, "observation native identity malformed");
+	if (std::all_of(data + 104, data + 136, [](uint8_t byte) { return byte == 0; }) ||
+	    std::all_of(data + 168, data + 200, [](uint8_t byte) { return byte == 0; }))
+		return Fail(reason, "observation evidence binding absent");
+	observation->image = image;
+	observation->facts = {true,
+	                      image.authority_id,
+	                      capability,
+	                      known,
+	                      v2 && (authorization_flags & 1u) != 0,
+	                      v2 && (authorization_flags & 2u) != 0};
+	std::copy(data + 104, data + 136, observation->evidence_sha256.begin());
+	observation->envelope_sha256 = envelope_sha256;
+	std::copy(data, data + size, observation->encoded.begin());
+	if (reason != nullptr) *reason = "verified";
+	return true;
+}
+CaptureLoadResult LoadObservationFromEnvironment(const ImageIdentity& image,
+                                                 Observation* observation, std::string* reason) {
+	if (observation == nullptr) {
+		Fail(reason, "observation output unavailable");
+		return CaptureLoadResult::Rejected;
+	}
+	*observation          = {};
+	const auto  suffix    = DigestHex(image.self_sha256);
+	const auto  path_name = "KYTY_PS5_AUTHORIZATION_OBSERVATION_" + suffix;
+	const auto  hash_name = "KYTY_PS5_AUTHORIZATION_OBSERVATION_SHA256_" + suffix;
+	const char* path      = std::getenv(path_name.c_str());
+	const char* hash      = std::getenv(hash_name.c_str());
+	if ((!path || !*path) && (!hash || !*hash)) {
+		if (reason != nullptr) *reason = "absent";
+		return CaptureLoadResult::Absent;
+	}
+	Digest expected {};
+	if (!path || !*path || !hash || !ParseDigestHex(hash, &expected)) {
+		Fail(reason, "observation path/hash pair incomplete or malformed");
+		return CaptureLoadResult::Rejected;
+	}
+	try {
+		const auto                            file = std::filesystem::u8path(path);
+		std::array<uint8_t, kObservationSize> bytes {};
+		if (!file.is_absolute() ||
+		    ReadCaptureSnapshot(file, &bytes) != CaptureSnapshotResult::Read) {
+			Fail(reason, "observation file unavailable or wrong size");
+			return CaptureLoadResult::Rejected;
+		}
+		return ParseObservation(bytes.data(), bytes.size(), expected, image, observation, reason)
+		           ? CaptureLoadResult::Verified
+				   : CaptureLoadResult::Rejected;
+	} catch (const std::filesystem::filesystem_error&) {
+		Fail(reason, "observation path invalid");
+		return CaptureLoadResult::Rejected;
+	}
 }
 } // namespace Libs::LibKernel::AuthInfo

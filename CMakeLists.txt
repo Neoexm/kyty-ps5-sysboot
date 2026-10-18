@@ -702,6 +702,20 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME kernel_file_system_exec_startup_diagnostics
+		COMMAND $<TARGET_FILE:kernel_file_system_tests> --guest-exec-startup-diagnostics-only)
+	set_tests_properties(kernel_file_system_exec_startup_diagnostics PROPERTIES TIMEOUT 120)
+	# Only the clang-cl build embeds kyty_emulator.manifest.
+	if(KYTY_CLANG_CL)
+		add_test(NAME emulator_long_log_path
+			COMMAND ${CMAKE_COMMAND} -DEMULATOR=$<TARGET_FILE:kyty_emulator> -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/emulator_long_log_path
+			        -P "${KYTY_TESTS_DIR}/emulator_long_log_path.cmake")
+		set_tests_properties(emulator_long_log_path PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+	endif()
+	add_test(NAME emulator_root_self_launch
+		COMMAND ${CMAKE_COMMAND} -DEMULATOR=$<TARGET_FILE:kyty_emulator> -DFIXTURE_TOOL=$<TARGET_FILE:kernel_file_system_tests>
+		        -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/emulator_root_self_launch -P "${KYTY_TESTS_DIR}/emulator_root_self_launch.cmake")
+	set_tests_properties(emulator_root_self_launch PROPERTIES TIMEOUT 600)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)

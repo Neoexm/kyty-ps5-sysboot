@@ -106,6 +106,7 @@ private:
 	FileDescriptors* owned    = nullptr;
 };
 
+void DiagnosticVerifyGuestDescriptorIsolation();
 int  ExportExecDescriptors(std::string* manifest);
 int  ImportExecDescriptors(const std::string& manifest);
 int  ExportExecReadOnlyProviders(std::string* manifest);
@@ -152,6 +153,7 @@ int  MountRegisteredPartitionPassthrough(const std::string& device, const std::s
 void                  Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
+bool ReadPsmShellUiApplicationSnapshot(const std::string& guest_path, std::vector<uint8_t>* image);
 bool IsNullfsNoExec(const std::string& mounted_file_name);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
@@ -170,6 +172,7 @@ struct NativeSystemMbusState {
 	bool                    shutting_down = false;
 };
 bool                                    IsNativeDipswDescriptor(int fd);
+int KYTY_SYSV_ABI     KernelPhyshmOpen(const char* path, int flags, uint16_t mode, int memory_type);
 int KYTY_SYSV_ABI     KernelShmUnlink(const char* path);
 int KYTY_SYSV_ABI     KernelClose(int d);
 int KYTY_SYSV_ABI     KernelPipe(int* fds);

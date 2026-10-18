@@ -197,6 +197,9 @@ bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
+// Named shm shared across the diagnostic scope. Open/Unlink return a POSIX errno, Map a kernel
+// error.
+int  OpenScopeSharedMemory(const char* name, int flags, int* object, uint64_t* size);
 int  UnlinkScopeSharedMemory(const char* name);
 uint64_t GetAnonymousSharedMemorySize(const std::shared_ptr<AnonymousSharedMemory>& object);
 uint16_t GetAnonymousSharedMemoryMode(const std::shared_ptr<AnonymousSharedMemory>& object);

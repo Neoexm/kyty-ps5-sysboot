@@ -26,5 +26,7 @@ int GetResourceLimit(int32_t id, const std::function<int(int32_t*)>& count_in,
 // {1,14,0x51,index}: the two builtin budget slots behind GetBuiltinBudget/SetBuiltinBudget.
 int Builtin(uint32_t index, uint64_t old_len, uint64_t new_len,
             const std::function<int(int64_t)>& out, const std::function<int(int64_t*)>& in);
+void Fork(int parent_pid, int child_pid);
+void Exit(int pid);
 } // namespace Libs::LibKernel::Budget
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_BUDGET_H_ */

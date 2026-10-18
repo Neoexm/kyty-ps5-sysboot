@@ -7,4 +7,6 @@
 #include <cstdint>
 #include <string_view>
 
+namespace Libs::LibKernel::Process {
+}
 #endif

@@ -6,10 +6,14 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/fileSystem.h"
+#include "kernel/process.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/network.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <limits>
@@ -485,6 +489,29 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 	return KernelAddEvent(eq, event);
 }
 
+// FreeBSD NOTE_EXIT and NOTE_EXEC, as seen in SceSysCore's process-watch request (0xa0000000).
+constexpr uint32_t NATIVE_PROC_NOTE_EXIT = 0x80000000u;
+struct NativeProcNotification {
+	uint32_t note;
+	uint32_t exit_status;
+};
+static void NotifyNativeProcForAll(int pid, uint32_t note, uint32_t exit_status) {
+	NativeProcNotification       notification {note, exit_status};
+	std::vector<KernelEqueueRef> queues;
+	{
+		Common::LockGuard lock(g_equeues_mutex);
+		for (const auto& [handle, owner]: g_equeues) {
+			(void)handle;
+			queues.push_back(owner);
+		}
+	}
+	for (const auto& owner: queues) {
+		owner->TriggerEvent(static_cast<uintptr_t>(pid), KERNEL_EVFILT_PROC, &notification);
+	}
+}
+void KernelNotifyNativeProcExitForAll(int pid, uint32_t exit_status) {
+	NotifyNativeProcForAll(pid, NATIVE_PROC_NOTE_EXIT, exit_status);
+}
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 	PRINT_NAME();
 

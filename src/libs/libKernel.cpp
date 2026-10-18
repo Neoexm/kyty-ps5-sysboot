@@ -93,6 +93,25 @@ static void ApplyNativeModuleOverlay(const std::string& guest_path, NativeModule
 		case Loader::DecryptedModuleOverlay::Resolution::NotApplicable: break;
 	}
 }
+static int ReadNativeModuleSnapshot(const std::string&           guest_path,
+                                    const std::filesystem::path& file_name,
+                                    std::vector<uint8_t>*        image) {
+	if (LibKernel::FileSystem::ReadPsmShellUiApplicationSnapshot(guest_path, image)) {
+		return image->empty() ? LibKernel::KERNEL_ERROR_ENOEXEC : OK;
+	}
+	Common::File file;
+	if (!file.Open(file_name, Common::File::Mode::Read)) return LibKernel::KERNEL_ERROR_ENOENT;
+	const auto size = file.Size();
+	if (size == 0) return LibKernel::KERNEL_ERROR_ENOEXEC;
+	if (size > UINT32_MAX) return LibKernel::KERNEL_ERROR_EFBIG;
+	std::vector<uint8_t> bytes(static_cast<size_t>(size));
+	uint32_t             actual = 0;
+	std::error_code      error;
+	file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &actual, &error);
+	if (error || actual != bytes.size() || file.Size() != size) return LibKernel::KERNEL_ERROR_EIO;
+	*image = std::move(bytes);
+	return OK;
+}
 LIB_VERSION("libkernel", 1, "libkernel", 1, 1);
 
 namespace LibKernelApr {
@@ -504,16 +523,142 @@ static KYTY_SYSV_ABI void stack_chk_fail() {
 	EXIT("stack fail!!!");
 }
 
-static KYTY_SYSV_ABI int sigprocmask(int /*how*/, const void* /*set*/, void* /*oset*/) {
-	// PRINT_NAME();
+bool CanAccessCurrentThreadStack(const void* pointer, uint64_t size, bool writable) {
+	const auto address = reinterpret_cast<uint64_t>(pointer);
+	if (size == 0) {
+		return true;
+	}
+	if (pointer == nullptr || size > UINT64_MAX - address) {
+		return false;
+	}
+	Memory::VirtualQueryInfo guest {};
+	if (Memory::KernelVirtualQuery(pointer, 1, &guest, sizeof(guest)) == 0 &&
+	    guest.start < address + size && address < guest.end) {
+		return false;
+	}
+	uint64_t low  = 0;
+	uint64_t high = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ULONG_PTR stack_low  = 0;
+	ULONG_PTR stack_high = 0;
+	GetCurrentThreadStackLimits(&stack_low, &stack_high);
+	low  = stack_low;
+	high = stack_high;
+#elif defined(__APPLE__)
+	high = reinterpret_cast<uint64_t>(pthread_get_stackaddr_np(pthread_self()));
+	low  = high - pthread_get_stacksize_np(pthread_self());
+#else
+	pthread_attr_t attr {};
+	if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+		return false;
+	}
+	void*      base       = nullptr;
+	size_t     stack_size = 0;
+	const auto result     = pthread_attr_getstack(&attr, &base, &stack_size);
+	pthread_attr_destroy(&attr);
+	if (result != 0) {
+		return false;
+	}
+	low = reinterpret_cast<uint64_t>(base);
+	if (stack_size > UINT64_MAX - low) {
+		return false;
+	}
+	high = low + stack_size;
+#endif
+	const auto end = address + size;
+	if (address < low || end > high) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	for (auto cursor = address; cursor < end;) {
+		MEMORY_BASIC_INFORMATION region {};
+		if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) !=
+		        sizeof(region) ||
+		    region.State != MEM_COMMIT || (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+			return false;
+		}
+		const auto protection = region.Protect & 0xffu;
+		const bool can_write  = protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+		                        protection == PAGE_EXECUTE_READWRITE ||
+		                        protection == PAGE_EXECUTE_WRITECOPY;
+		const bool can_read =
+		    can_write || protection == PAGE_READONLY || protection == PAGE_EXECUTE_READ;
+		if (writable ? !can_write : !can_read) {
+			return false;
+		}
+		const auto base = reinterpret_cast<uint64_t>(region.BaseAddress);
+		if (base > cursor || region.RegionSize > UINT64_MAX - base) {
+			return false;
+		}
+		const auto next = std::min<uint64_t>(end, base + region.RegionSize);
+		if (next <= cursor) {
+			return false;
+		}
+		cursor = next;
+	}
+#else
+	(void)writable;
+#endif
+	return true;
+}
 
-	// LOGF("\t how = %d\n", how);
-	// LOGF("\t set = %016" PRIx64 "\n", reinterpret_cast<uint64_t>(set));
-	// LOGF("\t oset = %016" PRIx64 "\n", reinterpret_cast<uint64_t>(oset));
+static bool ReadSignalMask(const void* source, PthreadSignalMask* mask) {
+	if (Memory::CopyFromGuest(mask, source, sizeof(*mask))) {
+		return true;
+	}
+	if (!CanAccessCurrentThreadStack(source, sizeof(*mask), false)) {
+		return false;
+	}
+	std::memcpy(mask, source, sizeof(*mask));
+	return true;
+}
 
+static bool WriteSignalMask(void* destination, const PthreadSignalMask& mask) {
+	if (Memory::CopyToGuest(destination, &mask, sizeof(mask))) {
+		return true;
+	}
+	if (!CanAccessCurrentThreadStack(destination, sizeof(mask), true)) {
+		return false;
+	}
+	std::memcpy(destination, &mask, sizeof(mask));
+	return true;
+}
+
+void KernelDispatchPendingSignalForCurrentThread();
+int KernelSigprocmask(int how, const void* set, void* oset) {
+	static_assert(sizeof(PthreadSignalMask) == 16);
+	PthreadSignalMask requested {};
+	if (set != nullptr && !ReadSignalMask(set, &requested)) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (set != nullptr && (how < 1 || how > 3)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	auto*      thread   = PthreadSelfOrNull();
+	const auto previous = PthreadGetSignalMask(thread);
+	if (set != nullptr) {
+		for (size_t i = 0; i < 2; ++i) {
+			if (how == 1) {
+				requested.words[i] |= previous.words[i];
+			}
+			if (how == 2) {
+				requested.words[i] = previous.words[i] & ~requested.words[i];
+			}
+		}
+		PthreadSetSignalMask(thread, requested);
+	}
+	if (oset != nullptr && !WriteSignalMask(oset, previous)) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (set != nullptr && how != 1) {
+		KernelDispatchPendingSignalForCurrentThread();
+	}
 	return 0;
 }
 
+static KYTY_SYSV_ABI int sigprocmask(int how, const void* set, void* oset) {
+	return POSIX_CALL(KernelSigprocmask(how, set, oset));
+}
 static bool IsAllowedExceptionSignal(int signum) {
 	constexpr int POSIX_SIGHUP  = 1;
 	constexpr int POSIX_SIGILL  = 4;
@@ -1618,6 +1763,56 @@ int KYTY_SYSV_ABI KernelSysctlStub(const uint32_t* mib, uint32_t mib_count, void
                                    size_t* oldlenp, const void* newp, size_t newlen) {
 	return KernelSysctl(mib, mib_count, oldp, oldlenp, newp, newlen) == 0 ? 0
 	                                                                      : *Posix::GetErrorAddr();
+}
+int KYTY_SYSV_ABI KernelNativeOpen(const char* path, int flags, int mode) {
+	return POSIX_N_CALL(FileSystem::KernelOpen(path, flags, (flags & 0x200) != 0 ? mode : 0));
+}
+int64_t KYTY_SYSV_ABI KernelNativeWrite(int d, const void* buf, size_t nbytes) {
+	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
+}
+int KYTY_SYSV_ABI KernelNativeClose(int d) {
+	return POSIX_CALL(FileSystem::KernelClose(d));
+}
+// non-zero *error goes to libkernel's cerror (+0xd4), which sets errno and returns -1
+int64_t KYTY_SYSV_ABI KernelRawSyscallStub(uint64_t arg0, uint64_t arg1, uint64_t arg2,
+                                           uint64_t arg3, uint64_t arg4, uint64_t arg5,
+                                           uint64_t number, uint64_t* error) {
+	const auto reply =
+	    NativeKernelBridge::DispatchSyscall({number, {arg0, arg1, arg2, arg3, arg4, arg5}});
+	int posix_errno = reply.posix_errno;
+	if (posix_errno == 0 && reply.value > KERNEL_ERROR_UNKNOWN &&
+	    reply.value <= KERNEL_ERROR_UNKNOWN + 101) {
+		posix_errno = KernelToPosix(static_cast<int>(reply.value));
+	}
+	static std::atomic_uint32_t seen[0x300];
+	if (number < 0x300 && seen[number].fetch_add(1) == 0) {
+		// error is the slot the +0x47040 stub pushed right under the wrapper's return address.
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_REDIRECT_LIBKERNEL_RAW_SYSCALLS first call "
+		     "number=0x%" PRIx64 " caller=0x%" PRIx64 " args=0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64
+		     ",0x%" PRIx64 ",0x%" PRIx64 ",0x%" PRIx64 " value=0x%" PRIx64
+		     " errno=%d NON_AUTHENTIC\n",
+		     number, error[1], arg0, arg1, arg2, arg3, arg4, arg5,
+		     static_cast<uint64_t>(reply.value), posix_errno);
+	}
+	*error = static_cast<uint64_t>(posix_errno);
+	return reply.value;
+}
+// called mid-wrapper by the census stub (+0x47080) on any thread, so the line is built on the stack
+void KYTY_SYSV_ABI KernelRawSyscallCensus(uint64_t number, uint64_t caller) {
+	static std::atomic_uint64_t calls[0x300];
+	if (number >= 0x300) {
+		return;
+	}
+	const uint64_t count = calls[number].fetch_add(1) + 1;
+	if ((count & (count - 1)) == 0) {
+		char      line[160];
+		const int length = std::snprintf(
+		    line, sizeof(line),
+		    "FIRST_FRAME_AUDIT DIAGNOSTIC_CENSUS_LIBKERNEL_RAW_SYSCALLS number=0x%" PRIx64
+		    " caller=0x%016" PRIx64 " count=%" PRIu64 "\n",
+		    number, caller, count);
+		::Log::Write(std::string_view(line, static_cast<size_t>(length)));
+	}
 }
 static int64_t KYTY_SYSV_ABI read(int d, void* buf, uint64_t nbytes) {
 	// PRINT_NAME();
@@ -3073,6 +3268,15 @@ static int SdkVersionByPath(const char* path, uint64_t shift, uint32_t* out, con
 	LOGF("%s path=%s result=0x%x reason=no_procparam\n", tag, path, LibKernel::KERNEL_ERROR_ENOENT);
 	return LibKernel::KERNEL_ERROR_ENOENT;
 }
+// The budget wrappers below sit on raw 0x238-0x23a, whose handlers put an sce error in the value
+// rather than an errno.
+static int BudgetErrno(const NativeKernelBridge::Reply& reply) {
+	if (reply.posix_errno == 0 && reply.value > LibKernel::KERNEL_ERROR_UNKNOWN &&
+	    reply.value <= LibKernel::KERNEL_ERROR_UNKNOWN + 101) {
+		return LibKernel::KernelToPosix(static_cast<int>(reply.value));
+	}
+	return reply.posix_errno;
+}
 int KYTY_SYSV_ABI KernelAioInitializeImpl(void* param, int32_t size) {
 	PRINT_NAME();
 
@@ -3457,6 +3661,15 @@ LIB_DEFINE(InitLibKernel_1_Semaphore) {
 	LIB_FUNC("DjpBvGlaWbQ", Semaphore::PthreadSemGetvalue);
 }
 
+static int KYTY_SYSV_ABI DiagnosticPsmThreadRename(LibKernel::Pthread thread, const char* name) {
+	thread                 = LibKernel::PthreadHostObjectFor(thread);
+	const bool target_self = thread != nullptr && thread == LibKernel::PthreadSelfOrNull();
+	const int  result      = LibKernel::PthreadRename(thread, name);
+	LOGF(
+	    "FIRST_FRAME_AUDIT PSM_NATIVE_THREAD_RENAME target_self=%u name_present=%u result=0x%08x\n",
+	    target_self ? 1u : 0u, name != nullptr ? 1u : 0u, static_cast<uint32_t>(result));
+	return result;
+}
 LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("9UK1vLZQft4", LibKernel::PthreadMutexLock);
 	LIB_FUNC("tn3VlD0hG60", LibKernel::PthreadMutexUnlock);

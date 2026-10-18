@@ -15,6 +15,9 @@ constexpr size_t   kCaptureEnvelopeSize    = 0x108;
 constexpr size_t   kObservationSize        = 200;
 constexpr uint64_t kFilteredCapabilityMask = 0x7000000000000000ull;
 
+inline constexpr char kCapturePathEnvironment[]   = "KYTY_PS5_CAPTURED_AUTHINFO";
+inline constexpr char kCaptureSha256Environment[] = "KYTY_PS5_CAPTURED_AUTHINFO_SHA256";
+
 using Record = std::array<uint8_t, kSize>;
 using Digest = std::array<uint8_t, kDigestSize>;
 struct AuthorizationFacts {
@@ -55,6 +58,11 @@ struct Observation {
 	Digest                                envelope_sha256 {};
 	std::array<uint8_t, kObservationSize> encoded {};
 };
+enum class CaptureLoadResult {
+	Absent,
+	Verified,
+	Rejected,
+};
 uint64_t    AuthorityId(const Record& record);
 uint64_t    Capability0(const Record& record);
 Record      Filter(const Record& record);
@@ -62,8 +70,18 @@ bool        BuildFilteredRecord(const AuthorizationFacts& facts, Record* output)
 Digest      Sha256(const void* data, size_t size);
 std::string DigestHex(const Digest& digest);
 bool        ParseDigestHex(std::string_view text, Digest* digest);
+bool ParseObservation(const uint8_t* data, size_t size, const Digest& envelope_sha256,
+                      const ImageIdentity& image, Observation* observation, std::string* reason);
+CaptureLoadResult LoadObservationFromEnvironment(const ImageIdentity& image,
+                                                 Observation* observation, std::string* reason);
+bool ValidateImageIdentity(const uint8_t* self_data, size_t self_size, const uint8_t* elf_data,
+                           size_t elf_size, ImageIdentity* identity, std::string* reason);
 bool ParseCaptureEnvelope(const uint8_t* data, size_t size, const Digest& expected_envelope_sha256,
                           const Digest& expected_self_sha256, const Digest& expected_elf_sha256,
                           uint64_t expected_authority_id, Capture* capture, std::string* reason);
+CaptureLoadResult LoadCaptureFromEnvironment(const Digest& expected_self_sha256,
+                                             const Digest& expected_elf_sha256,
+                                             uint64_t expected_authority_id, Capture* capture,
+                                             std::string* reason);
 } // namespace Libs::LibKernel::AuthInfo
 #endif

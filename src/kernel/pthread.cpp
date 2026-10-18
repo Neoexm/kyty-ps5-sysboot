@@ -10,6 +10,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/execProcess.h"
 #include "kernel/memory.h"
 #include "kernel/process.h"
 #include "kernel/fileSystem.h"
@@ -396,6 +397,12 @@ struct PthreadPrivate {
 	PthreadAttr           attr;
 	pthread_entry_func_t  entry;
 	void*                 arg;
+	int                     guest_process_pid  = 0;
+	int                     guest_parent_pid   = 0;
+	uint64_t                rfork_stack_top    = 0;
+	bool                    rfork_exit_known   = false;
+	uint32_t                rfork_exit_status  = 0;
+	bool                    rfork_exec_retired = false;
 	int                   unique_id;
 	std::atomic_bool      detached;
 	std::atomic_bool      almost_done;
@@ -407,6 +414,7 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	std::atomic<uint64_t>   blocked_signal_mask[2] {};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -517,6 +525,7 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -584,6 +593,8 @@ static std::array<PthreadKeyState, KEYS_MAX>                g_pthread_keys;
 static std::mutex                                           g_pthread_keys_mutex;
 static thread_local std::unique_ptr<PthreadSpecificValue[]> g_pthread_specific;
 
+static std::mutex                            g_guest_pthread_mutex;
+static std::unordered_map<uint64_t, Pthread> g_guest_pthread_objects;
 class PthreadPool {
 public:
 	PthreadPool() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -3071,6 +3082,14 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 }
 
+Pthread PthreadHostObjectFor(Pthread thread) {
+	if (thread == nullptr) {
+		return nullptr;
+	}
+	std::lock_guard lock(g_guest_pthread_mutex);
+	const auto      it = g_guest_pthread_objects.find(reinterpret_cast<uint64_t>(thread));
+	return it != g_guest_pthread_objects.end() ? it->second : thread;
+}
 Pthread KYTY_SYSV_ABI PthreadSelf() {
 	// PRINT_NAME();
 
@@ -3093,6 +3112,17 @@ uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
 
+static thread_local std::atomic<uint64_t> g_unattached_signal_mask[2] {};
+PthreadSignalMask PthreadGetSignalMask(Pthread thread) {
+	auto* words = thread != nullptr ? thread->blocked_signal_mask : g_unattached_signal_mask;
+	return {{words[0].load(std::memory_order_acquire), words[1].load(std::memory_order_acquire)}};
+}
+void PthreadSetSignalMask(Pthread thread, PthreadSignalMask mask) {
+	mask.words[0] &= ~((1ull << 8) | (1ull << 16) | (1ull << 31));
+	auto* words = thread != nullptr ? thread->blocked_signal_mask : g_unattached_signal_mask;
+	words[0].store(mask.words[0], std::memory_order_release);
+	words[1].store(mask.words[1], std::memory_order_release);
+}
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Raise a host signal on another guest thread.
 bool PthreadKillHost(Pthread thread, int host_signal) {
@@ -3206,6 +3236,60 @@ static void* RunThread(void* arg) {
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
 	g_pthread_self = thread;
+	std::unique_ptr<Process::ScopedGuestProcessPid>         rfork_pid_scope;
+	std::unique_ptr<FileSystem::ScopedGuestDescriptorTable> rfork_fd_scope;
+	if (thread->guest_process_pid > 0) {
+		Process::RegisterRforkChild(thread->guest_process_pid, thread->guest_parent_pid);
+		rfork_pid_scope =
+		    std::make_unique<Process::ScopedGuestProcessPid>(thread->guest_process_pid);
+		rfork_fd_scope = std::make_unique<FileSystem::ScopedGuestDescriptorTable>();
+		LOGF("SYSCORE_NATIVE_RFORK_CHILD_THREAD_START guest_pid=%d host_thread_id=%" PRIu64
+		     " guest_entry=%016" PRIx64 " guest_stack_top=%016" PRIx64
+		     " isolated_guest_file_table=1\n",
+		     thread->guest_process_pid, static_cast<uint64_t>(Common::Thread::GetThreadIdUnique()),
+		     reinterpret_cast<uint64_t>(thread->entry), thread->rfork_stack_top);
+		// sc_spawn trampoline args: a[1] path, a[2] argv, a[3] prework fd (sub_468BF0), a[5] signed
+		// auth fd, a[6] fd handoff (-1 = syscall 0x261, else fd for 0x23b), a[8] stdio flag, a[9]
+		// title-id ptr
+		if (thread->arg != nullptr) {
+			const auto* a = reinterpret_cast<const uint64_t*>(thread->arg);
+			LOGF("SYSCORE_RFORK_ARG_DUMP guest_pid=%d arg_ptr=%p"
+			     " a0=%016" PRIx64 " a1=%016" PRIx64 " a2=%016" PRIx64 " a3=%016" PRIx64
+			     " a4=%016" PRIx64 " a5=%016" PRIx64 " a6=%016" PRIx64 " a7=%016" PRIx64
+			     " a8=%016" PRIx64 " a9=%016" PRIx64 "\n",
+			     thread->guest_process_pid, thread->arg, a[0], a[1], a[2], a[3], a[4], a[5], a[6],
+			     a[7], a[8], a[9]);
+			char       buf[256] {};
+			const auto path_ptr = a[1];
+			if (path_ptr != 0 && path_ptr < 0xffff'ffff'0000'0000ull) {
+				const auto* p = reinterpret_cast<const char*>(path_ptr);
+				for (size_t i = 0; i < sizeof(buf) - 1; ++i) {
+					char c = p[i];
+					if (c == 0) break;
+					buf[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
+				}
+				LOGF("SYSCORE_RFORK_ARG_PATH guest_pid=%d path=\"%s\"\n", thread->guest_process_pid,
+				     buf);
+			}
+			const auto alias_ptr = a[0];
+			if (alias_ptr != 0 && alias_ptr < 0xffff'ffff'0000'0000ull && buf[0] != 0) {
+				const auto* ap = reinterpret_cast<const char*>(alias_ptr);
+				char        alias_buf[256] {};
+				for (size_t i = 0; i < sizeof(alias_buf) - 1; ++i) {
+					char c = ap[i];
+					if (c == 0) break;
+					alias_buf[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
+				}
+				// only app children have a /app0 alias in a0, daemons exec their package path
+				// directly
+				if (std::strncmp(alias_buf, "/app0", 5) == 0) {
+					Process::SetRforkChildAppExec(thread->guest_process_pid, alias_buf, buf);
+					LOGF("SYSCORE_RFORK_APP_EXEC_PATHS guest_pid=%d alias=\"%s\" package=\"%s\"\n",
+					     thread->guest_process_pid, alias_buf, buf);
+				}
+			}
+		}
+	}
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3236,8 +3320,10 @@ static void* RunThread(void* arg) {
 	return ret;
 }
 
-int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
-                                pthread_entry_func_t entry, void* arg, const char* name) {
+static int KYTY_SYSV_ABI PthreadCreateImpl(Pthread* thread, const PthreadAttr* attr,
+                                           pthread_entry_func_t entry, void* arg, const char* name,
+                                           int guest_process_pid, uint64_t rfork_stack_top,
+                                           uint64_t creator) {
 	PRINT_NAME();
 
 	if (thread == nullptr) {
@@ -3318,6 +3404,17 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 	}
 }
 
+int PthreadCreateGuestRfork(Pthread* thread, const PthreadAttr* attr, pthread_entry_func_t entry,
+                            void* arg, const char* name, int guest_process_pid,
+                            uint64_t rfork_stack_top) {
+	const int parent_pid = Process::GetPid();
+	const int rc =
+	    PthreadCreateImpl(thread, attr, entry, arg, name, guest_process_pid, rfork_stack_top, 0);
+	if (rc == OK) {
+		Process::RegisterRforkChild(guest_process_pid, parent_pid);
+	}
+	return rc;
+}
 int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 	PRINT_NAME();
 
@@ -3525,6 +3622,12 @@ void KYTY_SYSV_ABI PthreadTestcancel() {
 
 void KYTY_SYSV_ABI PthreadExit(void* value) {
 	PRINT_NAME();
+	if (g_pthread_self != nullptr && g_pthread_self->guest_process_pid > 0 &&
+	    !g_pthread_self->rfork_exec_retired) {
+		g_pthread_self->rfork_exit_status =
+		    (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(value)) & 0xffu) << 8;
+		g_pthread_self->rfork_exit_known = true;
+	}
 
 #if defined(__x86_64__) || defined(_M_X64)
 	if (g_guest_entry_return_rsp != 0) {
@@ -3566,6 +3669,14 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 	pthread_exit(value);
 }
 
+[[noreturn]] void PthreadRetireRforkChildForExec() {
+	EXIT_IF(g_pthread_self == nullptr || g_pthread_self->guest_process_pid <= 0 ||
+	        g_pthread_self->guest_host_rsp == 0 || g_guest_entry_return_rsp == 0 ||
+	        !Process::IsRforkChildExecCommitted(g_pthread_self->guest_process_pid));
+	g_pthread_self->rfork_exec_retired = true;
+	PthreadExit(nullptr);
+	__builtin_unreachable();
+}
 int KYTY_SYSV_ABI PthreadEqual(Pthread thread1, Pthread thread2) {
 	static std::atomic<uint32_t> log_count {0};
 
@@ -4430,6 +4541,7 @@ int KYTY_SYSV_ABI pthread_getstack(const LibKernel::PthreadAttr* __restrict attr
 
 	return pthread_attr_getstack(attr, stack_addr, stack_size);
 }
+
 
 } // namespace Posix
 
