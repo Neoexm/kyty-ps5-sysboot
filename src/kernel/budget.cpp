@@ -15,8 +15,12 @@
 #include <string>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
+
 namespace Libs::LibKernel::Budget {
 // Id table K+0x3684bb8, 5 x 15 pools K+0x36844b0, builtin slots K+0x1ae69a0, per-proc
 // p+0x5cc/p+0x5d0/p+0xb4 bit 0x80. One section per guest scope, like appMount.cpp.
@@ -229,6 +233,13 @@ public:
 #endif
 	KYTY_CLASS_NO_COPY(TableLock);
 };
+// K+0x608f90 tests cred caps0 bit 62; ENOSYS while the bit is unknown
+const char* Gate(const AuthInfo::AuthorizationFacts& facts) {
+	if (!facts.has_authority || (facts.known_capability0 & (1ull << 62)) == 0)
+		return "capability62_unmeasured";
+	if ((facts.capability0 & (1ull << 62)) == 0) return "capability62_clear";
+	return nullptr;
+}
 ScopeBudgets::Object* Lookup(ScopeBudgets& table, int32_t id) {
 	if (id < 0 || id > 0xffff) return nullptr;
 	const uint32_t index = static_cast<uint32_t>(id) & 0x1fff;

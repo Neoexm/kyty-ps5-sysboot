@@ -8,11 +8,14 @@
 #include <string_view>
 
 namespace Libs::LibKernel::AuthInfo {
+
 constexpr size_t   kSize                   = 0x88;
 constexpr size_t   kDigestSize             = 32;
 constexpr uint32_t kCaptureEnvelopeVersion = 2;
 constexpr size_t   kCaptureEnvelopeSize    = 0x108;
+constexpr size_t   kScopedCaptureSize      = 0x150;
 constexpr size_t   kObservationSize        = 200;
+constexpr size_t   kScopedObservationSize  = 0x118;
 constexpr uint64_t kFilteredCapabilityMask = 0x7000000000000000ull;
 
 inline constexpr char kCapturePathEnvironment[]   = "KYTY_PS5_CAPTURED_AUTHINFO";
@@ -20,6 +23,7 @@ inline constexpr char kCaptureSha256Environment[] = "KYTY_PS5_CAPTURED_AUTHINFO_
 
 using Record = std::array<uint8_t, kSize>;
 using Digest = std::array<uint8_t, kDigestSize>;
+
 struct AuthorizationFacts {
 	bool     has_authority     = false;
 	uint64_t authority_id      = 0;
@@ -28,6 +32,7 @@ struct AuthorizationFacts {
 	bool     root_prison_known = false;
 	bool     root_prison       = false;
 };
+
 struct Capture {
 	uint32_t                                  version      = 0;
 	uint64_t                                  authority_id = 0;
@@ -44,6 +49,7 @@ struct Capture {
 			bytes[i] = 0;
 	}
 };
+
 struct ImageIdentity {
 	uint64_t authority_id = 0;
 	uint64_t self_size    = 0;
@@ -51,6 +57,7 @@ struct ImageIdentity {
 	Digest   self_sha256 {};
 	Digest   elf_sha256 {};
 };
+
 struct Observation {
 	ImageIdentity                         image;
 	AuthorizationFacts                    facts;
@@ -58,24 +65,32 @@ struct Observation {
 	Digest                                envelope_sha256 {};
 	std::array<uint8_t, kObservationSize> encoded {};
 };
+
 enum class CaptureLoadResult {
 	Absent,
 	Verified,
 	Rejected,
 };
+
 uint64_t    AuthorityId(const Record& record);
 uint64_t    Capability0(const Record& record);
+bool        IsFilteredAuthorityVisible(uint64_t authority_id);
 Record      Filter(const Record& record);
+bool        FilterSelfAuthInfo(const Record& caller, const Record& target, Record* output);
 bool        BuildFilteredRecord(const AuthorizationFacts& facts, Record* output);
 Digest      Sha256(const void* data, size_t size);
 std::string DigestHex(const Digest& digest);
 bool        ParseDigestHex(std::string_view text, Digest* digest);
+std::string CapturePathEnvironmentName(const Digest& self_sha256);
+std::string CaptureSha256EnvironmentName(const Digest& self_sha256);
 bool ParseObservation(const uint8_t* data, size_t size, const Digest& envelope_sha256,
                       const ImageIdentity& image, Observation* observation, std::string* reason);
 CaptureLoadResult LoadObservationFromEnvironment(const ImageIdentity& image,
                                                  Observation* observation, std::string* reason);
 bool ValidateImageIdentity(const uint8_t* self_data, size_t self_size, const uint8_t* elf_data,
                            size_t elf_size, ImageIdentity* identity, std::string* reason);
+bool BuildCaptureEnvelope(const Record& record, const ImageIdentity& identity, Capture* capture,
+                          std::string* reason);
 bool ParseCaptureEnvelope(const uint8_t* data, size_t size, const Digest& expected_envelope_sha256,
                           const Digest& expected_self_sha256, const Digest& expected_elf_sha256,
                           uint64_t expected_authority_id, Capture* capture, std::string* reason);
@@ -83,5 +98,22 @@ CaptureLoadResult LoadCaptureFromEnvironment(const Digest& expected_self_sha256,
                                              const Digest& expected_elf_sha256,
                                              uint64_t expected_authority_id, Capture* capture,
                                              std::string* reason);
+bool              EncodeScopedCapture(const Capture& capture, int guest_pid, uint32_t host_pid,
+                                      std::array<uint8_t, kScopedCaptureSize>* encoded);
+bool DecodeScopedCapture(const uint8_t* data, size_t size, int expected_guest_pid,
+                         uint32_t expected_host_pid, uint64_t expected_authority_id,
+                         const Digest& expected_self_sha256, const Digest& expected_elf_sha256,
+                         Capture* capture, std::string* reason);
+bool EncodeScopedObservation(const Observation& observation, int guest_pid, uint32_t host_pid,
+                             uint64_t                                     host_birth,
+                             std::array<uint8_t, kScopedObservationSize>* encoded);
+bool DecodeScopedObservation(const uint8_t* data, size_t size, int expected_guest_pid,
+                             uint32_t expected_host_pid, uint64_t expected_host_birth,
+                             uint64_t expected_authority_id, const Digest& expected_self_sha256,
+                             const Digest& expected_elf_sha256,
+                             const Digest& expected_envelope_sha256, Observation* observation,
+                             std::string* reason);
+
 } // namespace Libs::LibKernel::AuthInfo
+
 #endif

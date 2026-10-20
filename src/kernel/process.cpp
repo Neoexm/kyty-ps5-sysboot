@@ -32,12 +32,16 @@
 #include <thread>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <sddl.h>
 #pragma comment(lib, "advapi32.lib")
 #else
 #include <unistd.h>
 #endif
+
 namespace Libs::LibKernel::Process {
 static std::filesystem::path RecordPath(const std::string& scope, const char* key, uint32_t id) {
 	return std::filesystem::temp_directory_path() /
@@ -86,7 +90,11 @@ static void ReleaseAllOwnedScopedAuthObservations() {
 #else
 static uint64_t CurrentProcessCreationTime() {
 	return 0;
+}
+}
+}
 #endif
+
 namespace {
 thread_local int g_thread_guest_pid = 0;
 std::mutex       g_auth_info_update_mutex;
@@ -160,6 +168,11 @@ ScopePidAllocator* AttachScopePidAllocator(const std::string& scope) {
 }
 #endif
 } // namespace
+ScopedGuestProcessPid::ScopedGuestProcessPid(int pid) {
+	EXIT_IF(pid <= 0);
+	previous_pid       = g_thread_guest_pid;
+	g_thread_guest_pid = pid;
+}
 int AllocateRforkChildPid() {
 	std::string scope;
 	if (GetScope(&scope)) {
@@ -217,6 +230,24 @@ struct RforkChild {
 	std::string app_exec_real;
 };
 std::unordered_map<int, RforkChild> g_rfork_children;
+struct WaitEchildKey {
+	int parent    = 0;
+	int requested = 0;
+	int options   = 0;
+
+	bool operator==(const WaitEchildKey& other) const {
+		return parent == other.parent && requested == other.requested && options == other.options;
+	}
+};
+struct WaitEchildKeyHash {
+	size_t operator()(const WaitEchildKey& key) const {
+		size_t value = std::hash<int> {}(key.parent);
+		value ^= std::hash<int> {}(key.requested) + 0x9e3779b9u + (value << 6u) + (value >> 2u);
+		value ^= std::hash<int> {}(key.options) + 0x9e3779b9u + (value << 6u) + (value >> 2u);
+		return value;
+	}
+};
+std::unordered_set<WaitEchildKey, WaitEchildKeyHash> g_wait_echild_logged;
 } // namespace
 void RegisterRforkChild(int pid, int parent_pid) {
 	if (pid <= 0 || parent_pid <= 0) {
@@ -326,6 +357,63 @@ bool GetRforkChildExitStatus(int pid, uint32_t* status) {
 	}
 	*status = child->second.exit_status;
 	return true;
+}
+int WaitForChild(int pid, uint32_t* status, int options, bool guest_status) {
+	if (pid == 0 || pid < -1 || (options & ~1) != 0) return KERNEL_ERROR_ENOSYS;
+	const int        parent = GetPid();
+	std::unique_lock lock(g_rfork_children_mutex);
+	for (;;) {
+		bool     has_child      = false;
+		uint32_t parent_total   = 0;
+		uint32_t parent_reaped  = 0;
+		uint32_t parent_exited  = 0;
+		uint32_t request_total  = 0;
+		uint32_t request_reaped = 0;
+		uint32_t request_exited = 0;
+		for (auto& [child_pid, child]: g_rfork_children) {
+			if (child.parent_pid != parent) continue;
+			++parent_total;
+			if (child.reaped) ++parent_reaped;
+			if (child.has_exit_status) ++parent_exited;
+			if (pid != -1 && pid != child_pid) continue;
+			++request_total;
+			if (child.reaped) ++request_reaped;
+			if (child.has_exit_status) ++request_exited;
+			if (child.reaped) continue;
+			has_child = true;
+			if (!child.has_exit_status || (child.exec_committed && !child.context_retired))
+				continue;
+			if (status != nullptr) {
+				if (guest_status) {
+					if (!Memory::CopyToGuest(status, &child.exit_status, sizeof(*status)))
+						return KERNEL_ERROR_EFAULT;
+				} else {
+					*status = child.exit_status;
+				}
+			}
+			child.reaped = true;
+			g_rfork_children_changed.notify_all();
+			LOGF("GUEST_WAIT4_REAP parent_pid=%d guest_pid=%d wait_status=0x%08x recorded_exit=1\n",
+			     parent, child_pid, child.exit_status);
+			return child_pid;
+		}
+		if (!has_child) {
+			if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_SIGPROCMASK_LOOP_TRACE") != nullptr &&
+			    g_wait_echild_logged.size() < 128 &&
+			    g_wait_echild_logged.insert({parent, pid, options}).second) {
+				LOGF("GUEST_WAIT4_ECHILD parent_pid=%d requested_pid=%d options=0x%x"
+				     " parent_total=%u parent_unreaped=%u parent_reaped=%u parent_exited=%u"
+				     " request_total=%u request_unreaped=%u request_reaped=%u request_exited=%u"
+				     " status_written=0\n",
+				     parent, pid, options, parent_total, parent_total - parent_reaped,
+				     parent_reaped, parent_exited, request_total, request_total - request_reaped,
+				     request_reaped, request_exited);
+			}
+			return KERNEL_ERROR_ECHILD;
+		}
+		if ((options & 1) != 0) return 0;
+		g_rfork_children_changed.wait(lock);
+	}
 }
 void NotifyRforkChildExited(int pid, uint32_t exit_status) {
 	if (pid <= 0) {
@@ -645,6 +733,120 @@ static uint64_t GetAuthorityId() {
 		return authority_id;
 	}();
 	return id;
+}
+// peers are separate host processes, so per-pid kernel state goes to files they can read
+void PublishToScope() {
+	if (std::getenv("KYTY_DIAGNOSTIC_GUEST_WAIT_SELFTEST") != nullptr) {
+		constexpr int fixture = 0x70000000;
+		const int     parent  = GetPid();
+		LOGF("PS5_GUEST_WAIT_SELFTEST_BEGIN\n");
+		{
+			std::lock_guard lock(g_rfork_children_mutex);
+			for (int i = 0; i != 5; ++i)
+				EXIT_IF(g_rfork_children.contains(fixture + i));
+		}
+		RegisterRforkChild(fixture, parent);
+		RegisterRforkChild(fixture + 1, parent);
+		uint32_t status = 0x12345678;
+		EXIT_IF(WaitForChild(fixture, &status, 1) != 0 || status != 0x12345678);
+		EXIT_IF(WaitForChild(fixture, &status, 2) != KERNEL_ERROR_ENOSYS);
+		{
+			ScopedGuestProcessPid foreign(parent + 1);
+			EXIT_IF(WaitForChild(fixture, &status, 1) != KERNEL_ERROR_ECHILD);
+		}
+		std::atomic<bool> waiting {false};
+		std::atomic<bool> done {false};
+		int               waited = 0;
+		std::thread       waiter([&] {
+			ScopedGuestProcessPid owner(parent);
+			waiting = true;
+			waited  = WaitForChild(fixture, &status, 0);
+			done    = true;
+		});
+		while (!waiting.load())
+			std::this_thread::yield();
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		EXIT_IF(done.load());
+		NotifyRforkChildExited(fixture, 0x2a00);
+		waiter.join();
+		EXIT_IF(waited != fixture || status != 0x2a00);
+		EXIT_IF(WaitForChild(fixture, &status, 1) != KERNEL_ERROR_ECHILD);
+		uint32_t recorded = 0;
+		EXIT_IF(!GetRforkChildExitStatus(fixture, &recorded) || recorded != 0x2a00);
+		NotifyRforkChildExited(fixture + 1, 0x3300);
+		int         results[2] {};
+		std::thread first([&] {
+			ScopedGuestProcessPid owner(parent);
+			results[0] = WaitForChild(fixture + 1, nullptr, 0);
+		});
+		std::thread second([&] {
+			ScopedGuestProcessPid owner(parent);
+			results[1] = WaitForChild(fixture + 1, nullptr, 0);
+		});
+		first.join();
+		second.join();
+		EXIT_IF(!((results[0] == fixture + 1 && results[1] == KERNEL_ERROR_ECHILD) ||
+		          (results[1] == fixture + 1 && results[0] == KERNEL_ERROR_ECHILD)));
+		const int   nested_parent = parent + 11;
+		std::thread child_first([&] { RegisterRforkChild(fixture + 2, nested_parent); });
+		child_first.join();
+		RegisterRforkChild(fixture + 2, nested_parent);
+		NotifyRforkChildExited(fixture + 2, 0x4400);
+		EXIT_IF(WaitForChild(fixture + 2, &status, 1) != KERNEL_ERROR_ECHILD);
+		{
+			ScopedGuestProcessPid nested(nested_parent);
+			EXIT_IF(WaitForChild(fixture + 2, &status, 0) != fixture + 2 || status != 0x4400);
+		}
+		void*            mapped_status = nullptr;
+		constexpr size_t page_size     = 0x4000;
+		EXIT_IF(Memory::KernelMapNamedFlexibleMemory(&mapped_status, page_size, 3, 0,
+		                                             "wait4-fixture") != OK);
+		EXIT_IF(Memory::CanWriteGuest(reinterpret_cast<void*>(UINT64_MAX - 1), sizeof(status)));
+		EXIT_IF(Memory::CanWriteGuest(nullptr, sizeof(status)));
+		for (int i = 3; i != 5; ++i) {
+			RegisterRforkChild(fixture + i, parent);
+			std::atomic<bool> validated {false};
+			int               copy_result = 0;
+			std::thread       copy_waiter([&] {
+				ScopedGuestProcessPid owner(parent);
+				EXIT_IF(!Memory::CanWriteGuest(mapped_status, sizeof(status)));
+				validated = true;
+				copy_result =
+				    WaitForChild(fixture + i, static_cast<uint32_t*>(mapped_status), 0, true);
+			});
+			while (!validated.load())
+				std::this_thread::yield();
+			if (i == 3) {
+				EXIT_IF(Memory::KernelMprotect(mapped_status, page_size, 1) != OK);
+			} else {
+				EXIT_IF(Memory::KernelMunmap(reinterpret_cast<uint64_t>(mapped_status),
+				                             page_size) != OK);
+			}
+			EXIT_IF(Memory::CanWriteGuest(mapped_status, sizeof(status)));
+			NotifyRforkChildExited(fixture + i, 0x5500 + static_cast<uint32_t>(i << 8));
+			copy_waiter.join();
+			EXIT_IF(copy_result != KERNEL_ERROR_EFAULT);
+			EXIT_IF(!GetRforkChildExitStatus(fixture + i, &recorded) ||
+			        recorded != 0x5500 + static_cast<uint32_t>(i << 8));
+			if (i == 3) {
+				EXIT_IF(Memory::KernelMprotect(mapped_status, page_size, 3) != OK);
+				EXIT_IF(WaitForChild(fixture + i, static_cast<uint32_t*>(mapped_status), 0, true) !=
+				        fixture + i);
+				EXIT_IF(*static_cast<uint32_t*>(mapped_status) != recorded);
+			} else {
+				EXIT_IF(WaitForChild(fixture + i, &status, 0) != fixture + i || status != recorded);
+			}
+			EXIT_IF(WaitForChild(fixture + i, nullptr, 1) != KERNEL_ERROR_ECHILD);
+		}
+		{
+			std::lock_guard lock(g_rfork_children_mutex);
+			for (int i = 0; i != 5; ++i)
+				g_rfork_children.erase(fixture + i);
+		}
+		LOGF("PS5_GUEST_WAIT_SELFTEST PASS blocking_exit=1 nohang_unchanged=1 owner_isolation=1"
+		     " single_reap=1 monitor_status_retained=1 unsupported_options=1 nested_child_first=1"
+		     " protected_copyout=1 unmapped_copyout=1 failed_copyout_retains_child=1\n");
+	}
 }
 bool FindPeerByPid(int pid, PeerProcess* peer) {
 	if (peer == nullptr) return false;

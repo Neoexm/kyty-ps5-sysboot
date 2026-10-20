@@ -10,7 +10,9 @@
 #include "kernel/eventFlag.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/ipmiManager.h"
 #include "kernel/memory.h"
+#include "kernel/process.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
@@ -3228,6 +3230,121 @@ int chmod(const char* path, int mode) {
 	return OK;
 }
 
+// diagnostic: selected peers get the 0x4800000000000015 SceAvCapture authority
+static bool DiagnosticCompositorClientAuthorityMatches(uint64_t authority_id) {
+	const char* value = std::getenv("KYTY_DIAGNOSTIC_AUTHINFO_COMPOSITOR_CLIENT");
+	if (value == nullptr || *value == '\0') return false;
+	const char* p = value;
+	while (*p != '\0') {
+		while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t')
+			++p;
+		if (*p == '\0') break;
+		char*          end    = nullptr;
+		const uint64_t parsed = std::strtoull(p, &end, 0);
+		if (end == p) break;
+		if (parsed == authority_id) return true;
+		p = end;
+	}
+	return false;
+}
+int KYTY_SYSV_ABI KernelGetAuthinfo(int pid, void* info) {
+	PRINT_NAME();
+
+	if (info == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+
+	LibKernel::Process::PeerProcess process;
+	if (!LibKernel::Process::FindPeerByPid(pid != 0 ? pid : LibKernel::Process::GetPid(),
+	                                       &process)) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ESRCH;
+		return -1;
+	}
+
+	LibKernel::AuthInfo::Record response {};
+	const int                   target_pid = pid != 0 ? pid : LibKernel::Process::GetPid();
+	const bool                  remote     = target_pid != LibKernel::Process::GetPid();
+	const bool observed = !process.has_auth_info &&
+	                      (remote ? process.has_filtered_auth_info
+	                              : LibKernel::Process::GetCurrentFilteredAuthInfo(&response));
+	if (!process.has_auth_info && !observed &&
+	    DiagnosticCompositorClientAuthorityMatches(process.auth_id)) {
+		LibKernel::AuthInfo::Record standin {};
+		constexpr uint64_t          compositor_client_authority = 0x4800000000000015ull;
+		std::memcpy(standin.data(), &compositor_client_authority,
+		            sizeof(compositor_client_authority));
+		if (!LibKernel::Memory::CopyToGuest(info, standin.data(), standin.size())) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+			return -1;
+		}
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_AUTHINFO_COMPOSITOR_CLIENT pid=%d "
+		     "peer_authority=0x%016" PRIx64 " synthesized_authority=0x%016" PRIx64
+		     " NON_AUTHENTIC\n",
+		     pid, process.auth_id, compositor_client_authority);
+		return OK;
+	}
+	if (!process.has_auth_info && !observed) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+		LOGF("AUTHINFO_MISSING pid=%d authority=0x%016" PRIx64 " result=ENOENT\n", pid,
+		     process.auth_id);
+		return -1;
+	}
+	const auto         caller               = LibKernel::Process::GetCurrentAuthorizationFacts();
+	constexpr uint64_t privilege_bit        = uint64_t {1} << 62;
+	const bool         privileged           = caller.root_prison_known && caller.root_prison &&
+	                                          (caller.known_capability0 & privilege_bit) != 0 &&
+	                                          (caller.capability0 & privilege_bit) != 0;
+	bool               full_authinfo_record = false;
+	if (privileged && process.has_auth_info) {
+		response             = process.auth_info;
+		full_authinfo_record = true;
+	} else {
+		if (process.has_auth_info)
+			response = LibKernel::AuthInfo::Filter(process.auth_info);
+		else if (remote)
+			response = process.filtered_auth_info;
+		if (privileged) {
+			std::memcpy(response.data(), &process.auth_id, sizeof(process.auth_id));
+		}
+	}
+	constexpr uint64_t diagnostic_caps = 0x4000000000000000ull;
+	const bool         diagnostic_shellui_cap =
+	    !privileged && !observed && process.auth_id == 0x480000000000000Full &&
+	    std::getenv("KYTY_DIAGNOSTIC_AUTHINFO_SHELLUI_SYSTEM_CAP") != nullptr;
+	if (diagnostic_shellui_cap) {
+		std::memcpy(response.data() + 8, &diagnostic_caps, sizeof(diagnostic_caps));
+	}
+	if (!LibKernel::Memory::CopyToGuest(info, response.data(), response.size())) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+	if (privileged) {
+		LOGF("AUTHINFO_PRIVILEGE_0X2AE pid=%d root_prison=verified bit62=verified source=%s"
+		     " full_authinfo_record=%d remote_visibility=existing_peer_scope\n",
+		     target_pid, full_authinfo_record ? "exact_capture" : "partial_observation",
+		     full_authinfo_record ? 1 : 0);
+		return OK;
+	}
+	if (observed) {
+		LOGF("AUTHINFO_FILTERED_OBSERVATION pid=%d source=%s full_authinfo_record=0\n", target_pid,
+		     remote ? "scoped_peer_observation" : "native_587_observed_fields");
+		return OK;
+	}
+	LOGF("AUTHINFO_FILTERED_SOURCE_RECORD pid=%d authority=0x%016" PRIx64
+	     " privilege_0x2ae=filtered caller_root_prison_known=%d caller_root_prison=%d"
+	     " caller_bit62_known=%d caller_bit62=%d\n",
+	     pid, process.auth_id, caller.root_prison_known ? 1 : 0, caller.root_prison ? 1 : 0,
+	     (caller.known_capability0 & privilege_bit) != 0 ? 1 : 0,
+	     (caller.capability0 & privilege_bit) != 0 ? 1 : 0);
+	if (diagnostic_shellui_cap) {
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_AUTHINFO_CAPS pid=%d caps0=0x%016" PRIx64
+		     " NON_AUTHENTIC\n",
+		     pid, diagnostic_caps);
+	}
+	LOGF("\t pid = %d, authority id = 0x%016" PRIx64 "\n", pid, process.auth_id);
+	return OK;
+}
 // processSpawn gate: Prospero SDK word from PT_OS_PROCPARAM, taken from the decrypted overlay
 static int SdkVersionByPath(const char* path, uint64_t shift, uint32_t* out, const char* tag) {
 	if (path == nullptr || out == nullptr) {

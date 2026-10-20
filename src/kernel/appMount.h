@@ -10,6 +10,8 @@ namespace Libs::LibKernel::AppMount {
 // Raw syscall 0x2c2 block as libkernel HRDq-RDIGmI marshals it; +0xb0 points at the wrapper-local
 // id.
 using Request = std::array<uint8_t, 0x178>;
+// The proc+0x460 record behind {1,14,35,pid}.
+using Record = std::array<uint8_t, 0x98>;
 // return 0 or a POSIX errno
 // copyin fills the block, copyout writes the id to +0xb0, read fetches param.json behind +0xa0
 int Begin(const std::function<int(Request&)>&                  copyin,

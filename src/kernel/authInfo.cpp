@@ -11,6 +11,9 @@
 #include <type_traits>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <cerrno>
@@ -18,10 +21,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
 namespace Libs::LibKernel::AuthInfo {
 namespace {
 constexpr std::array<uint8_t, 8> kCaptureMagic {'K', 'y', 't', 'y', 'A', 'I', '0', '2'};
+constexpr std::array<uint8_t, 8> kScopedMagic {'K', 'y', 't', 'y', 'A', 'P', '0', '2'};
+constexpr std::array<uint8_t, 8> kScopedObservationMagic {'K', 'y', 't', 'y', 'A', 'S', '0', '1'};
 constexpr uint32_t               kCaptureHeaderSize           = 0x80;
+constexpr uint32_t               kScopedHeaderSize            = 0x48;
+constexpr uint32_t               kScopedObservationHeaderSize = 0x50;
+
 constexpr std::array<uint32_t, 64> kSha256Constants {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -32,6 +41,7 @@ constexpr std::array<uint32_t, 64> kSha256Constants {
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
+
 struct Sha256State {
 	std::array<uint32_t, 8> state {
 	    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -41,6 +51,7 @@ struct Sha256State {
 	uint64_t                bytes = 0;
 	size_t                  used  = 0;
 };
+
 void SecureWipe(void* data, size_t size) noexcept {
 	auto* bytes = static_cast<volatile unsigned char*>(data);
 	while (size != 0) {
@@ -48,6 +59,7 @@ void SecureWipe(void* data, size_t size) noexcept {
 		--size;
 	}
 }
+
 template <typename T>
 class WipeObjectOnExit final {
 public:
@@ -62,6 +74,7 @@ public:
 private:
 	T* m_value;
 };
+
 template <typename Buffer>
 class WipeBufferOnExit final {
 public:
@@ -78,31 +91,38 @@ public:
 private:
 	Buffer* m_buffer;
 };
+
 uint32_t RotateRight(uint32_t value, uint32_t count) {
 	return (value >> count) | (value << (32 - count));
 }
+
 uint32_t Load32Big(const uint8_t* data) {
 	return (uint32_t {data[0]} << 24) | (uint32_t {data[1]} << 16) | (uint32_t {data[2]} << 8) |
 	       uint32_t {data[3]};
 }
+
 uint32_t Load32Little(const uint8_t* data) {
 	return uint32_t {data[0]} | (uint32_t {data[1]} << 8) | (uint32_t {data[2]} << 16) |
 	       (uint32_t {data[3]} << 24);
 }
+
 uint64_t Load64Little(const uint8_t* data) {
 	uint64_t value = 0;
 	for (uint32_t i = 0; i != 8; ++i)
 		value |= uint64_t {data[i]} << (i * 8);
 	return value;
 }
+
 void Store32Little(uint8_t* data, uint32_t value) {
 	for (uint32_t i = 0; i != 4; ++i)
 		data[i] = static_cast<uint8_t>(value >> (i * 8));
 }
+
 void Store64Little(uint8_t* data, uint64_t value) {
 	for (uint32_t i = 0; i != 8; ++i)
 		data[i] = static_cast<uint8_t>(value >> (i * 8));
 }
+
 void Transform(Sha256State* state, const uint8_t* block) {
 	std::array<uint32_t, 64> words {};
 	WipeObjectOnExit         wipe_words(&words);
@@ -148,6 +168,7 @@ void Transform(Sha256State* state, const uint8_t* block) {
 	state->state[6] += g;
 	state->state[7] += h;
 }
+
 void Update(Sha256State* state, const uint8_t* data, size_t size) {
 	state->bytes += size;
 	while (size != 0) {
@@ -162,6 +183,7 @@ void Update(Sha256State* state, const uint8_t* data, size_t size) {
 		}
 	}
 }
+
 Digest Finish(Sha256State* state) {
 	const uint64_t bits         = state->bytes * 8;
 	state->block[state->used++] = 0x80;
@@ -185,10 +207,12 @@ Digest Finish(Sha256State* state) {
 	}
 	return digest;
 }
+
 bool Fail(std::string* reason, const char* text) {
 	if (reason != nullptr) *reason = text;
 	return false;
 }
+
 bool ParseCaptureInternal(const uint8_t* data, size_t size, const Digest* expected_envelope_sha256,
                           const Digest* expected_self_sha256, const Digest* expected_elf_sha256,
                           const uint64_t* expected_authority_id, Capture* capture,
@@ -242,6 +266,15 @@ bool ParseCaptureInternal(const uint8_t* data, size_t size, const Digest* expect
 	if (reason != nullptr) *reason = "verified";
 	return true;
 }
+
+bool SameCapture(const Capture& left, const Capture& right) {
+	return left.version == right.version && left.authority_id == right.authority_id &&
+	       left.self_sha256 == right.self_sha256 && left.elf_sha256 == right.elf_sha256 &&
+	       left.record_sha256 == right.record_sha256 &&
+	       left.envelope_sha256 == right.envelope_sha256 && left.record == right.record &&
+	       left.envelope == right.envelope;
+}
+
 std::string HexBytes(const uint8_t* data, size_t size) {
 	constexpr char digits[] = "0123456789abcdef";
 	std::string    text(size * 2, '0');
@@ -251,12 +284,14 @@ std::string HexBytes(const uint8_t* data, size_t size) {
 	}
 	return text;
 }
+
 int HexDigit(char value) {
 	if (value >= '0' && value <= '9') return value - '0';
 	if (value >= 'a' && value <= 'f') return value - 'a' + 10;
 	if (value >= 'A' && value <= 'F') return value - 'A' + 10;
 	return -1;
 }
+
 bool DecodeHex(std::string_view text, uint8_t* data, size_t size) {
 	if (data == nullptr || text.size() != size * 2) return false;
 	for (size_t i = 0; i != size; ++i) {
@@ -267,12 +302,14 @@ bool DecodeHex(std::string_view text, uint8_t* data, size_t size) {
 	}
 	return true;
 }
+
 enum class CaptureSnapshotResult {
 	Read,
 	Unavailable,
 	WrongSize,
 	Changed,
 };
+
 template <size_t Size>
 CaptureSnapshotResult ReadCaptureSnapshot(const std::filesystem::path& path,
                                           std::array<uint8_t, Size>*   encoded) {
@@ -354,21 +391,36 @@ CaptureSnapshotResult ReadCaptureSnapshot(const std::filesystem::path& path,
 #endif
 }
 } // namespace
+
 uint64_t AuthorityId(const Record& record) {
 	uint64_t value = 0;
 	std::memcpy(&value, record.data(), sizeof(value));
 	return value;
 }
+
 uint64_t Capability0(const Record& record) {
 	uint64_t value = 0;
 	std::memcpy(&value, record.data() + 8, sizeof(value));
 	return value;
 }
+
 bool IsFilteredAuthorityVisible(uint64_t authority_id) {
 	if (authority_id == 0x4800000000001010ull) return true;
 	const uint64_t index = authority_id - 0x4800000010000004ull;
 	return index <= 15 && ((0xe001ull >> index) & 1) != 0;
 }
+
+Record Filter(const Record& record) {
+	Record         filtered {};
+	const uint64_t authority_id = AuthorityId(record);
+	const uint64_t capability   = Capability0(record) & kFilteredCapabilityMask;
+	if (IsFilteredAuthorityVisible(authority_id)) {
+		std::memcpy(filtered.data(), &authority_id, sizeof(authority_id));
+	}
+	std::memcpy(filtered.data() + 8, &capability, sizeof(capability));
+	return filtered;
+}
+
 bool BuildFilteredRecord(const AuthorizationFacts& facts, Record* output) {
 	if (output == nullptr || !facts.has_authority ||
 	    facts.known_capability0 != kFilteredCapabilityMask ||
@@ -383,15 +435,46 @@ bool BuildFilteredRecord(const AuthorizationFacts& facts, Record* output) {
 	*output = filtered;
 	return true;
 }
+
+bool FilterSelfAuthInfo(const Record& caller, const Record& target, Record* output) {
+	if (output == nullptr) return false;
+	const uint64_t   caller_authority = AuthorityId(caller);
+	const bool       restricted       = (caller[0x17] & 1u) != 0;
+	Record           filtered         = target;
+	WipeObjectOnExit wipe_filtered(&filtered);
+	*output = {};
+	std::fill(filtered.begin() + 0x08, filtered.begin() + 0x28, 0);
+	std::fill(filtered.begin() + 0x48, filtered.end(), 0);
+	if (caller_authority != 0x4800000000000010ull) {
+		std::fill(filtered.begin(), filtered.begin() + sizeof(uint64_t), 0);
+	}
+	if (restricted) {
+		Store64Little(filtered.data() + 0x28, Load64Little(filtered.data() + 0x28) & 0x04000000ull);
+		std::fill(filtered.begin() + 0x30, filtered.begin() + 0x48, 0);
+	} else {
+		if (caller_authority != 0x4800000000000010ull &&
+		    caller_authority != 0x4800000000000007ull) {
+			return false;
+		}
+		std::fill(filtered.begin() + 0x28, filtered.begin() + 0x38, 0);
+		Store64Little(filtered.data() + 0x38, Load64Little(filtered.data() + 0x38) & 0xffull);
+		std::fill(filtered.begin() + 0x40, filtered.begin() + 0x48, 0);
+	}
+	*output = filtered;
+	return true;
+}
+
 Digest Sha256(const void* data, size_t size) {
 	Sha256State      state;
 	WipeObjectOnExit wipe_state(&state);
 	if (size != 0) Update(&state, static_cast<const uint8_t*>(data), size);
 	return Finish(&state);
 }
+
 std::string DigestHex(const Digest& digest) {
 	return HexBytes(digest.data(), digest.size());
 }
+
 bool ParseDigestHex(std::string_view text, Digest* digest) {
 	if (digest == nullptr) return false;
 	Digest parsed {};
@@ -399,12 +482,15 @@ bool ParseDigestHex(std::string_view text, Digest* digest) {
 	*digest = parsed;
 	return true;
 }
+
 std::string CapturePathEnvironmentName(const Digest& self_sha256) {
 	return std::string(kCapturePathEnvironment) + '_' + DigestHex(self_sha256);
 }
+
 std::string CaptureSha256EnvironmentName(const Digest& self_sha256) {
 	return std::string(kCaptureSha256Environment) + '_' + DigestHex(self_sha256);
 }
+
 bool ValidateImageIdentity(const uint8_t* self_data, size_t self_size, const uint8_t* elf_data,
                            size_t elf_size, ImageIdentity* identity, std::string* reason) {
 	if (identity == nullptr) return Fail(reason, "image identity arguments invalid");
@@ -479,6 +565,7 @@ bool ValidateImageIdentity(const uint8_t* self_data, size_t self_size, const uin
 	if (reason != nullptr) *reason = "verified";
 	return true;
 }
+
 bool BuildCaptureEnvelope(const Record& record, const ImageIdentity& identity, Capture* capture,
                           std::string* reason) {
 	if (capture == nullptr) return Fail(reason, "capture builder arguments invalid");
@@ -511,12 +598,14 @@ bool BuildCaptureEnvelope(const Record& record, const ImageIdentity& identity, C
 	if (reason != nullptr) *reason = "built";
 	return true;
 }
+
 bool ParseCaptureEnvelope(const uint8_t* data, size_t size, const Digest& expected_envelope_sha256,
                           const Digest& expected_self_sha256, const Digest& expected_elf_sha256,
                           uint64_t expected_authority_id, Capture* capture, std::string* reason) {
 	return ParseCaptureInternal(data, size, &expected_envelope_sha256, &expected_self_sha256,
 	                            &expected_elf_sha256, &expected_authority_id, capture, reason);
 }
+
 CaptureLoadResult LoadCaptureFromEnvironment(const Digest& expected_self_sha256,
                                              const Digest& expected_elf_sha256,
                                              uint64_t expected_authority_id, Capture* capture,
@@ -574,6 +663,7 @@ CaptureLoadResult LoadCaptureFromEnvironment(const Digest& expected_self_sha256,
 		return CaptureLoadResult::Rejected;
 	}
 }
+
 bool ParseObservation(const uint8_t* data, size_t size, const Digest& envelope_sha256,
                       const ImageIdentity& image, Observation* observation, std::string* reason) {
 	if (observation == nullptr) return Fail(reason, "observation output unavailable");
@@ -618,6 +708,7 @@ bool ParseObservation(const uint8_t* data, size_t size, const Digest& envelope_s
 	if (reason != nullptr) *reason = "verified";
 	return true;
 }
+
 CaptureLoadResult LoadObservationFromEnvironment(const ImageIdentity& image,
                                                  Observation* observation, std::string* reason) {
 	if (observation == nullptr) {
@@ -655,4 +746,123 @@ CaptureLoadResult LoadObservationFromEnvironment(const ImageIdentity& image,
 		return CaptureLoadResult::Rejected;
 	}
 }
+
+bool EncodeScopedCapture(const Capture& capture, int guest_pid, uint32_t host_pid,
+                         std::array<uint8_t, kScopedCaptureSize>* encoded) {
+	if (encoded == nullptr || guest_pid <= 0 || host_pid == 0) return false;
+	Capture verified {};
+	if (!ParseCaptureInternal(capture.envelope.data(), capture.envelope.size(),
+	                          &capture.envelope_sha256, &capture.self_sha256, &capture.elf_sha256,
+	                          &capture.authority_id, &verified, nullptr))
+		return false;
+	if (!SameCapture(capture, verified)) return false;
+	encoded->fill(0);
+	std::copy(kScopedMagic.begin(), kScopedMagic.end(), encoded->begin());
+	Store32Little(encoded->data() + 8, kCaptureEnvelopeVersion);
+	Store32Little(encoded->data() + 12, kScopedHeaderSize);
+	Store32Little(encoded->data() + 16, kScopedCaptureSize);
+	Store32Little(encoded->data() + 20, kCaptureEnvelopeSize);
+	Store32Little(encoded->data() + 24, static_cast<uint32_t>(guest_pid));
+	Store32Little(encoded->data() + 28, host_pid);
+	Store64Little(encoded->data() + 32, verified.authority_id);
+	std::memcpy(encoded->data() + 40, verified.envelope_sha256.data(),
+	            verified.envelope_sha256.size());
+	std::memcpy(encoded->data() + kScopedHeaderSize, verified.envelope.data(),
+	            verified.envelope.size());
+	return true;
+}
+
+bool DecodeScopedCapture(const uint8_t* data, size_t size, int expected_guest_pid,
+                         uint32_t expected_host_pid, uint64_t expected_authority_id,
+                         const Digest& expected_self_sha256, const Digest& expected_elf_sha256,
+                         Capture* capture, std::string* reason) {
+	if (capture == nullptr) {
+		return Fail(reason, "scoped capture arguments invalid");
+	}
+	*capture = {};
+	if (data == nullptr || expected_guest_pid <= 0 || expected_host_pid == 0) {
+		return Fail(reason, "scoped capture arguments invalid");
+	}
+	if (size != kScopedCaptureSize) return Fail(reason, "scoped capture wrong size");
+	if (!std::equal(kScopedMagic.begin(), kScopedMagic.end(), data))
+		return Fail(reason, "scoped capture magic mismatch");
+	if (Load32Little(data + 8) != kCaptureEnvelopeVersion ||
+	    Load32Little(data + 12) != kScopedHeaderSize ||
+	    Load32Little(data + 16) != kScopedCaptureSize ||
+	    Load32Little(data + 20) != kCaptureEnvelopeSize) {
+		return Fail(reason, "scoped capture header malformed");
+	}
+	if (Load32Little(data + 24) != static_cast<uint32_t>(expected_guest_pid) ||
+	    Load32Little(data + 28) != expected_host_pid ||
+	    Load64Little(data + 32) != expected_authority_id) {
+		return Fail(reason, "scoped capture owner mismatch");
+	}
+	Digest           envelope_sha256 {};
+	WipeObjectOnExit wipe_envelope_sha256(&envelope_sha256);
+	std::memcpy(envelope_sha256.data(), data + 40, envelope_sha256.size());
+	return ParseCaptureInternal(data + kScopedHeaderSize, kCaptureEnvelopeSize, &envelope_sha256,
+	                            &expected_self_sha256, &expected_elf_sha256, &expected_authority_id,
+	                            capture, reason);
+}
+
+bool EncodeScopedObservation(const Observation& observation, int guest_pid, uint32_t host_pid,
+                             uint64_t                                     host_birth,
+                             std::array<uint8_t, kScopedObservationSize>* encoded) {
+	if (encoded == nullptr || guest_pid <= 0 || host_pid == 0 || host_birth == 0) return false;
+	Observation verified {};
+	if (!ParseObservation(observation.encoded.data(), observation.encoded.size(),
+	                      observation.envelope_sha256, observation.image, &verified, nullptr) ||
+	    verified.encoded != observation.encoded ||
+	    verified.envelope_sha256 != observation.envelope_sha256)
+		return false;
+	encoded->fill(0);
+	std::copy(kScopedObservationMagic.begin(), kScopedObservationMagic.end(), encoded->begin());
+	Store32Little(encoded->data() + 8, 1);
+	Store32Little(encoded->data() + 12, kScopedObservationHeaderSize);
+	Store32Little(encoded->data() + 16, kScopedObservationSize);
+	Store32Little(encoded->data() + 20, kObservationSize);
+	Store32Little(encoded->data() + 24, static_cast<uint32_t>(guest_pid));
+	Store32Little(encoded->data() + 28, host_pid);
+	Store64Little(encoded->data() + 32, verified.image.authority_id);
+	std::memcpy(encoded->data() + 40, verified.envelope_sha256.data(),
+	            verified.envelope_sha256.size());
+	Store64Little(encoded->data() + 72, host_birth);
+	std::copy(verified.encoded.begin(), verified.encoded.end(),
+	          encoded->begin() + kScopedObservationHeaderSize);
+	return true;
+}
+
+bool DecodeScopedObservation(const uint8_t* data, size_t size, int expected_guest_pid,
+                             uint32_t expected_host_pid, uint64_t expected_host_birth,
+                             uint64_t expected_authority_id, const Digest& expected_self_sha256,
+                             const Digest& expected_elf_sha256,
+                             const Digest& expected_envelope_sha256, Observation* observation,
+                             std::string* reason) {
+	if (observation == nullptr) return Fail(reason, "scoped observation output unavailable");
+	*observation = {};
+	if (data == nullptr || expected_guest_pid <= 0 || expected_host_pid == 0 ||
+	    expected_host_birth == 0)
+		return Fail(reason, "scoped observation arguments invalid");
+	if (size != kScopedObservationSize) return Fail(reason, "scoped observation wrong size");
+	if (!std::equal(kScopedObservationMagic.begin(), kScopedObservationMagic.end(), data) ||
+	    Load32Little(data + 8) != 1 || Load32Little(data + 12) != kScopedObservationHeaderSize ||
+	    Load32Little(data + 16) != kScopedObservationSize ||
+	    Load32Little(data + 20) != kObservationSize) {
+		return Fail(reason, "scoped observation header malformed");
+	}
+	if (Load32Little(data + 24) != static_cast<uint32_t>(expected_guest_pid) ||
+	    Load32Little(data + 28) != expected_host_pid ||
+	    Load64Little(data + 32) != expected_authority_id ||
+	    Load64Little(data + 72) != expected_host_birth ||
+	    !std::equal(expected_envelope_sha256.begin(), expected_envelope_sha256.end(), data + 40)) {
+		return Fail(reason, "scoped observation owner mismatch");
+	}
+	ImageIdentity image {};
+	image.authority_id = expected_authority_id;
+	image.self_sha256  = expected_self_sha256;
+	image.elf_sha256   = expected_elf_sha256;
+	return ParseObservation(data + kScopedObservationHeaderSize, kObservationSize,
+	                        expected_envelope_sha256, image, observation, reason);
+}
+
 } // namespace Libs::LibKernel::AuthInfo

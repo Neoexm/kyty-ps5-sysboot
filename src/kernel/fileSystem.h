@@ -171,6 +171,15 @@ struct NativeSystemMbusState {
 	std::deque<uint8_t>     priority;
 	bool                    shutting_down = false;
 };
+struct NativeMbusReceiveQueue {
+	std::mutex                             mutex;
+	std::deque<uint8_t>                    received;
+	bool                                   closed       = false;
+	bool                                   readable     = true;
+	bool                                   tearing_down = false;
+	std::shared_ptr<NativeSystemMbusState> system;
+	std::mutex&                            GetMutex() { return system ? system->mutex : mutex; }
+};
 bool                                    IsNativeDipswDescriptor(int fd);
 int KYTY_SYSV_ABI     KernelPhyshmOpen(const char* path, int flags, uint16_t mode, int memory_type);
 int KYTY_SYSV_ABI     KernelShmUnlink(const char* path);

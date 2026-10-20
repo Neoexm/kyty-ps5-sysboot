@@ -52,6 +52,7 @@ bool MarkRforkChildExecCommitted(int pid, uint32_t host_pid, const std::string& 
 bool IsRforkChildExecCommitted(int pid);
 bool IsRforkChildContextRetired(int pid);
 bool GetRforkChildExitStatus(int pid, uint32_t* status);
+int  WaitForChild(int pid, uint32_t* status, int options, bool guest_status = false);
 void NotifyRforkChildExited(int pid, uint32_t exit_status);
 bool GetScope(std::string* scope);
 void InstallVerifiedOriginalSelf(const AuthInfo::ImageIdentity& identity);
@@ -59,10 +60,12 @@ void ClearVerifiedOriginalSelf();
 bool GetVerifiedOriginalSelfIdentity(AuthInfo::ImageIdentity* identity);
 AuthInfo::AuthorizationFacts GetCurrentAuthorizationFacts();
 bool InstallVerifiedAuthorizationObservation(const AuthInfo::Observation& observation);
+bool GetCurrentFilteredAuthInfo(AuthInfo::Record* record);
 bool InstallVerifiedAuthInfo(const AuthInfo::Capture& capture);
 bool GetVerifiedAuthInfoForImage(const AuthInfo::ImageIdentity& identity,
                                  AuthInfo::Capture*             capture);
 void ClearVerifiedAuthInfo();
+bool FindPeerByPid(int pid, PeerProcess* peer);
 bool FindPeerByHostPid(uint32_t host_pid, PeerProcess* peer);
 void SetName(const std::string& name);
 } // namespace Libs::LibKernel::Process

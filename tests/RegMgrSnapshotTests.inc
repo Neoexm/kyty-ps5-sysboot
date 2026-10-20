@@ -61,6 +61,38 @@ void CheckRegMgrSnapshot(const std::filesystem::path& root) {
   put32(globals, 8, 1);
   put32(globals, 0x50, 7);
   put32(mode_mask, 0, 4);
+  put32(rodata, 8, 4);
+  put32(rodata, 0x30, 0x7a010000);
+  rodata[0x35] = 1;
+  rodata[0x36] = 1;
+  put32(rodata, 0x38, 0);
+  put32(rodata, 0x3c, 10);
+  hw[0] = 0xfe;
+  hw[1] = 0xff;
+  put32(hw, 0xc, 0xffffffff);
+  put32(region, 0, 1);
+  std::memcpy(region.data() + 4, "JP", 3);
+  put32(region, 8, 4);
+  std::memcpy(region.data() + 12, "US", 3);
+  std::memcpy(region.data() + 0x78, "XX", 3);
+  put32(version, 0, 0x01020304);
+  put32(version, 0x24, 0x05060708);
+
+  const auto write_snapshot = [&](const std::filesystem::path& at) {
+    std::filesystem::create_directories(at);
+    const std::pair<const char*, const std::vector<uint8_t>*> files[] = {
+        {"live_regmgr_head.bin", &head},       {"live_regmgr_table.bin", &table},     {"live_regmgr_pool.bin", &pool},
+        {"live_regmgr_pool2.bin", &pool2},     {"live_regmgr_nvs_a.bin", &nvs_a},     {"live_regmgr_nvs_b.bin", &nvs_b},
+        {"live_regmgr_globals.bin", &globals}, {"live_regmgr_modemask.bin", &mode_mask}, {"live_regmgr_rodata.bin", &rodata},
+        {"live_regmgr_hw.bin", &hw},           {"live_regmgr_region.bin", &region},   {"live_regmgr_version.bin", &version}};
+    std::string manifest;
+    for (const auto& [name, bytes]: files) {
+      std::ofstream(at / name, std::ios::binary).write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+      manifest += AuthInfo::DigestHex(AuthInfo::Sha256(bytes->data(), bytes->size())) + " *" + name + "\n";
+    }
+    std::ofstream(at / "regmgr_snapshot.sha256", std::ios::binary) << manifest;
+    return AuthInfo::DigestHex(AuthInfo::Sha256(manifest.data(), manifest.size()));
+  };
   const auto use = [](const std::filesystem::path& at, const std::string& sha) {
     Check(_putenv_s(RegMgr::kSnapshotEnvironment, at.string().c_str()) == 0 && _putenv_s(RegMgr::kSnapshotSha256Environment, sha.c_str()) == 0,
           "point at the registry snapshot");
@@ -105,6 +137,26 @@ void CheckRegMgrSnapshot(const std::filesystem::path& root) {
     return answers(1, key, 4, expected);
   };
 
+  const auto captured = write_snapshot(root / "main");
+  use(root / "main", captured);
+  Process::ScopedGuestProcessPid as_caller(7300);
+  become(7300, 0x4800000000000007ull, true, true);
+
+  Check(get_int(0x7a010000) == 5, "GetInt reads a live in-row value");
+  std::memset(value, 0xcc, 4);
+  Check(answers(7, 0x7a010000, 4, 0) && std::memcmp(value, "\x09\x00\x00\x00", 4) == 0, "op 7 reads the row default");
+  Check(set_int(0x7a010000, 11, 0x800d0225) && set_int(0x7a010000, -1, 0x800d0224), "the validator table bounds SetInt");
+  Check(set_int(0x7a010000, 5, 0) && set_int(0x7a010000, 7, 0) && get_int(0x7a010000) == 7, "SetInt stores and reads back");
+
+  Check(get_int(0x7a020000) == 0x11223344, "a row without memory storage reads NVS");
+  Check(set_int(0x7a020000, 42, 0) && get_int(0x7a020000) == 42, "an NVS row keeps what was written");
+  Check(get_int(0x7a090000) == static_cast<int32_t>(0x5a5a5a5a) && static_cast<uint32_t>(*status) == 0x800d0002, "an NVS offset between the halves is refused");
+
+  Check(get_int(0x7a030000) == 1234, "a caller without row permission gets the default");
+  Check(set_int(0x7a030000, 5, 0) && get_int(0x7a030000) == 1234, "a defaulted SetInt succeeds without storing");
+
+  std::memset(value, 0xcc, 32);
+  Check(answers(4, 0x7a040000, 16, 0) && std::strcmp(reinterpret_cast<char*>(value), "hello") == 0, "GetStr copies the string");
   Check(answers(4, 0x7a040000, 8, 0x800d0208), "GetStr wants the whole row");
   std::memset(value, 0, 32);
   std::memcpy(value, "world", 6);
@@ -206,5 +258,42 @@ void CheckRegMgrSnapshot(const std::filesystem::path& root) {
   std::snprintf(first, sizeof(first), "r%08lx%08lx", GetCurrentProcessId(), static_cast<unsigned long>(GetTickCount()));
   std::snprintf(second, sizeof(second), "s%08lx%08lx", GetCurrentProcessId(), static_cast<unsigned long>(GetTickCount()));
   Check(_putenv_s("KYTY_DIAGNOSTIC_REGMGR_SESSION_STORE", "1") == 0, "enable diagnostic registry session storage");
+  scope(first);
+  Check(get_int(0x7a020000) == 0x11223344 && set_int(0x7a020000, 77, 0), "a scope starts from the capture");
+  std::memset(value, 0, 16);
+  std::memcpy(value, "recovered", 10);
+  Check(answers(3, 0x7a0a0000, 16, 0), "the diagnostic gate stores an NVS-less row in scope-shared memory");
+  {
+    Process::ScopedGuestProcessPid peer(7301);
+    become(7301, 0x4800000000000007ull, true, true);
+    std::memset(value, 0xcc, 16);
+    Check(answers(4, 0x7a0a0000, 16, 0) && std::strcmp(reinterpret_cast<char*>(value), "recovered") == 0,
+          "a peer guest process in the same scope reads the session write");
+  }
+  become(7300, 0x4800000000000007ull, true, true);
+  scope(second);
+  std::memset(value, 0xcc, 16);
+  Check(get_int(0x7a020000) == 0x11223344 && answers(4, 0x7a0a0000, 16, 0) &&
+            std::strcmp(reinterpret_cast<char*>(value), "captured") == 0,
+        "another scope does not see session writes");
+  scope(first);
+  std::memset(value, 0xcc, 16);
+  Check(get_int(0x7a020000) == 77 && answers(4, 0x7a0a0000, 16, 0) &&
+            std::strcmp(reinterpret_cast<char*>(value), "recovered") == 0,
+        "the scope keeps its own persistent and session writes");
+  scope("");
+  Check(_putenv_s("KYTY_DIAGNOSTIC_REGMGR_SESSION_STORE", "") == 0, "disable diagnostic registry session storage");
+
+  use(root / "main", std::string(64, '0'));
+  Check(unanswered(2, 0x7a010000, 4), "a capture whose manifest does not match is not used");
+  hw[1] = 3;
+  put32(hw, 0xc, 0x12345);
+  const auto fresh = write_snapshot(root / "fresh");
+  use(root / "fresh", fresh);
+  Check(get_int(0x7a020000) == 0x11223344, "pointing at another capture directory starts over");
+  Check(get_int(0x02010000) == 3 && get_int(0x02130000) == 0x12345, "0x02130000 is a whole dword");
+  Check(_putenv_s(RegMgr::kSnapshotEnvironment, "") == 0 && _putenv_s(RegMgr::kSnapshotSha256Environment, "") == 0, "clear the registry snapshot");
+  Process::ClearVerifiedOriginalSelf();
+  Check(Memory::KernelMunmap(reinterpret_cast<uint64_t>(memory), 0x4000) == OK, "release registry guest buffers");
 }
 #endif

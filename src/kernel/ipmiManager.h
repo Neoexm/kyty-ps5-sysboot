@@ -8,5 +8,6 @@
 #include <string_view>
 
 namespace Libs::LibKernel::Process {
+struct PeerProcess;
 }
 #endif

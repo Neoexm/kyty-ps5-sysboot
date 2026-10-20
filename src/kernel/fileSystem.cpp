@@ -900,6 +900,17 @@ struct DevctlSoftc {
 };
 
 
+// /dev/envelope, cdevsw K+0x2bfe5d8. Header and RSA-PSS checks (K+0xc37bb0) need only guest bytes,
+// so they run locally
+struct EnvelopeObservation {
+	AuthInfo::Digest     in_sha256;
+	uint64_t             in_size;
+	uint32_t             cid;
+	uint32_t             mkv;
+	AuthInfo::Digest     key_sha256;
+	AuthInfo::Digest     salt_sha256;
+	std::vector<uint8_t> plaintext;
+};
 
 
 static bool EnvelopeDigestMatches(std::span<const uint8_t> plaintext, const uint8_t* expected) {
@@ -911,6 +922,83 @@ static bool EnvelopeDigestMatches(std::span<const uint8_t> plaintext, const uint
 }
 
 
+#if defined(_WIN32)
+// K+0xc37d60: RSA_public_decrypt(0x180, in+0x50, em, RSA_NO_PADDING), then
+// RSA_verify_PKCS1_PSS(mhash, sha256, em, -2)
+static bool EnvelopeSignatureValid(const uint8_t* key, const std::vector<uint8_t>& in) {
+	const uint8_t* modulus   = key;
+	const uint8_t* exponent  = key + 0x180;
+	const uint8_t* signature = in.data() + 0x50;
+	size_t         skip      = 0;
+	while (skip < 0x180 && exponent[skip] == 0)
+		skip++;
+	// short modulus fails flen > RSA_size, e >= n BAD_E_VALUE, sig >= n DATA_TOO_LARGE_FOR_MODULUS
+	if (modulus[0] == 0 || skip == 0x180 || std::memcmp(modulus, exponent, 0x180) <= 0 ||
+	    std::memcmp(signature, modulus, 0x180) >= 0)
+		return false;
+	int ms_bits = 7;
+	while (((modulus[0] >> ms_bits) & 1) == 0)
+		ms_bits--;
+	std::vector<uint8_t> blob(sizeof(BCRYPT_RSAKEY_BLOB) + (0x180 - skip) + 0x180);
+	auto*                header = reinterpret_cast<BCRYPT_RSAKEY_BLOB*>(blob.data());
+	header->Magic               = BCRYPT_RSAPUBLIC_MAGIC;
+	header->BitLength           = 0x17f * 8 + ms_bits + 1;
+	header->cbPublicExp         = static_cast<ULONG>(0x180 - skip);
+	header->cbModulus           = 0x180;
+	std::memcpy(blob.data() + sizeof(BCRYPT_RSAKEY_BLOB), exponent + skip, 0x180 - skip);
+	std::memcpy(blob.data() + sizeof(BCRYPT_RSAKEY_BLOB) + (0x180 - skip), modulus, 0x180);
+	std::array<uint8_t, 0x180> em {};
+	BCRYPT_ALG_HANDLE          algorithm = nullptr;
+	BCRYPT_KEY_HANDLE          handle    = nullptr;
+	ULONG                      written   = 0;
+	const bool                 raw =
+	    BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_RSA_ALGORITHM, nullptr, 0) >= 0 &&
+	    BCryptImportKeyPair(algorithm, nullptr, BCRYPT_RSAPUBLIC_BLOB, &handle, blob.data(),
+		                    static_cast<ULONG>(blob.size()), 0) >= 0 &&
+	    BCryptEncrypt(handle, const_cast<PUCHAR>(signature), 0x180, nullptr, nullptr, 0, em.data(),
+		              static_cast<ULONG>(em.size()), &written, BCRYPT_PAD_NONE) >= 0 &&
+	    written == em.size();
+	if (handle != nullptr) BCryptDestroyKey(handle);
+	if (algorithm != nullptr) BCryptCloseAlgorithmProvider(algorithm, 0);
+	if (!raw) return false;
+
+	const uint8_t* encoded = em.data();
+	size_t         length  = em.size();
+	if ((encoded[0] & (0xff << ms_bits)) != 0) return false;
+	if (ms_bits == 0) {
+		encoded++;
+		length--;
+	}
+	if (length < 32 + 2 || encoded[length - 1] != 0xbc) return false;
+	const size_t         db_length = length - 32 - 1;
+	const uint8_t*       h         = encoded + db_length;
+	std::vector<uint8_t> db(db_length);
+	for (uint32_t counter = 0; counter * 32 < db_length; counter++) {
+		uint8_t seed[36];
+		std::memcpy(seed, h, 32);
+		seed[32]        = static_cast<uint8_t>(counter >> 24);
+		seed[33]        = static_cast<uint8_t>(counter >> 16);
+		seed[34]        = static_cast<uint8_t>(counter >> 8);
+		seed[35]        = static_cast<uint8_t>(counter);
+		const auto mask = AuthInfo::Sha256(seed, sizeof(seed));
+		for (size_t i = counter * 32; i < db_length && i < counter * 32 + 32; i++)
+			db[i] = mask[i - counter * 32] ^ encoded[i];
+	}
+	if (ms_bits != 0) db[0] &= static_cast<uint8_t>(0xff >> (8 - ms_bits));
+	size_t i = 0;
+	while (db[i] == 0 && i < db_length - 1)
+		i++;
+	if (db[i++] != 0x01) return false;
+
+	std::vector<uint8_t> signed_bytes(in);
+	std::fill_n(signed_bytes.begin() + 0x50, 0x180, 0);
+	const auto           mhash = AuthInfo::Sha256(signed_bytes.data(), signed_bytes.size());
+	std::vector<uint8_t> message(8 + 32 + (db_length - i));
+	std::memcpy(message.data() + 8, mhash.data(), 32);
+	std::memcpy(message.data() + 40, db.data() + i, db_length - i);
+	return std::memcmp(AuthInfo::Sha256(message.data(), message.size()).data(), h, 32) == 0;
+}
+#endif
 
 struct NativeDceEnvelope;
 
@@ -997,6 +1085,7 @@ struct File {
 	std::shared_ptr<Memory::AnonymousSharedMemory> anonymous_shared;
 	std::shared_ptr<GuestPipe>                     socket_send;
 	std::shared_ptr<GuestSocketReadSource>         socket_read_source;
+	std::shared_ptr<NativeMbusReceiveQueue>        native_mbus_receive;
 	std::shared_ptr<SectorBacking>                 sector_backing;
 	std::shared_ptr<Tmpfs::Handle>                 tmpfs;
 	std::shared_ptr<ExfatMount::Handle>            exfat;
@@ -2586,6 +2675,85 @@ static bool SamePsmShellUiFile(const std::filesystem::path& left,
 }
 #endif
 
+static bool AcquirePsmShellUiApplicationLease(size_t slot, const std::filesystem::path& selected,
+                                              uint64_t expected_size, const char* expected_sha256,
+                                              const char** failure) {
+	if (failure != nullptr) *failure = "invalid_pin";
+	AuthInfo::Digest expected {};
+	if (slot >= g_psm_shellui_application_leases.size() || selected.empty() ||
+	    !selected.is_absolute() || !AuthInfo::ParseDigestHex(expected_sha256, &expected) ||
+	    expected_size == 0 || expected_size > UINT32_MAX)
+		return false;
+
+	std::vector<uint8_t> bytes(static_cast<size_t>(expected_size));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const HANDLE handle =
+	    CreateFileW(selected.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+		            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		if (failure != nullptr) *failure = "open";
+		return false;
+	}
+	LARGE_INTEGER size {};
+	DWORD         actual = 0;
+	const bool    read =
+	    GetFileSizeEx(handle, &size) && size.QuadPart >= 0 &&
+	    static_cast<uint64_t>(size.QuadPart) == expected_size &&
+	    ReadFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &actual, nullptr) &&
+	    actual == bytes.size();
+	if (!read) {
+		if (failure != nullptr)
+			*failure = size.QuadPart >= 0 && static_cast<uint64_t>(size.QuadPart) != expected_size
+			               ? "size"
+			               : "read";
+		CloseHandle(handle);
+		return false;
+	}
+#else
+	Common::File input;
+	if (!input.Open(selected, Common::File::Mode::Read)) {
+		if (failure != nullptr) *failure = "open";
+		return false;
+	}
+	uint32_t        actual = 0;
+	std::error_code read_error;
+	input.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &actual, &read_error);
+	if (read_error || actual != bytes.size() || input.Size() != expected_size) {
+		if (failure != nullptr) *failure = "size_or_read";
+		return false;
+	}
+#endif
+	const auto digest = AuthInfo::Sha256(bytes.data(), bytes.size());
+	if (digest != expected) {
+		if (failure != nullptr) *failure = "hash";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		CloseHandle(handle);
+#endif
+		return false;
+	}
+
+	std::lock_guard lock(g_psm_shellui_application_lease_mutex);
+	auto&           lease = g_psm_shellui_application_leases[slot];
+	if (lease.active) {
+		bool same = lease.sha256 == digest && lease.bytes.size() == bytes.size();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		same = same && SamePsmShellUiFile(lease.handle, handle);
+		CloseHandle(handle);
+#else
+		same = same && SamePsmShellUiFile(lease.source, selected);
+#endif
+		if (!same && failure != nullptr) *failure = "identity_changed";
+		return same;
+	}
+	lease.source = selected;
+	lease.bytes  = std::move(bytes);
+	lease.sha256 = digest;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	lease.handle = handle;
+#endif
+	lease.active = true;
+	return true;
+}
 
 static void ReleasePsmShellUiApplicationLeases() {
 	std::lock_guard lock(g_psm_shellui_application_lease_mutex);
@@ -2602,6 +2770,73 @@ static void ReleasePsmShellUiApplicationLeases() {
 }
 
 
+static std::filesystem::path ResolvePsmShellUiApplicationPath(const std::string& mounted_name,
+                                                              bool*              matched) {
+	if (matched != nullptr) *matched = false;
+	bool        exact = false;
+	const auto* route = ClassifyPsmShellUiApplicationRoute(mounted_name, &exact);
+	if (route == nullptr) return {};
+#if defined(KYTY_PSM_SHELLUI_APPLICATION_ROUTE_TESTS)
+	const bool test_route = std::getenv("KYTY_TEST_PSM_SHELLUI_APPLICATION_ROUTE") != nullptr;
+#else
+	constexpr bool test_route = false;
+#endif
+	std::filesystem::path app0_dir;
+	const bool target_package = Process::ResolveExecChildApp0PackageTarget("NPXS40087", &app0_dir);
+	if (!test_route && !target_package) return {};
+	if (matched != nullptr) *matched = true;
+	static std::atomic_uint32_t accepted {0};
+	static std::atomic_uint32_t rejected {0};
+	const auto                  reject = [&](const char* reason) {
+		if (rejected.fetch_add(1) < 12) {
+			LOGF("FIRST_FRAME_AUDIT PSM_SHELLUI_APPLICATION_MAP guest=%s result=rejected "
+			     "reason=%s\n",
+			     mounted_name.c_str(), reason);
+		}
+		return std::filesystem::path {};
+	};
+	if (!exact) return reject("alias");
+	if (!test_route) {
+		std::filesystem::path verified_app0_dir;
+		if (!Process::ResolveExecChildApp0Package("NPXS40087", &verified_app0_dir) ||
+		    verified_app0_dir != app0_dir)
+			return reject("package_identity");
+		const char* package_failure = nullptr;
+		if (!AcquirePsmShellUiApplicationLease(
+		        kPsmShellUiPackageSelfLease, app0_dir / "psm" / "Application" / "app.exe.sprx",
+		        27697, "c24e8d00cdd8dd5d5938fd9f5b8b2b5ba3eb29e837e45c6d1b273a0ef99b8268",
+		        &package_failure)) {
+			return reject(package_failure != nullptr ? package_failure : "package_self");
+		}
+	}
+	const char*           source = std::getenv(route->source_environment);
+	const char*           pin    = std::getenv(route->sha256_environment);
+	AuthInfo::Digest      expected {};
+	AuthInfo::Digest      production_expected {};
+	std::filesystem::path selected;
+	const char*           reason = "environment";
+	bool valid = source != nullptr && source[0] != '\0' && pin != nullptr &&
+	             AuthInfo::ParseDigestHex(pin, &expected) &&
+	             AuthInfo::ParseDigestHex(route->expected_sha256, &production_expected) &&
+	             (test_route || expected == production_expected);
+	if (valid) {
+		selected        = std::filesystem::path(source);
+		const auto slot = static_cast<size_t>(route - kPsmShellUiApplicationRoutes);
+		valid =
+		    AcquirePsmShellUiApplicationLease(slot, selected, route->expected_size,
+			                                  test_route ? pin : route->expected_sha256, &reason);
+	}
+	if (!valid) return reject(reason);
+	if (accepted.fetch_add(1) < 12) {
+		LOGF("FIRST_FRAME_AUDIT PSM_SHELLUI_APPLICATION_MAP guest=%s source=%s bytes=%" PRIu64
+		     " sha256=%s package_self_sha256=%s read_only=1 result=verified\n",
+		     mounted_name.c_str(), EscapeLogPath(selected).c_str(), route->expected_size,
+		     test_route ? pin : route->expected_sha256,
+		     test_route ? "test_fixture"
+		                : "c24e8d00cdd8dd5d5938fd9f5b8b2b5ba3eb29e837e45c6d1b273a0ef99b8268");
+	}
+	return selected;
+}
 
 bool OpenPsmShellUiApplicationSnapshot(const std::string& guest_path, Common::File* file) {
 	if (file == nullptr || !file->IsInvalid()) return false;
@@ -2740,6 +2975,16 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 #endif
 
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
+	if (mounted_name.starts_with('/') && ValidateMountedTraversal(mounted_name) != OK) return {};
+	std::filesystem::path exec_image;
+	if (Process::ResolveExecChildImagePath(mounted_name, &exec_image)) return exec_image;
+	bool shellui_application = false;
+	auto shellui_application_path =
+	    ResolvePsmShellUiApplicationPath(mounted_name, &shellui_application);
+	if (shellui_application) return shellui_application_path;
+	if (Tmpfs::Contains(mounted_name) || ExfatMount::Contains(mounted_name) ||
+	    BfsMount::Contains(mounted_name) || DirectoryPassthrough::Contains(mounted_name))
+		return {};
 	Common::LockGuard lock(m_mutex);
 	// PSM's Mono loads /common_ex/lib/mono/2.1/<assembly>.dll.sprx, but the AOT ELF is at
 	// /system_ex/common_ex/lib/<assembly>.dll.sprx
@@ -4713,6 +4958,71 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		LOGF_COLOR(Log::Color::Green, "\tOpen device: %s, [ok]\n",
 		           Common::PathToString(file->real_name).c_str());
 
+		return descriptor;
+	}
+	// d_open (K+0xc38400) only tests caps bit 62 and keeps no per-open state.
+	if (!directory && file->name == "/dev/envelope") {
+		const auto         facts      = Process::GetCurrentAuthorizationFacts();
+		constexpr uint64_t capability = uint64_t {1} << 62;
+		if ((facts.known_capability0 & facts.capability0 & capability) == 0) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EPERM;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::Envelope;
+		file->opened    = true;
+		LOGF("SBL_ENVELOPE_OPEN guest_pid=%d fd=%d flags=0x%x\n", Process::GetPid(), descriptor,
+		     flags);
+		return descriptor;
+	}
+	// libVideoOut opens this before registering backend-0 (SysAv 0x464680)
+	if (!directory && file->name == "/dev/dce" &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr) {
+		if (flags != 2 || mode != 0 || !VideoOut::VideoOutIsInitialized()) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENODEV;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::NativeDce;
+		file->opened    = true;
+		LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_DESCRIPTOR fd=%d"
+		     " linked_to_VideoOut_presenter\n",
+		     descriptor);
+		return descriptor;
+	}
+	// SysAv 0x4766F2/0x476744/0x47678C, before its 36 MiB splash allocation
+	if (!directory && std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr &&
+	    (file->name == "/dev/dmem0" || file->name == "/dev/dmem1" || file->name == "/dev/dmem2")) {
+		if (flags != 2 || mode != 0) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::NativeDmem;
+		file->opened    = true;
+		LOGF("FIRST_FRAME_AUDIT SYSAV_DMEM_DESCRIPTOR fd=%d path=%s"
+		     " backing=direct_memory\n",
+		     descriptor, file->name.c_str());
+		return descriptor;
+	}
+	if (!directory && file->name == "/dev/mbus" &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr) {
+		const auto         facts      = Process::GetCurrentAuthorizationFacts();
+		constexpr uint64_t capability = uint64_t {1} << 62;
+		if ((facts.known_capability0 & facts.capability0 & capability) == 0) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EPERM;
+		}
+		file->real_name                     = file->name;
+		file->special                       = SpecialFile::NativeSystemMbus;
+		file->native_mbus_receive           = std::make_shared<NativeMbusReceiveQueue>();
+		file->native_mbus_receive->system   = g_native_system_mbus;
+		file->native_mbus_receive->readable = file->readable;
+		file->opened                        = true;
+		LOGF("SYSTEM_MBUS_OPEN guest_pid=%d fd=%d flags=0x%x capability62_known=1 capability62=1"
+		     " shared_system_queue=1\n",
+		     Process::GetPid(), descriptor, flags);
+		Log::Flush();
 		return descriptor;
 	}
 	if (!directory && A53StorageEnabled() && file->name == "/dev/bfs/ctl") {
