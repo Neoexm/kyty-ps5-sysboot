@@ -2090,7 +2090,20 @@ static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
 
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
-
+	const int guest_pid = Process::GetPid();
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr &&
+	    Process::IsTrackedRforkChild(guest_pid) && PthreadSelfOrNull() != nullptr) {
+		LOGF("SYSCORE_GUEST_CHILD_KERNEL_EXIT"
+		     " guest_pid=%d exit_code=%d"
+		     " terminating_only_child_thread"
+		     " parent_and_other_guest_threads_preserved\n",
+		     guest_pid, code);
+		PthreadExit(reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<uint32_t>(code))));
+		EXIT("guest child kernel exit unexpectedly returned\n");
+	}
+	if (Process::IsExecChild()) {
+		Process::RecordExecChildExitStatus((static_cast<uint32_t>(code) & 0xffu) << 8u);
+	}
 	::exit(code);
 }
 
