@@ -5311,6 +5311,21 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		libc->process_owned = true;
 	}
 	RelocateAll();
+	Libs::LibKernel::Process::MarkExecChildStartupStage(9);
+	Common::HostException::PrepareUnhandledFaultProvenance(Libs::LibKernel::Process::GetPid());
+	if (std::getenv("KYTY_DIAGNOSTIC_NPCOMMON_NATIVE_TRACE") != nullptr) {
+		for (const auto* module: m_needed_modules) {
+			if (module->file_name.filename() == "libSceNpCommon.sprx") {
+				Libs::NpCommon::SetDiagnosticNativeEntries(module->base_vaddr + 0x3b70u,
+				                                           module->base_vaddr + 0x4080u,
+				                                           module->base_vaddr + 0x3f60u);
+				break;
+			}
+		}
+	}
+	if (!m_needed_modules.empty()) {
+		WriteUnresolvedSymbols();
+	}
 
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
