@@ -139,6 +139,7 @@ struct Program {
 	uint64_t                     base_size_aligned = 0;
 	uint64_t                     mapped_size       = 0;
 	uint64_t instruction_trampoline_size = 0;
+	std::vector<uint32_t>           host_exception_code_tokens;
 	std::vector<uint64_t>           original_ud2_sites;
 	std::unique_ptr<SymbolDatabase> export_symbols;
 	std::unique_ptr<SymbolDatabase> import_symbols;
@@ -229,6 +230,7 @@ private:
 	std::vector<Program*>           m_programs;
 	std::vector<Program*>           m_needed_modules;
 	std::vector<int32_t>            m_module_start_order;
+	bool                            m_stopping_all_modules           = false;
 	Program*                        m_shellui_npcommon_pool_provider = nullptr;
 	uint64_t                        m_shellui_npcommon_pool_release  = 0;
 	bool                            m_shellui_npcommon_pool_owned    = false;

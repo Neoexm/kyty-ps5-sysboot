@@ -279,6 +279,7 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 
 #endif
 
+
 bool InstallHandler(Handler handler) {
 	if (handler == nullptr) {
 		return false;

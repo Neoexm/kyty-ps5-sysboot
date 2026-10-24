@@ -129,6 +129,14 @@ struct Context {
 		return true;
 	}
 };
+inline Context& GetContext() {
+	static Context context;
+	return context;
+}
+inline std::mutex& GetContextMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
 class Lock {
 public:
 	explicit Lock(HANDLE mutex): m_mutex(mutex) {
@@ -147,6 +155,48 @@ private:
 	bool   m_locked = false;
 };
 } // namespace Detail
+inline uint64_t Publish(const State& input) {
+	std::lock_guard context_lock(Detail::GetContextMutex());
+	auto&           context = Detail::GetContext();
+	if (!context.Open(Detail::Scope())) return 0;
+	Detail::Lock lock(context.mutex);
+	if (!lock.Locked()) return 0;
+	const auto sequence = ++context.state->sequence;
+	auto&      record   = context.state->records[(sequence - 1) % Detail::CAPACITY];
+	record.state        = input;
+	record.sequence     = sequence;
+	return sequence;
+}
+inline size_t Read(Reader* reader, State* output, size_t capacity) {
+	if (reader == nullptr || output == nullptr || capacity == 0) return 0;
+	std::lock_guard context_lock(Detail::GetContextMutex());
+	auto&           context = Detail::GetContext();
+	if (!context.Open(Detail::Scope())) return 0;
+	Detail::Lock lock(context.mutex);
+	if (!lock.Locked()) return 0;
+
+	const auto latest = context.state->sequence;
+	if (!reader->attached) {
+		reader->attached = true;
+		reader->sequence = latest;
+		if (latest == 0) return 0;
+		const auto& record = context.state->records[(latest - 1) % Detail::CAPACITY];
+		if (record.sequence != latest) return 0;
+		output[0] = record.state;
+		return 1;
+	}
+	if (reader->sequence >= latest) return 0;
+	auto next = reader->sequence + 1;
+	if (latest - next + 1 > Detail::CAPACITY) next = latest - Detail::CAPACITY + 1;
+
+	size_t count = 0;
+	while (next <= latest && count < capacity) {
+		const auto& record = context.state->records[(next - 1) % Detail::CAPACITY];
+		if (record.sequence == next) output[count++] = record.state;
+		reader->sequence = next++;
+	}
+	return count;
+}
 #else
 #endif
 } // namespace Libs::Controller::HostInputShared

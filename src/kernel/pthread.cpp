@@ -3123,6 +3123,14 @@ void PthreadSetSignalMask(Pthread thread, PthreadSignalMask mask) {
 	words[0].store(mask.words[0], std::memory_order_release);
 	words[1].store(mask.words[1], std::memory_order_release);
 }
+bool PthreadIsSignalBlocked(Pthread thread, int signum) {
+	if (signum < 1 || signum > 128) {
+		return false;
+	}
+	auto*      words = thread != nullptr ? thread->blocked_signal_mask : g_unattached_signal_mask;
+	const auto bit   = static_cast<unsigned>(signum - 1);
+	return (words[bit / 64].load(std::memory_order_acquire) & (1ull << (bit % 64))) != 0;
+}
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Raise a host signal on another guest thread.
 bool PthreadKillHost(Pthread thread, int host_signal) {

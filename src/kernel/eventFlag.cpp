@@ -3,58 +3,109 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
-#include "common/stringUtils.h"
+#include "common/singleton.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/process.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/runtimeLinker.h"
+
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Libs::LibKernel::EventFlag {
 
 LIB_NAME("libkernel", "libkernel");
 
-class KernelEventFlagPrivate {
-public:
-	enum class Result { Ok, AlreadyWaiting, TimedOut, Canceled, Deleted };
+struct ScopeEventFlags {
+	static constexpr uint32_t MaxFlags   = 128;
+	static constexpr uint32_t MaxWaiters = 64;
+	static constexpr uint64_t Signature  = 0x325646455954594bull;
 
-	enum class ClearMode { None, All, Bits };
+	struct Flag {
+		char     name[32];
+		uint64_t generation;
+		uint64_t creator_birth;
+		uint32_t creator;
+		bool     linked;
+		bool     deleted;
+		bool     single;
+		uint32_t canceled;
+		uint64_t bits;
+		uint64_t waiters;
+	};
 
-	enum class WaitMode { And, Or };
+	uint64_t signature;
+	uint64_t next_generation;
+	Flag     flags[MaxFlags];
+};
 
-	KernelEventFlagPrivate(const std::string& name, bool single, bool /*fifo*/, uint64_t bits)
-	    : m_name(name), m_single_thread(single), m_bits(bits) {}
-	virtual ~KernelEventFlagPrivate();
-
-	KYTY_CLASS_NO_COPY(KernelEventFlagPrivate);
-
-	void   Set(uint64_t bits);
-	void   Clear(uint64_t bits);
-	void   Cancel(uint64_t bits, int* num_waiting_threads);
-	Result Wait(uint64_t bits, WaitMode wait_mode, ClearMode clear_mode, uint64_t* result,
-	            uint32_t* ptr_micros);
-
-	Result Poll(uint64_t bits, WaitMode wait_mode, ClearMode clear_mode, uint64_t* result) {
-		uint32_t micros = 0;
-		return Wait(bits, wait_mode, clear_mode, result, &micros);
+struct ScopeEventFlagContext {
+	std::string      name;
+	ScopeEventFlags* table = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HANDLE mutex   = nullptr;
+	HANDLE section = nullptr;
+	~ScopeEventFlagContext() {
+		if (table != nullptr) UnmapViewOfFile(table);
+		if (section != nullptr) CloseHandle(section);
+		if (mutex != nullptr) CloseHandle(mutex);
 	}
+#endif
+};
+class KernelEventFlagState {
+public:
+	enum class Result { Ok, AlreadyWaiting, TimedOut, Canceled, Deleted, NoSpace, Failed };
+	enum class ClearMode { None, All, Bits };
+	enum class WaitMode { And, Or };
+	enum class Operation { Set, Clear, Cancel, Delete, Unlink };
+
+	KernelEventFlagState(std::string name, bool single, uint64_t bits)
+	    : name(std::move(name)), single(single), bits(bits) {}
+
+	Result Wait(uint64_t wanted, WaitMode mode, ClearMode clear, uint64_t* result,
+	            uint32_t* micros);
+	int    Change(Operation operation, uint64_t pattern, int* waiting, uint64_t caller);
+	void   Trace(Operation operation, uint64_t before, uint64_t after, uint64_t caller);
+
+	std::string                            name;
+	std::string                            key;
+	bool                                   single;
+	uint64_t                               generation = 0;
+	std::shared_ptr<ScopeEventFlagContext> scope;
+	ScopeEventFlags::Flag*                 shared    = nullptr;
+	bool                                   synthetic = false;
 
 private:
-	enum class Status { Set, Canceled, Deleted };
-
-	Common::Mutex   m_mutex;
-	Common::CondVar m_cond_var;
-	Status          m_status          = Status::Set;
-	int             m_waiting_threads = 0;
-	std::string     m_name;
-	bool            m_single_thread = false;
-	uint64_t        m_bits          = 0;
+	Common::Mutex           mutex;
+	Common::CondVar         cond;
+	bool                    deleted  = false;
+	uint32_t                canceled = 0;
+	int                     waiters  = 0;
+	uint64_t                bits;
+	std::array<uint32_t, 5> trace_counts {};
 };
 
 namespace {
 
-struct EventFlagWaitMode {
-	KernelEventFlagPrivate::WaitMode  wait  = KernelEventFlagPrivate::WaitMode::And;
-	KernelEventFlagPrivate::ClearMode clear = KernelEventFlagPrivate::ClearMode::None;
+struct EventFlagEntry {
+	std::shared_ptr<KernelEventFlagState> flag;
+	bool                                  creator = false;
 };
 
 EventFlagWaitMode DecodeEventFlagWaitMode(uint32_t wait_mode) {
@@ -78,24 +129,21 @@ EventFlagWaitMode DecodeEventFlagWaitMode(uint32_t wait_mode) {
 
 } // namespace
 
-KernelEventFlagPrivate::~KernelEventFlagPrivate() {
-	Common::LockGuard lock(m_mutex);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_status = Status::Deleted;
-
-	m_cond_var.SignalAll();
-
-	while (m_waiting_threads > 0) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
+void KernelEventFlagState::Trace(Operation operation, uint64_t before, uint64_t after,
+                                 uint64_t caller) {
+	const auto index = static_cast<size_t>(operation);
+	if (trace_counts[index] >= 256 ||
+	    (before == after && trace_counts[index] >= 4 && operation != Operation::Delete &&
+	     operation != Operation::Unlink))
+		return;
+	++trace_counts[index];
+	const char* names[] = {"set", "clear", "cancel", "delete", "namespace_unlink"};
+	LOGF("NATIVE_EVENTFLAG_CHANGE source=common operation=%s name=%s generation=%llu"
+	     " scope=%s pid=%d caller=0x%016llx before=0x%016llx after=0x%016llx\n",
+	     names[index], name.c_str(), static_cast<unsigned long long>(generation),
+	     scope != nullptr ? scope->name.c_str() : "local", Process::GetPid(),
+	     static_cast<unsigned long long>(caller), static_cast<unsigned long long>(before),
+	     static_cast<unsigned long long>(after));
 }
 
 KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitMode wait_mode,

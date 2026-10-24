@@ -661,6 +661,84 @@ int KernelSigprocmask(int how, const void* set, void* oset) {
 static KYTY_SYSV_ABI int sigprocmask(int how, const void* set, void* oset) {
 	return POSIX_CALL(KernelSigprocmask(how, set, oset));
 }
+struct GuestSigaction {
+	uint64_t handler = 0;
+	uint32_t flags   = 0;
+	uint32_t mask[4] {};
+	uint32_t padding = 0;
+};
+static std::mutex                      g_guest_sigaction_mutex;
+static std::array<GuestSigaction, 129> g_guest_sigactions;
+static std::atomic_uint32_t            g_guest_sigaction_calls {0};
+static bool ReadGuestSigaction(const GuestSigaction* source, GuestSigaction* action) {
+	if (Memory::CopyFromGuest(action, source, sizeof(*action))) {
+		return true;
+	}
+	if (!CanAccessCurrentThreadStack(source, sizeof(*action), false)) {
+		return false;
+	}
+	std::memcpy(action, source, sizeof(*action));
+	return true;
+}
+static bool WriteGuestSigaction(GuestSigaction* destination, const GuestSigaction& action) {
+	if (Memory::CopyToGuest(destination, &action, sizeof(action))) {
+		return true;
+	}
+	if (!CanAccessCurrentThreadStack(destination, sizeof(action), true)) {
+		return false;
+	}
+	std::memcpy(destination, &action, sizeof(action));
+	return true;
+}
+static int GuestSigactionError(int error) {
+	*Posix::GetErrorAddr() = error;
+	return -1;
+}
+static bool IsValidGuestSigaction(int signum, const GuestSigaction& action) {
+	constexpr uint32_t allowed_flags = 0x7f;
+	if (action.handler != 0 && action.handler != 1 && (action.flags & ~allowed_flags) != 0) {
+		return false;
+	}
+	if ((signum == 9 || signum == 17) && action.handler != 0) {
+		return false;
+	}
+	return true;
+}
+static int KYTY_SYSV_ABI GuestSigactionCall(int signum, const GuestSigaction* requested,
+                                            GuestSigaction* previous) {
+	if (signum < 1 || signum > 128 || signum == 32) {
+		return GuestSigactionError(Posix::POSIX_EINVAL);
+	}
+
+	GuestSigaction requested_copy {};
+	if (requested != nullptr && !ReadGuestSigaction(requested, &requested_copy)) {
+		return GuestSigactionError(Posix::POSIX_EFAULT);
+	}
+	if (requested != nullptr && !IsValidGuestSigaction(signum, requested_copy)) {
+		return GuestSigactionError(Posix::POSIX_EINVAL);
+	}
+
+	GuestSigaction previous_copy {};
+	{
+		std::lock_guard lock(g_guest_sigaction_mutex);
+		previous_copy = g_guest_sigactions[signum];
+		if (requested != nullptr) {
+			g_guest_sigactions[signum] = requested_copy;
+		}
+	}
+
+	if (previous != nullptr && !WriteGuestSigaction(previous, previous_copy)) {
+		return GuestSigactionError(Posix::POSIX_EFAULT);
+	}
+
+	const auto call = g_guest_sigaction_calls.fetch_add(1, std::memory_order_relaxed);
+	if (call < 18 || (call % 256) == 0) {
+		LOGF("FIRST_FRAME_AUDIT GUEST_SIGACTION_STATE signal=%d set=%d query=%d"
+		     " delivery=unmodeled\n",
+		     signum, requested != nullptr, previous != nullptr);
+	}
+	return 0;
+}
 static bool IsAllowedExceptionSignal(int signum) {
 	constexpr int POSIX_SIGHUP  = 1;
 	constexpr int POSIX_SIGILL  = 4;
@@ -1157,7 +1235,7 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 	auto* host_ctx = static_cast<ucontext_t*>(native_context);
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
+		if (PthreadIsSignalBlocked(current, signum) || !PthreadTakePendingSignal(current, signum)) {
 			continue;
 		}
 
@@ -1218,7 +1296,7 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
 	auto*      thread = static_cast<Pthread>(arg1);
 	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
-	if (!PthreadTakePendingSignal(thread, signum)) {
+	if (PthreadIsSignalBlocked(thread, signum) || !PthreadTakePendingSignal(thread, signum)) {
 		return;
 	}
 
@@ -1253,7 +1331,7 @@ void KernelDispatchPendingSignalForCurrentThread() {
 	}
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!PthreadTakePendingSignal(current, signum)) {
+		if (PthreadIsSignalBlocked(current, signum) || !PthreadTakePendingSignal(current, signum)) {
 			continue;
 		}
 
@@ -1308,6 +1386,10 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 
 	auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 	if (handler != nullptr) {
+		if (PthreadIsSignalBlocked(thread, signum)) {
+			PthreadQueuePendingSignal(thread, signum);
+			return OK;
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const auto target_thread_id       = PthreadGetHostThreadId(thread);
 		auto*      nt_queue_apc_thread_ex = GetNtQueueApcThreadEx();
@@ -2084,8 +2166,27 @@ static void KYTY_SYSV_ABI KernelDebugRaiseExceptionOnReleaseMode(int /*c1*/, int
 	PRINT_NAME();
 }
 
-static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
+static int KYTY_SYSV_ABI KernelIpmiManagerCall(uint32_t command, int32_t client_id, int32_t* result,
+                                               void* args, size_t args_size, uint64_t magic) {
 	PRINT_NAME();
+}
+static int32_t KYTY_SYSV_ABI KernelDebugRaiseException(int32_t code, const void* context) {
+	PRINT_NAME();
+	if (std::getenv("KYTY_DIAGNOSTIC_SHELLUI_EXCEPTION_ORIGIN") != nullptr) {
+		const auto caller  = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		auto*      linker  = Common::Singleton<Loader::RuntimeLinker>::Instance();
+		auto*      program = linker->FindProgramByAddr(caller);
+		const auto module  = program == nullptr
+		                         ? std::string("unknown")
+		                         : Common::PathToString(program->file_name.filename());
+		const auto rva     = program == nullptr ? 0 : caller - program->base_vaddr;
+		LOGF("SHELLUI_DEBUG_RAISE guest_pid=%d guest_tid=%d code=0x%08x context_null=%u"
+		     " caller_module=%s caller_rva=0x%016" PRIx64 " provider=hle_libkernel result=%s\n",
+		     Process::GetPid(), PthreadGetthreadid(), static_cast<uint32_t>(code),
+		     context == nullptr ? 1u : 0u, module.c_str(), rva,
+		     context == nullptr ? "operation3_unsupported" : "invalid_context");
+	}
+	return context == nullptr ? KERNEL_ERROR_ENOSYS : KERNEL_ERROR_EINVAL;
 }
 
 static void KYTY_SYSV_ABI exit(int code) {
@@ -2337,6 +2438,28 @@ int KYTY_SYSV_ABI gettimeofday(LibKernel::KernelTimeval* time, KernelTimezone* t
 	return 0;
 }
 
+struct KernelRusage {
+	LibKernel::KernelTimeval ru_utime;
+	LibKernel::KernelTimeval ru_stime;
+	int64_t                  ru_counters[14];
+};
+int KYTY_SYSV_ABI wait4(int pid, int32_t* status, int options, KernelRusage* usage) {
+	if (usage != nullptr) {
+		*GetErrorAddr() = POSIX_ENOSYS;
+		return -1;
+	}
+	if (status != nullptr && !LibKernel::Memory::CanWriteGuest(status, sizeof(*status))) {
+		*GetErrorAddr() = POSIX_EFAULT;
+		return -1;
+	}
+	const int child =
+	    LibKernel::Process::WaitForChild(pid, reinterpret_cast<uint32_t*>(status), options, true);
+	if (child < 0) {
+		*GetErrorAddr() = LibKernel::KernelToPosix(child);
+		return -1;
+	}
+	return child;
+}
 int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
                             LibKernel::KernelTimespec*       rmtp) {
 	PRINT_NAME();
@@ -3406,6 +3529,21 @@ static int BudgetErrno(const NativeKernelBridge::Reply& reply) {
 		return LibKernel::KernelToPosix(static_cast<int>(reply.value));
 	}
 	return reply.posix_errno;
+}
+int KYTY_SYSV_ABI KernelGetProcessName(int pid, char* name) {
+	PRINT_NAME();
+
+	// Ids above 99999 are thread ids, which the native wrapper (+0x15860) turns away before its
+	// thr_get_name syscall.
+	std::string process_name;
+	if (pid > 99999 || !LibKernel::Process::FindNameByPid(pid, &process_name)) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+
+	strncpy(name, process_name.c_str(), 32);
+	name[31] = '\0';
+	LOGF("\t pid = %d, name = %s\n", pid, name);
+	return OK;
 }
 int KYTY_SYSV_ABI KernelAioInitializeImpl(void* param, int32_t size) {
 	PRINT_NAME();

@@ -360,6 +360,10 @@ public:
 		EditUnlocked(start, size, [name](Range* r) { CopyVirtualRangeName(r->name, name); });
 	}
 
+	void SetOwner(uint64_t start, uint64_t size, uint64_t token) {
+		Common::LockGuard lock(m_mutex);
+		EditUnlocked(start, size, [token](Range* r) { r->owner_token = token; });
+	}
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
 
@@ -2651,6 +2655,16 @@ int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int pr
 	return KernelMapNamedFlexibleMemory(addr_in_out, len, prot, flags, "");
 }
 
+int MapOwnedFlexibleMemory(void** address, size_t len, const char* name, uint64_t* token) {
+	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+	const int rc = KernelMapNamedFlexibleMemory(address, len, 3, 0x400000, name);
+	if (rc != OK) return rc;
+	static uint64_t next_token = 0;
+	EXIT_IF(++next_token == 0);
+	g_virtual_ranges->SetOwner(reinterpret_cast<uint64_t>(*address), len, next_token);
+	*token = next_token;
+	return OK;
+}
 bool OwnsFlexibleMemory(uint64_t address, size_t len, uint64_t token) {
 	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
 	std::vector<VirtualRanges::Range>     ranges;

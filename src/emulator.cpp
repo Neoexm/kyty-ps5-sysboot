@@ -18,6 +18,7 @@
 #include "kernel/capturedDirectory.h"
 #include "kernel/execProcess.h"
 #include "kernel/memory.h"
+#include "kernel/process.h"
 #include "kernel/pthread.h"
 #include "kernel/sectorBacking.h"
 #include "kytyGitVersion.h"

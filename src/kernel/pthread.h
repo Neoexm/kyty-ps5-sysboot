@@ -122,6 +122,7 @@ struct PthreadSignalMask {
 };
 PthreadSignalMask     PthreadGetSignalMask(Pthread thread);
 void                  PthreadSetSignalMask(Pthread thread, PthreadSignalMask mask);
+bool                  PthreadIsSignalBlocked(Pthread thread, int signum);
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);

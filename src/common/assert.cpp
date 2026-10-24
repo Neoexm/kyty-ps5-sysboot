@@ -1,5 +1,6 @@
 #include "common/assert.h"
 
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
@@ -43,7 +44,9 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 }
 
 void DbgExit(int status) {
+	HostException::NoteHostExit(6, status, nullptr);
 	Subsystems::EmergencyShutdownActive();
+	Log::Flush();
 	std::fflush(nullptr);
 	std::_Exit(status);
 }

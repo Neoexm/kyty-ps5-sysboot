@@ -78,6 +78,10 @@ namespace Libs::LibKernel::FileSystem {
 
 static std::recursive_mutex g_mount_publication_mutex;
 
+static bool DiagnosticHostInputHidPadEnabled() {
+	const auto* value = std::getenv("KYTY_DIAGNOSTIC_HOST_INPUT_HID_PAD");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
 
 static std::string EscapeLogPath(const char* path) {
 	return path != nullptr ? Log::EscapeField(path) : "(null)";
@@ -341,6 +345,11 @@ enum class SpecialFile {
 
 struct LvdDevice;
 
+struct HidPadHandle {
+	bool                                        configured   = false;
+	uint32_t                                    device_class = 0;
+	::Libs::Controller::HostInputShared::Reader reader;
+};
 
 // Shared by descriptor aliases. Bounded, writers block when full.
 
@@ -1094,6 +1103,7 @@ struct File {
 	std::shared_ptr<LvdDevice>                     lvd;
 	int32_t                                        hid_next_pad_handle   = 1;
 	uint32_t                                       hid_unknown_log_count = 0;
+	std::unordered_map<int32_t, HidPadHandle>      hid_pad_handles;
 	bool                                           data_topology          = false;
 	bool                                           devfs_root             = false;
 	uint64_t                                       sector_position        = 0;
@@ -1658,6 +1668,26 @@ int FileDescriptors::CloneGuestSocketPairInto(FileDescriptors* child, int source
 	return guest_fd;
 }
 
+int DuplicateParentSocketForRdup(int parent_pid, int parent_fd) {
+	const char* configured      = std::getenv("KYTY_DIAGNOSTIC_GUEST_PID");
+	const int   expected_parent = configured == nullptr ? 100 : std::atoi(configured);
+	if ((std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") == nullptr &&
+	     std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_LIVE_RFORK") == nullptr) ||
+	    g_guest_files_override == nullptr || g_primary_files == nullptr ||
+	    parent_pid != expected_parent || !Process::IsTrackedRforkChild(Process::GetPid())) {
+		return KERNEL_ERROR_ENOSYS;
+	}
+	const int created =
+	    g_primary_files->CloneGuestSocketPairInto(g_guest_files_override, parent_fd);
+	if (created >= DESCRIPTOR_MIN) {
+		LOGF("SYSCORE_RDUP_PARENT_CHILD_SOCKET"
+		     " source_guest_pid=%d source_fd=%d"
+		     " child_guest_pid=%d child_fd=%d"
+		     " parent_pipe_shared\n",
+		     parent_pid, parent_fd, Process::GetPid(), created);
+	}
+	return created;
+}
 
 std::shared_ptr<GuestSocketReadSource> FileDescriptors::PinSocketReadSource(int fd) {
 	if (fd < DESCRIPTOR_MIN) {
@@ -5025,6 +5055,46 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		Log::Flush();
 		return descriptor;
 	}
+	if (native_sshot_path) {
+		file->real_name              = file->name;
+		file->special                = SpecialFile::NativeSshot;
+		file->native_sshot_owner_pid = Process::GetPid();
+		file->readable               = true;
+		file->writable               = true;
+		file->opened                 = true;
+		LOGF("NATIVE_SSHOT_OPEN guest_pid=%d fd=%d access=readwrite session_active=0\n",
+		     Process::GetPid(), descriptor);
+		return descriptor;
+	}
+
+	if (!directory && A53StorageEnabled() &&
+	    (file->name == "/dev/a53io" || file->name == "/dev/nsid1.ctl" ||
+	     IsA53SsdDevice(file->name))) {
+		if (trunc || append || excl || creat) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (file->name == "/dev/a53io") {
+			file->special = SpecialFile::NativeA53Io;
+		} else if (file->name == "/dev/nsid1.ctl") {
+			file->special = SpecialFile::NativeNsidCtl;
+		} else {
+			std::lock_guard lock(g_a53_controller.mutex);
+			if (!g_a53_controller.namespace_present) {
+				g_files->DeleteDescriptor(descriptor);
+				return KERNEL_ERROR_ENOENT;
+			}
+			file->special = SpecialFile::NativeSsd;
+		}
+		file->real_name = file->name;
+		file->opened    = true;
+		LOGF("A53_STORAGE_DEVICE_OPEN path=%s fd=%d flags=0x%x NON_AUTHENTIC"
+		     " emulated_controller nand_init=%d namespace=%d a53_enable=%d\n",
+		     file->name.c_str(), descriptor, flags, g_a53_controller.nand_initialized ? 1 : 0,
+		     g_a53_controller.namespace_present ? 1 : 0, g_a53_controller.a53_enabled ? 1 : 0);
+		return descriptor;
+	}
+
 	if (!directory && A53StorageEnabled() && file->name == "/dev/bfs/ctl") {
 		if (trunc || append || excl || creat) {
 			g_files->DeleteDescriptor(descriptor);
@@ -5349,6 +5419,10 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (file->special == SpecialFile::NativeSshot &&
+	    file->native_sshot_owner_pid != Process::GetPid()) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -5802,10 +5876,159 @@ static_assert(offsetof(NativeSshotRequest, value) == 0x20);
 
 
 
+struct HidPadOpenRequest {
+	int32_t  user_id;
+	uint32_t type;
+	uint32_t index;
+};
 
+struct HidPadHandleRequest {
+	int32_t  handle;
+	uint32_t value;
+};
 
+struct HidPadCloseRequest {
+	uint32_t type;
+	int32_t  handle;
+};
 
+struct HidPadSampleRequest {
+	uint8_t  command;
+	uint8_t  reserved01[3];
+	int32_t  handle;
+	uint64_t record_count;
+	uint32_t mode;
+	uint32_t reserved14;
+	uint64_t reserved18;
+	uint64_t device_generation;
+	uint64_t status;
+	uint64_t reserved30;
+	uint64_t reserved38;
+	uint64_t reports;
+};
 
+static int HidPadIoctl(File* file, int fd, uint64_t request, void* arg) {
+	if (!DiagnosticHostInputHidPadEnabled()) return KERNEL_ERROR_ENOTTY;
+
+	Common::LockGuard lock(file->mutex);
+	if (request == 0x800c4802u) {
+		if (arg == nullptr) return KERNEL_ERROR_EFAULT;
+		HidPadOpenRequest input {};
+		if (!Memory::CopyFromGuest(&input, arg, sizeof(input))) return KERNEL_ERROR_EFAULT;
+		if (input.user_id != -1 || input.type != 3 || input.index != 0) {
+			LOGF("HID_PAD_OPEN_REJECT guest_pid=%d fd=%d user_id=%d type=%u index=%u"
+			     " error=EINVAL NON_AUTHENTIC_INPUT_BRIDGE\n",
+			     Process::GetPid(), fd, input.user_id, input.type, input.index);
+			return KERNEL_ERROR_EINVAL;
+		}
+		const auto handle = file->hid_next_pad_handle++;
+		file->hid_pad_handles.emplace(handle, HidPadHandle {});
+		LOGF("HID_PAD_OPEN guest_pid=%d fd=%d handle=%d type=%u index=%u"
+		     " NON_AUTHENTIC_INPUT_BRIDGE\n",
+		     Process::GetPid(), fd, handle, input.type, input.index);
+		return handle;
+	}
+
+	if (request == 0x8008485bu) {
+		if (arg == nullptr) return KERNEL_ERROR_EFAULT;
+		HidPadHandleRequest input {};
+		if (!Memory::CopyFromGuest(&input, arg, sizeof(input))) return KERNEL_ERROR_EFAULT;
+		const auto found = file->hid_pad_handles.find(input.handle);
+		if (found == file->hid_pad_handles.end()) return KERNEL_ERROR_EINVAL;
+		found->second.configured   = true;
+		found->second.device_class = input.value;
+		LOGF("HID_PAD_CONFIGURE guest_pid=%d fd=%d handle=%d device_class=%u"
+		     " NON_AUTHENTIC_INPUT_BRIDGE\n",
+		     Process::GetPid(), fd, input.handle, input.value);
+		return OK;
+	}
+
+	if (request == 0x80084803u) {
+		if (arg == nullptr) return KERNEL_ERROR_EFAULT;
+		HidPadCloseRequest input {};
+		if (!Memory::CopyFromGuest(&input, arg, sizeof(input))) return KERNEL_ERROR_EFAULT;
+		if (input.handle < 1 || input.type != 3) return KERNEL_ERROR_EINVAL;
+		if (file->hid_pad_handles.erase(input.handle) == 0) return KERNEL_ERROR_EINVAL;
+		LOGF("HID_PAD_CLOSE guest_pid=%d fd=%d handle=%d NON_AUTHENTIC_INPUT_BRIDGE\n",
+		     Process::GetPid(), fd, input.handle);
+		return OK;
+	}
+
+	if (request != 0xc0484851u) {
+		if (file->hid_unknown_log_count++ < 32) {
+			if (request == 0x80184808u) {
+				std::array<uint8_t, 0x18> fields {};
+				const bool                copied =
+				    arg != nullptr && Memory::CopyFromGuest(fields.data(), arg, fields.size());
+				uint32_t first  = 0;
+				uint64_t target = 0;
+				if (copied) {
+					std::memcpy(&first, fields.data(), sizeof(first));
+					std::memcpy(&target, fields.data() + 8, sizeof(target));
+				}
+				LOGF("HID_FOCUS_UNMODELED guest_pid=%d fd=%d first=%u target=0x%" PRIx64
+				     " mode=%u copied=%u error=ENOTTY NON_AUTHENTIC_INPUT_BRIDGE\n",
+				     Process::GetPid(), fd, first, target,
+				     copied ? static_cast<uint32_t>(fields[16]) : 0u, copied ? 1u : 0u);
+			} else {
+				LOGF("HID_IOCTL_UNSUPPORTED guest_pid=%d fd=%d request=0x%08" PRIx64
+				     " arg=0x%" PRIx64 " error=ENOTTY NON_AUTHENTIC_INPUT_BRIDGE\n",
+				     Process::GetPid(), fd, request, reinterpret_cast<uint64_t>(arg));
+			}
+		}
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (arg == nullptr) return KERNEL_ERROR_EFAULT;
+	HidPadSampleRequest input {};
+	if (!Memory::CopyFromGuest(&input, arg, sizeof(input))) return KERNEL_ERROR_EFAULT;
+	const auto found = file->hid_pad_handles.find(input.handle);
+	if (input.command != 6 || input.record_count == 0 || input.record_count > 64 ||
+	    input.reports == 0 || input.device_generation == 0 || input.status == 0 ||
+	    (input.mode != 0 && input.mode != 4 && input.mode != 5) ||
+	    found == file->hid_pad_handles.end() || !found->second.configured) {
+		LOGF("HID_PAD_SAMPLE_REJECT guest_pid=%d fd=%d command=%u handle=%d count=%" PRIu64
+		     " mode=%u reports=0x%" PRIx64 " generation=0x%" PRIx64 " status=0x%" PRIx64
+		     " error=EINVAL NON_AUTHENTIC_INPUT_BRIDGE\n",
+		     Process::GetPid(), fd, static_cast<uint32_t>(input.command), input.handle,
+		     input.record_count, input.mode, input.reports, input.device_generation, input.status);
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	using SharedInput = ::Libs::Controller::HostInputShared::State;
+	std::vector<SharedInput> states(static_cast<size_t>(input.record_count));
+	const auto count = ::Libs::Controller::HostInputShared::Read(&found->second.reader,
+	                                                             states.data(), states.size());
+	if (count == 0) return 0;
+
+	constexpr size_t     RAW_REPORT_SIZE = 0xe0;
+	std::vector<uint8_t> reports(count * RAW_REPORT_SIZE);
+	const auto           base_time = ::Libs::LibKernel::KernelGetProcessTime();
+	for (size_t index = 0; index < count; ++index) {
+		auto*      report    = reports.data() + index * RAW_REPORT_SIZE;
+		const auto timestamp = base_time + index;
+		std::memcpy(report, &timestamp, sizeof(timestamp));
+		std::memcpy(report + 0x0c, &states[index].buttons, sizeof(states[index].buttons));
+		for (size_t axis = 0; axis < states[index].axes.size(); ++axis) {
+			report[0x10 + axis] =
+			    static_cast<uint8_t>(std::clamp(states[index].axes[axis], 0, 255));
+		}
+	}
+	if (!Memory::CopyToGuest(reinterpret_cast<void*>(input.reports), reports.data(),
+	                         reports.size())) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	const uint32_t device_generation = 0;
+	const uint32_t status            = 0;
+	if (!Memory::CopyToGuest(reinterpret_cast<void*>(input.device_generation), &device_generation,
+	                         sizeof(device_generation)) ||
+	    !Memory::CopyToGuest(reinterpret_cast<void*>(input.status), &status, sizeof(status))) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	LOGF("HID_PAD_SAMPLE guest_pid=%d fd=%d handle=%d count=%zu mode=%u buttons=0x%08x"
+	     " NON_AUTHENTIC_INPUT_BRIDGE\n",
+	     Process::GetPid(), fd, input.handle, count, input.mode, states[count - 1].buttons);
+	return static_cast<int>(count);
+}
 
 int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 	PRINT_NAME();
@@ -5876,6 +6099,32 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 		     " arg=0x%016" PRIx64 " error=ENOTTY\n",
 		     Process::GetPid(), d, request, reinterpret_cast<uint64_t>(arg));
 		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::Hid) return HidPadIoctl(file, d, request, arg);
+	if (file->special == SpecialFile::NativeMetadbg) return KERNEL_ERROR_ENODEV;
+	if (file->special == SpecialFile::M2Ctl) {
+		// no NVMe drive: ENODEV before copyout, which sceAutoMounterM2Exists reads as no m.2
+		if (request == 0x80283208u) {
+			LOGF("M2_CTL_SUMMARY_INFO guest_pid=%d fd=%d request=0x%08" PRIx64
+			     " error=ENODEV m2_drive_fitted=0\n",
+			     Process::GetPid(), d, request);
+			return KERNEL_ERROR_ENODEV;
+		}
+		// nvme answers ENXIO with no controller. ShellCore polls this about once a second, so not
+		// logged
+		if (request == 0x40103207u) return KERNEL_ERROR_ENXIO;
+		LOGF("M2_CTL_IOCTL_UNSUPPORTED guest_pid=%d fd=%d request=0x%08" PRIx64 " error=ENOTTY\n",
+		     Process::GetPid(), d, request);
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::NativeSystemMbus) {
+		switch (request) {
+			case 0xc0288c01u:
+			case 0xc0108c02u:
+			case 0xc1108c03u:
+			case 0xc0188c04u: return KERNEL_ERROR_ENOSYS;
+			default: return KERNEL_ERROR_EINVAL;
+		}
 	}
 	if (file->special == SpecialFile::NativeNsidCtl) {
 		if (request != 0x20003102u) return KERNEL_ERROR_ENOTTY;
@@ -6036,6 +6285,116 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 		LOGF("BFS_CTL_UNHANDLED fd=%d request=0x%08" PRIx64
 		     " dir=%u size=%u group=0x%02x nr=0x%02x result=ENOTTY\n",
 		     d, request, ioc_dir, ioc_size, ioc_group, ioc_nr);
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::NativeS3daProbe) {
+		LOGF("FIRST_FRAME_AUDIT S3DA_IOCTL_UNSUPPORTED"
+		     " fd=%d request=0x%08" PRIx64 " arg=0x%016" PRIx64 " result=ENOTTY\n",
+		     d, request, reinterpret_cast<uint64_t>(arg));
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::NativeAvDevice ||
+	    file->special == SpecialFile::NativeAvProbe) {
+		const bool native_device = file->special == SpecialFile::NativeAvDevice;
+		const auto bytes         = static_cast<size_t>((request >> 16) & 0x1fff);
+		if (native_device && bytes != 0 &&
+		    (((request & 0x80000000u) != 0 &&
+		      !NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) ||
+		     ((request & 0x40000000u) != 0 && !Memory::CanWriteGuest(arg, bytes)))) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		if (file->name == "/dev/av_control" &&
+		    (request == 0xc0089a01u || request == 0xc0089a04u || request == 0xc0089a05u ||
+		     request == 0xc0209a07u || request == 0xc0089a0du || request == 0xc0109a0eu ||
+		     request == 0xc0089a13u || request == 0xc0089a14u) &&
+		    !NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		if (file->name == "/dev/scanin" && request == 0x84b89e04u && bytes == 0x4b8 &&
+		    NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
+			uint64_t original_words[0x4b8 / sizeof(uint64_t)] {};
+			std::memcpy(original_words, arg, sizeof(original_words));
+			const uint64_t physical_start = original_words[0x240 / 8];
+			const uint64_t guest_base     = original_words[0x250 / 8];
+			const uint64_t guest_length   = original_words[0x260 / 8];
+			if (guest_base >= 0x200000000ull && guest_base <= 0x300000000ull &&
+			    guest_length == 0x6000000 && guest_base <= UINT64_MAX - guest_length &&
+			    physical_start <= INT64_MAX && (physical_start & 0x1fffffull) == 0 &&
+			    original_words[0x248 / 8] == UINT64_MAX && original_words[0x258 / 8] == 0) {
+				Memory::VirtualQueryInfo guest_mapping {};
+				if (Memory::KernelVirtualQuery(reinterpret_cast<const void*>(guest_base), 0,
+				                               &guest_mapping, sizeof(guest_mapping)) == 0 &&
+				    guest_mapping.is_committed && guest_mapping.is_direct &&
+				    guest_mapping.start <= guest_base &&
+				    guest_mapping.end >= guest_base + guest_length &&
+				    (guest_mapping.protection & 1u) != 0 &&
+				    guest_mapping.offset <= UINT64_MAX - (guest_base - guest_mapping.start) &&
+				    guest_mapping.offset + (guest_base - guest_mapping.start) == physical_start &&
+				    std::strcmp(guest_mapping.name, "SceSysAvControlScanInBuf") == 0) {
+					bool valid_buffers = true;
+					for (uint32_t i = 0; i < 72; ++i) {
+						const uint64_t address = original_words[i];
+						if (address < guest_base || address >= guest_base + guest_length ||
+						    (address & 0xff) != 0) {
+							valid_buffers = false;
+							break;
+						}
+					}
+					if (valid_buffers) {
+						Common::LockGuard scanin_lock(file->mutex);
+						if (file->native_scanin_registered) {
+							return KERNEL_ERROR_EBUSY;
+						}
+						std::copy_n(original_words, 72, file->native_scanin_buffers);
+						file->native_scanin_base       = guest_base;
+						file->native_scanin_length     = guest_length;
+						file->native_scanin_registered = true;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_SCANIN_BUFFER_MANAGER_REGISTERED"
+						     " ioctl=0x84b89e04"
+						     " buffers=72 guest_base=0x%016" PRIx64
+						     " verified_physical_offset=0x%016" PRIx64
+						     " physical_backing_size=0x%016" PRIx64 " buffer_addresses_saved\n",
+						     guest_base, physical_start, guest_length);
+						return OK;
+					}
+				}
+			}
+			uint32_t nonzero_count = 0;
+			for (uint32_t i = 0; i < std::size(original_words); ++i) {
+				if (original_words[i] != 0) {
+					if (nonzero_count < 160) {
+						LOGF("FIRST_FRAME_AUDIT SYSAV_SCANIN_SETUP_BUFMGR_WORD"
+						     " offset=0x%03x guest_value=0x%016" PRIx64 " input_only_no_init_ack\n",
+						     i * 8, original_words[i]);
+					}
+					++nonzero_count;
+				}
+			}
+			LOGF("FIRST_FRAME_AUDIT SYSAV_SCANIN_SETUP_BUFMGR_PROBE"
+			     " request=0x84b89e04 guest_bytes=%zu"
+			     " nonzero_qwords=%u\n",
+			     bytes, nonzero_count);
+		}
+		if (arg != nullptr && bytes > 0 && bytes <= 32 &&
+		    NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
+			uint64_t original_words[4] {};
+			std::memcpy(original_words, arg, bytes);
+			LOGF("FIRST_FRAME_AUDIT SYSAV_AV_PROBE_IOCTL_INPUT"
+			     " path=%s request=0x%08" PRIx64 " bytes=%zu"
+			     " words=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+			     " NO_HARDWARE_ACK\n",
+			     file->name.c_str(), request, bytes, original_words[0], original_words[1],
+			     original_words[2], original_words[3]);
+		}
+		if (native_device) {
+			LOGF("NATIVE_AV_IOCTL_UNSUPPORTED path=%s fd=%d request=0x%08" PRIx64
+			     " result=ENOTTY\n",
+			     file->name.c_str(), d, request);
+			return KERNEL_ERROR_ENOTTY;
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_AV_PROBE_IOCTL path=%s fd=%d"
+		     " request=0x%08" PRIx64 " arg=0x%016" PRIx64 " result=ENOTTY NON_AUTHENTIC\n",
+		     file->name.c_str(), d, request, reinterpret_cast<uint64_t>(arg));
 		return KERNEL_ERROR_ENOTTY;
 	}
 	if (file->special == SpecialFile::GcDiagnostic) {

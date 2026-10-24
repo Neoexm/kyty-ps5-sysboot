@@ -18,6 +18,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/execProcess.h"
 #include "kernel/memory.h"
+#include "kernel/process.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libMbus.h"
@@ -82,6 +83,9 @@ int KYTY_SYSV_ABI getpagesize();
 int KYTY_SYSV_ABI pthread_once(void* once_control, void(KYTY_SYSV_ABI* init_routine)());
 } // namespace Libs::Posix
 
+namespace Libs::NpCommon {
+void SetDiagnosticNativeEntries(uint64_t create, uint64_t config, uint64_t start);
+}
 namespace Libs::LibcInternal {
 }
 
@@ -287,6 +291,17 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	uint64_t   thunk_size                    = 0;
 	const auto thunk = AllocateUnresolvedImportThunk(record_id, &thunk_size);
 	g_stubbed_imports[record_id].thunk_vaddr = thunk;
+	const auto owner                         = Common::PathToString(program->file_name.filename());
+	const auto detail                        = SymbolDatabase::GetNid(ri.name);
+	g_stubbed_imports[record_id].host_exception_code_token =
+	    Common::HostException::RegisterGuestCodeProvenance(
+	        {thunk, thunk_size, ri.base_vaddr,
+			 ri.vaddr >= ri.base_vaddr ? ri.vaddr - ri.base_vaddr : 0,
+			 Common::HostException::FaultGuestCodeKind::UnresolvedImportThunk, owner.c_str(),
+			 detail.c_str()});
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(g_stubbed_imports[record_id].host_exception_code_token == 0);
+#endif
 	return thunk;
 }
 
@@ -1218,6 +1233,36 @@ static bool IsWritableRange(uint64_t addr, uint64_t size) {
 
 #endif
 
+static bool
+TerminateMappedExecChildOnUnhandledUd2(const Common::HostException::ExceptionInfo& info) {
+	if (info.type != Common::HostException::ExceptionType::IllegalInstruction ||
+	    !Libs::LibKernel::Process::IsExecChild() || !IsReadableRange(info.exception_address, 2)) {
+		return false;
+	}
+	const auto* opcode = reinterpret_cast<const uint8_t*>(info.exception_address);
+	if (opcode[0] != 0x0f || opcode[1] != 0x0b) {
+		return false;
+	}
+	uint64_t              owner_base = 0;
+	std::filesystem::path owner_path;
+	if (!Common::Singleton<RuntimeLinker>::Instance()->GetOriginalUd2ProgramInfo(
+	        info.exception_address, &owner_base, &owner_path)) {
+		return false;
+	}
+	Libs::LibKernel::Process::RecordExecChildExitStatus(
+	    Libs::LibKernel::Process::kGuestSigillCoreWaitStatus);
+	LOGF("GUEST_EXEC_FATAL_SIGNAL guest_pid=%d guest_pc=0x%016" PRIx64 " guest_rva=0x%016" PRIx64
+	     " owner=%s"
+	     " signal=4 core=1 wait_status=0x%08x source=original_guest_ud2\n",
+	     Libs::LibKernel::Process::GetPid(), info.exception_address,
+	     info.exception_address - owner_base, Common::PathToString(owner_path).c_str(),
+	     Libs::LibKernel::Process::kGuestSigillCoreWaitStatus);
+	Log::Flush();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ExitProcess(static_cast<UINT>(EXCEPTION_ILLEGAL_INSTRUCTION));
+#endif
+	return true;
+}
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
@@ -1292,6 +1337,62 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_FS10_AUDIT") != nullptr &&
+	    info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    info->exception_address == 0x92000dc4c && info->access_violation_vaddr == 0x10) {
+		const uint64_t tcb      = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+		const bool     readable = tcb <= UINT64_MAX - 0x18 && IsReadableRange(tcb + 0x10, 8);
+		uint64_t       guest_thread_word = 0;
+		if (readable) {
+			std::memcpy(&guest_thread_word, reinterpret_cast<const void*>(tcb + 0x10), 8);
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSCORE_FS10_PROBE"
+		     " fault_pc=0x%016" PRIx64 " tcb=0x%016" PRIx64
+		     " readable=%u guest_thread_word=0x%016" PRIx64 " fault_preserved\n",
+		     info->exception_address, tcb, readable ? 1u : 0u, guest_thread_word);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_GUEST_THREAD_FS10") != nullptr &&
+	    info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    (info->exception_address == 0x92000dc4c || info->exception_address == 0x920008431 ||
+	     info->exception_address == 0x92000e2ae || info->exception_address == 0x92000e669) &&
+	    info->access_violation_vaddr == 0x10 && IsReadableRange(info->exception_address, 9)) {
+		constexpr uint8_t expected_r15[] = {0x64, 0x4c, 0x8b, 0x3c, 0x25, 0x10, 0, 0, 0};
+		constexpr uint8_t expected_r14[] = {0x64, 0x4c, 0x8b, 0x34, 0x25, 0x10, 0, 0, 0};
+		constexpr uint8_t expected_r12[] = {0x64, 0x4c, 0x8b, 0x24, 0x25, 0x10, 0, 0, 0};
+		const bool        reads_r15      = info->exception_address == 0x92000dc4c;
+		const bool        reads_r12      = info->exception_address == 0x92000e2ae;
+		const auto* expected = reads_r15 ? expected_r15 : reads_r12 ? expected_r12 : expected_r14;
+		if (std::memcmp(reinterpret_cast<const void*>(info->exception_address), expected,
+		                sizeof(expected_r15)) == 0) {
+			const auto tcb = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+			if (tcb <= UINT64_MAX - 0x18 && IsReadableRange(tcb + 0x10, 8)) {
+				uint64_t thread_pointer = 0;
+				std::memcpy(&thread_pointer, reinterpret_cast<const void*>(tcb + 0x10), 8);
+				if (thread_pointer != 0 && thread_pointer <= UINT64_MAX - 0xe0 &&
+				    IsWritableRange(thread_pointer, 0xe0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					if (reads_r15) {
+						context->R15 = thread_pointer;
+					} else if (reads_r12) {
+						context->R12 = thread_pointer;
+					} else {
+						context->R14 = thread_pointer;
+					}
+					context->Rip += sizeof(expected_r15);
+					LOGF("FIRST_FRAME_AUDIT SYSCORE_LIBKERNEL_FS10"
+					     " pc=0x%016" PRIx64 " destination=%s"
+					     " tcb=0x%016" PRIx64 " model_thread=0x%016" PRIx64
+					     " thread_read_emulated\n",
+					     info->exception_address,
+					     reads_r15   ? "r15"
+					     : reads_r12 ? "r12"
+					                 : "r14",
+					     tcb, thread_pointer);
+					return true;
+				}
+			}
+		}
+	}
 	if (g_mini_native_syscall_traps_installed.load(std::memory_order_acquire) &&
 	    g_mini_native_fsbase != 0 &&
 	    info->type == Common::HostException::ExceptionType::AccessViolation &&
@@ -1337,6 +1438,50 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					     info->exception_address, g_mini_native_fsbase, displacement, destination,
 					     original_word);
 				}
+				return true;
+			}
+		}
+	}
+	if (g_mini_native_syscall_traps_installed.load(std::memory_order_acquire) &&
+	    info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    info->exception_address == 0x473a2d && info->access_violation_vaddr == 0x38 &&
+	    IsReadableRange(info->exception_address, 9)) {
+		const uint8_t expected[] = {0x64, 0x48, 0x8b, 0x04, 0x25, 0x38, 0, 0, 0};
+		if (std::memcmp(reinterpret_cast<const void*>(info->exception_address), expected,
+		                sizeof(expected)) == 0) {
+			const auto tcb = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+			if (tcb <= UINT64_MAX - 0x40 && IsReadableRange(tcb + 0x38, sizeof(uint64_t))) {
+				uint64_t original_guest_tls_word = 0;
+				std::memcpy(&original_guest_tls_word, reinterpret_cast<const void*>(tcb + 0x38),
+				            sizeof(original_guest_tls_word));
+				auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+				context->Rax  = original_guest_tls_word;
+				context->Rip += sizeof(expected);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_TLS_FS38"
+				     " guest_tcb=0x%016" PRIx64 " tls_word=0x%016" PRIx64 " fs_load_emulated\n",
+				     tcb, original_guest_tls_word);
+				return true;
+			}
+		}
+	}
+	if (g_mini_native_syscall_traps_installed.load(std::memory_order_acquire) &&
+	    info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    info->exception_address == 0x46b247 && info->access_violation_vaddr == 0x10 &&
+	    IsReadableRange(info->exception_address, 9)) {
+		const uint8_t expected[] = {0x64, 0x48, 0x8b, 0x1c, 0x25, 0x10, 0, 0, 0};
+		if (std::memcmp(reinterpret_cast<const void*>(info->exception_address), expected,
+		                sizeof(expected)) == 0) {
+			const auto tcb = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+			if (tcb <= UINT64_MAX - 0x18 && IsReadableRange(tcb + 0x10, sizeof(uint64_t))) {
+				uint64_t original_guest_thread = 0;
+				std::memcpy(&original_guest_thread, reinterpret_cast<const void*>(tcb + 0x10),
+				            sizeof(original_guest_thread));
+				auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+				context->Rbx  = original_guest_thread;
+				context->Rip += sizeof(expected);
+				LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_TLS_FS10"
+				     " guest_tcb=0x%016" PRIx64 " guest_thread=0x%016" PRIx64 " fs_load_emulated\n",
+				     tcb, original_guest_thread);
 				return true;
 			}
 		}
@@ -1670,6 +1815,32 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			     " site=0x%016" PRIx64 " eax=0x%x eax_signed=%d"
 			     " resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
 			     info->exception_address, static_cast<unsigned>(eax), eax, resume_rip, label);
+			Log::Flush();
+			return true;
+		}
+	}
+	const uint64_t sub426550_errno_sign_js =
+	    g_mini_sub426550_errno_sign_js_site.load(std::memory_order_acquire);
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    info->exception_address != 0 && info->exception_address == sub426550_errno_sign_js &&
+	    IsReadableRange(info->exception_address, 6)) {
+		auto*       ctx  = reinterpret_cast<CONTEXT*>(info->native_context);
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+		if (code[0] == 0x0f && code[1] == 0x0b && code[2] == 0x90 && code[3] == 0x90 &&
+		    code[4] == 0x90 && code[5] == 0x90) {
+			const int32_t  r12d       = static_cast<int32_t>(ctx->R12 & 0xFFFFFFFFULL);
+			const int32_t  r14d       = static_cast<int32_t>(ctx->R14 & 0xFFFFFFFFULL);
+			const uint64_t taken      = info->exception_address + 6 - 0x2BB;
+			const uint64_t fall       = info->exception_address + 6;
+			const uint64_t resume_rip = (r12d < 0) ? taken : fall;
+			const char*    label      = (r12d < 0) ? "js_taken_bail_return_sce_error_via_epilogue"
+			                                       : "js_not_taken_continue_to_open_ssd0";
+			ctx->Rip                  = resume_rip;
+			LOGF("NON_AUTHENTIC_PROBE_SUB426550_ERRNO_SIGN_JS"
+			     " site=0x%016" PRIx64 " r12d=0x%x r12d_signed=%d r14d=0x%x r14d_signed=%d"
+			     " resume_rip=0x%016" PRIx64 " %s NON_AUTHENTIC\n",
+			     info->exception_address, static_cast<unsigned>(r12d), r12d,
+			     static_cast<unsigned>(r14d), r14d, resume_rip, label);
 			Log::Flush();
 			return true;
 		}
@@ -2280,6 +2451,42 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					     entry.ident, entry.filter, entry.flags, entry.fflags, entry.data,
 					     reinterpret_cast<uint64_t>(entry.udata), result.value, err,
 					     failure ? 1u : 0u);
+				}
+				return true;
+			}
+		}
+	}
+	const uint64_t rdup_native_site =
+	    g_syscore_native_rdup_syscall_site.load(std::memory_order_acquire);
+	if (rdup_native_site != 0 &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr &&
+	    info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    info->exception_address == rdup_native_site && info->rax == 0x25b &&
+	    IsReadableRange(rdup_native_site, 2)) {
+		const auto* bytes = reinterpret_cast<const uint8_t*>(rdup_native_site);
+		if (bytes[0] == 0x0f && bytes[1] == 0x0b) {
+			const auto answer = Libs::NativeKernelBridge::DispatchSyscall(
+			    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+			const bool kernel_enosys =
+			    answer.value == Libs::LibKernel::KERNEL_ERROR_ENOSYS && answer.posix_errno == 0;
+			const int  err    = kernel_enosys
+			                        ? Libs::LibKernel::KernelToPosix(static_cast<int>(answer.value))
+			                        : answer.posix_errno;
+			const bool failed = kernel_enosys || (answer.value == -1 && err != 0);
+			if ((answer.value >= 0 && err == 0) || failed) {
+				auto* ctx = reinterpret_cast<CONTEXT*>(info->native_context);
+				ctx->Rax =
+				    failed ? static_cast<uint64_t>(err) : static_cast<uint64_t>(answer.value);
+				ctx->EFlags = (ctx->EFlags & ~uint32_t {1}) | (failed ? 1u : 0u);
+				ctx->Rip += 2;
+				static std::atomic_uint32_t observed {0};
+				if (observed.fetch_add(1) < 20) {
+					LOGF("SYSCORE_NATIVE_RDUP"
+					     " guest_pid=%d parent_pid=%" PRIu64 " parent_fd=%" PRIu64
+					     " result_fd=%" PRId64 " errno=%d cf=%u"
+					     " native_syscall=0x25b\n",
+					     Libs::LibKernel::Process::GetPid(), info->rdi, info->rsi, answer.value,
+					     err, failed ? 1u : 0u);
 				}
 				return true;
 			}
@@ -3279,6 +3486,68 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				    (reply.value == -1 && reply.posix_errno > 0)) {
 					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
 					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x1d2 && info->rdi == 0 &&
+			    info->rsi == static_cast<uint32_t>(Libs::LibKernel::PthreadGetthreadid()) &&
+			    IsReadableRange(info->rdx, sizeof(uint32_t))) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if (reply.value == 0 && reply.posix_errno == 0) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = 0;
+					context->EFlags &= ~uint32_t {1};
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_RT_PRIO\n");
+					return true;
+				}
+			}
+			if (info->rax == 0x1a0 && (info->rdi == 32 || info->rdi == 2) &&
+			    IsReadableRange(info->rsi, 32) && info->rdx == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if (reply.value == 0 && reply.posix_errno == 0) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = 0;
+					context->EFlags &= ~uint32_t {1};
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_DIAGNOSTIC_NATIVE_SIGACTION_RETURN"
+					     " signal=%" PRIu64 " WITHOUT_GUEST_SIGNAL_DELIVERY NON_AUTHENTIC\n",
+					     info->rdi);
+					return true;
+				}
+			}
+			if (info->rax == 0x154 &&
+			    ((info->rdi == 2 && info->rdx == 0) ||
+			     (info->rdi == 3 && info->rdx == 0 && (info->rsi & 0xfffull) == 0x208 &&
+			      info->rsi >= 0x200000000ull && info->rsi < 0x210000000ull) ||
+			     (info->rdi == 1 && info->rsi == 0x4de5c8 && IsReadableRange(info->rdx, 16))) &&
+			    IsReadableRange(info->rsi, 16)) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if (reply.value == 0 && reply.posix_errno == 0) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = 0;
+					context->EFlags &= ~uint32_t {1};
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_DIAGNOSTIC_SIGPROCMASK_RETURN"
+					     " WITHOUT_GUEST_SIGNAL_DELIVERY NON_AUTHENTIC\n");
+					return true;
+				}
+			}
+			if (info->rax == 0x1dd && info->rdi == 0 && info->rsi == 0x2000 && info->rdx == 3 &&
+			    info->r10 == 1 && info->r8 >= 3 && info->r8 <= INT32_MAX && info->r9 == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value > 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
 					context->EFlags =
 					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
 					context->Rip += 2;
@@ -5049,8 +5318,53 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
-	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
-		StartModule(libc, 0, nullptr, nullptr);
+	EntryParams* exec_params = nullptr;
+	void*        exec_stack  = nullptr;
+	if (Libs::LibKernel::Process::IsExecChild()) {
+		const auto entry = GetEntry();
+		if (entry == 0 || !PrepareExecEntryParameters(main_stack_top, &exec_params, &exec_stack) ||
+		    !InstallExecEntryTrace(entry)) {
+			LOGF("GUEST_EXECVE_IMAGE_PREPARATION_FAILED guest_pid=%d\n",
+			     Libs::LibKernel::Process::GetPid());
+			std::fflush(stdout);
+			std::quick_exit(1);
+		}
+		Libs::LibKernel::Process::MarkExecChildStartupStage(10);
+		LogExecLoadPhases("commit_wait");
+		if (!Libs::LibKernel::Process::AwaitExecChildCommit(
+		        entry, reinterpret_cast<uint64_t>(exec_stack),
+		        reinterpret_cast<uint64_t>(exec_params))) {
+			std::quick_exit(1);
+		}
+		Libs::LibKernel::Process::MarkExecChildStartupStage(11);
+		Libs::LibKernel::Process::PublishToScope();
+	}
+	if (const auto* proc_param = reinterpret_cast<const uint64_t*>(GetProcParam());
+	    proc_param != nullptr && proc_param[0] > 0x3f && proc_param[3] != 0) {
+		Libs::LibKernel::Process::SetName(reinterpret_cast<const char*>(proc_param[3]));
+	}
+	const bool shellui_npcommon_owner = [&] {
+		if (g_tls_main_program == nullptr ||
+		    g_tls_main_program->file_name.filename() != "NPXS40087_eboot_decrypted.elf") {
+			return false;
+		}
+		const auto* proc_param = reinterpret_cast<const uint64_t*>(GetProcParam());
+		return proc_param != nullptr && proc_param[0] > 0x1f && proc_param[3] != 0 &&
+		       std::strcmp(reinterpret_cast<const char*>(proc_param[3]), "SceShellUI") == 0;
+	}();
+	auto initialize_modules = [this, libc, shellui_npcommon_owner] {
+		if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
+			StartModule(libc, 0, nullptr, nullptr);
+		}
+	};
+	const auto init_start = std::chrono::steady_clock::now();
+	RunEntry(reinterpret_cast<uint64_t>(RunInitializerStage<decltype(initialize_modules)>),
+	         reinterpret_cast<EntryParams*>(&initialize_modules), nullptr,
+	         exec_stack != nullptr ? exec_stack : main_stack_top);
+	g_exec_load_timing.init_us += MicrosecondsSince(init_start);
+	Libs::LibKernel::Process::MarkExecChildStartupStage(12);
+	if (Libs::LibKernel::Process::IsExecChild()) {
+		LogExecLoadPhases("modules_started");
 	}
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -5164,6 +5478,13 @@ void RuntimeLinker::Clear() {
 		DeleteProgram(p);
 	}
 	m_programs.clear();
+	m_needed_modules.clear();
+	m_module_start_order.clear();
+	m_stopping_all_modules = false;
+	for (auto& record: g_stubbed_imports) {
+		Common::HostException::UnregisterGuestCodeProvenance(record.host_exception_code_token);
+		record.host_exception_code_token = 0;
+	}
 	for (const auto page: g_unresolved_stub_thunk_pages) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(page, UNRESOLVED_STUB_PAGE_SIZE));
 	}
@@ -5975,6 +6296,20 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				if (Common::VirtualMemory::IsExecute(mode)) {
 					Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_memory_size);
 				}
+			}
+			if (Common::VirtualMemory::IsExecute(mode)) {
+				const auto owner = Common::PathToString(program->file_name.filename());
+				const auto detail =
+				    fmt::format("{}#{}", phdr[i].p_type == PT_LOAD ? "PT_LOAD" : "PT_OS_RELRO", i);
+				const auto token = Common::HostException::RegisterGuestCodeProvenance(
+				    {segment_addr, segment_memory_size, program->base_vaddr,
+					 phdr[i].p_vaddr - image_offset,
+					 Common::HostException::FaultGuestCodeKind::ProgramExecutable, owner.c_str(),
+					 detail.c_str()});
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+				EXIT_IF(token == 0);
+#endif
+				if (token != 0) program->host_exception_code_tokens.push_back(token);
 			}
 		}
 
@@ -6986,6 +7321,8 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr >= program->base_vaddr &&
 		    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
+			Common::HostException::UnregisterGuestCodeProvenance(record.host_exception_code_token);
+			record.host_exception_code_token = 0;
 			record.patch_vaddr = 0;
 		}
 	}
@@ -7279,6 +7616,15 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 	                                                     Common::VirtualMemory::Mode::Execute));
 	Common::VirtualMemory::FlushInstructionCache(program->tls.handler_vaddr,
 	                                             Jit::SafeCall::GetSize());
+	const auto owner = Common::PathToString(program->file_name.filename());
+	const auto token = Common::HostException::RegisterGuestCodeProvenance(
+	    {program->tls.handler_vaddr, Jit::SafeCall::GetSize(), program->base_vaddr,
+		 program->tls.handler_vaddr - program->base_vaddr,
+		 Common::HostException::FaultGuestCodeKind::TlsHandler, owner.c_str(), "tls_safe_call"});
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(token == 0);
+#endif
+	if (token != 0) program->host_exception_code_tokens.push_back(token);
 }
 
 void RuntimeLinker::DeleteTlss(int thread_id) {

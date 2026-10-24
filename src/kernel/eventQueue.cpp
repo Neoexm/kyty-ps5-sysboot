@@ -491,6 +491,7 @@ int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id) {
 
 // FreeBSD NOTE_EXIT and NOTE_EXEC, as seen in SceSysCore's process-watch request (0xa0000000).
 constexpr uint32_t NATIVE_PROC_NOTE_EXIT = 0x80000000u;
+constexpr uint32_t NATIVE_PROC_NOTE_EXEC = 0x20000000u;
 struct NativeProcNotification {
 	uint32_t note;
 	uint32_t exit_status;
@@ -511,6 +512,9 @@ static void NotifyNativeProcForAll(int pid, uint32_t note, uint32_t exit_status)
 }
 void KernelNotifyNativeProcExitForAll(int pid, uint32_t exit_status) {
 	NotifyNativeProcForAll(pid, NATIVE_PROC_NOTE_EXIT, exit_status);
+}
+void KernelNotifyNativeProcExecForAll(int pid) {
+	NotifyNativeProcForAll(pid, NATIVE_PROC_NOTE_EXEC, 0);
 }
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata) {
 	PRINT_NAME();

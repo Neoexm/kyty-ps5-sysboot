@@ -157,6 +157,7 @@ bool ReadPsmShellUiApplicationSnapshot(const std::string& guest_path, std::vecto
 bool IsNullfsNoExec(const std::string& mounted_file_name);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
+int                   DuplicateParentSocketForRdup(int parent_pid, int parent_fd);
 int                   CreateEqueueDescriptor(int64_t handle);
 bool                  IsNativeDmemDescriptor(int fd);
 bool                  IsSectorPayloadDescriptor(int fd);

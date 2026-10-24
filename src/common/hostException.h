@@ -77,6 +77,8 @@ bool InstallHandler(Handler handler);
 bool     IsUnhandledFaultProvenancePrepared() noexcept;
 bool     CaptureUnhandledFaultProvenance(const ExceptionInfo& info) noexcept;
 void     NoteHostExit(uint32_t path_id, int exit_status, const ExceptionInfo* info) noexcept;
+uint32_t RegisterGuestCodeProvenance(const GuestCodeProvenance& provenance) noexcept;
+void     UnregisterGuestCodeProvenance(uint32_t token) noexcept;
 FaultGuestCodeKind QueryActiveGuestCodeKind(uint64_t address) noexcept;
 void ClearCurrentGuestStackBounds() noexcept;
 

@@ -77,6 +77,7 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 int KYTY_SYSV_ABI KernelAddUserEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id);
 void              KernelNotifyNativeProcExitForAll(int pid, uint32_t exit_status);
+void              KernelNotifyNativeProcExecForAll(int pid);
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata);
 int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata);
 int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id);

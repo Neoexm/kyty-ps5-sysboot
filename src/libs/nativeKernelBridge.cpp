@@ -117,6 +117,9 @@ Reply SysconfNative(const Request& request) {
 	}
 	return {page_size, 0};
 }
+Reply ReadlinkNative(const Request& request) {
+	return DispatchSyscall({0x3a, request.args});
+}
 bool ReadExecveGuestMemory(uint64_t address, void* data, size_t size) {
 	if (address == 0 || size > UINT64_MAX - address) return false;
 	auto*  output = static_cast<uint8_t*>(data);
@@ -1162,6 +1165,19 @@ ExecutableImageKind ExecutableImageHeaderKind(const uint8_t* data, size_t size, 
 	}
 	return ExecutableImageKind::Invalid;
 }
+Reply SyscoreNativeRdup(const SyscallRequest& request) {
+	if (request.number != 0x25b ||
+	    (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") == nullptr &&
+	     std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_LIVE_RFORK") == nullptr)) {
+		return {LibKernel::KERNEL_ERROR_ENOSYS, 0};
+	}
+	if (request.args[0] > INT32_MAX || request.args[1] > INT32_MAX) {
+		return {-1, Libs::Posix::POSIX_EBADF};
+	}
+	const int fd = LibKernel::FileSystem::DuplicateParentSocketForRdup(
+	    static_cast<int>(request.args[0]), static_cast<int>(request.args[1]));
+	return fd >= 0 ? Reply {fd, 0} : Reply {-1, LibKernel::KernelToPosix(fd)};
+}
 Reply RegMgrCall(const SyscallRequest& request) {
 	// 0x214 (op, key, int* status, void* value, size); *status is the answer when the call returns
 	// 0. Only what the guest stored this run reads back
@@ -1198,6 +1214,31 @@ Reply RegMgrCall(const SyscallRequest& request) {
 			LOGF("FIRST_FRAME_AUDIT REGMGR %s pid=%d\n", line, LibKernel::Process::GetPid());
 	};
 }
+Reply GuestChdir(const SyscallRequest& request) {
+	LOGF("SYSCORE_APP_SPAWN chdir pid=%d path=0x%" PRIx64 " result=0\n",
+	     LibKernel::Process::GetPid(), request.args[0]);
+	return {0, 0};
+}
+Reply GuestChroot(const SyscallRequest& request) {
+	std::string root;
+	const int   rc =
+	    ReadExecveGuestString(request.args[0], 1024, LibKernel::KERNEL_ERROR_ENAMETOOLONG, &root);
+	LOGF("SYSCORE_APP_SPAWN chroot pid=%d path=0x%" PRIx64 " root=%s result=0x%x\n",
+	     LibKernel::Process::GetPid(), request.args[0], rc == 0 ? root.c_str() : "", rc);
+	if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+	// the root becomes the child's / at execve; the child imports the sandbox mounts published
+	// under it
+	LibKernel::Process::RecordSpawnSandbox(LibKernel::Process::GetPid(), &root, nullptr);
+	return {0, 0};
+}
+struct NativeEventFlag {
+	LibKernel::EventFlag::KernelEventFlag flag;
+	int                                   owner;
+	bool                                  creator;
+	std::string                           name;
+};
+std::mutex                                    g_native_event_lock;
+uint32_t                                      g_native_event_next = 0;
 bool UseNativeEventFlags() {
 	return std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr ||
 	       (LibKernel::Process::IsExecChild() &&
@@ -1254,6 +1295,27 @@ bool ShouldLogMiniSyscallTrace(uint64_t ordinal) {
 Reply PreflightSyscoreExecve(const SyscallRequest& request) {
 	return SyscoreExecvePreflight(request);
 }
+Reply Dispatch(const Request& request) {
+	Reply       result {};
+	const char* label = "unknown";
+	switch (request.service) {
+		case Service::FlexibleMapExport:
+			label  = "dYK287SsmDs/native-map";
+			result = MapNative(request);
+			break;
+		case Service::SysconfExport:
+			label  = "mkawd0NA9ts/sysconf";
+			result = SysconfNative(request);
+			break;
+		case Service::ReadlinkExport:
+			label  = "pd02UI9TbOA/readlink";
+			result = ReadlinkNative(request);
+			break;
+		default: result = {LibKernel::KERNEL_ERROR_ENOSYS, 0}; break;
+	}
+	Trace(label, request, result.value, result.posix_errno);
+	return result;
+}
 Reply DispatchSyscall(const SyscallRequest& request) {
 	Reply result {LibKernel::KERNEL_ERROR_ENOSYS, 0};
 	if (DispatchGetdirentriesSyscall(request, &result)) return result;
@@ -1278,5 +1340,28 @@ Reply DispatchSyscall(const SyscallRequest& request) {
 			}
 		}
 	}
+}
+bool RunSelfTests() {
+	const Reply page     = Dispatch({Service::SysconfExport, {47}});
+	const Reply bad_page = Dispatch({Service::SysconfExport, {123}});
+	const Reply bad_map  = Dispatch({Service::FlexibleMapExport, {}});
+	const Reply bad_link = Dispatch({Service::ReadlinkExport, {}});
+	const Reply unknown  = Dispatch({static_cast<Service>(0xffffffffu), {}});
+	int32_t     mib[]    = {9, 20};
+	int32_t     output   = 0;
+	size_t      length   = sizeof(output);
+	const Reply size_query =
+	    DispatchSyscall({0xca,
+		                 {reinterpret_cast<uint64_t>(mib), 2, reinterpret_cast<uint64_t>(&output),
+		                  reinterpret_cast<uint64_t>(&length), 0, 0}});
+	const Reply               unknown_syscall = DispatchSyscall({0x123456u, {}});
+	int32_t                   app_mib[4] {1, 14, 35, LibKernel::Process::GetPid()};
+	std::array<uint8_t, 0x98> extended_info;
+	extended_info.fill(0xa5);
+	size_t      extended_size  = extended_info.size();
+	const Reply extended_query = DispatchSyscall(
+	    {0xca,
+		 {reinterpret_cast<uint64_t>(app_mib), 4, reinterpret_cast<uint64_t>(extended_info.data()),
+		  reinterpret_cast<uint64_t>(&extended_size), 0, 0}});
 }
 } // namespace Libs::NativeKernelBridge
