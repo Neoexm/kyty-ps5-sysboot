@@ -415,6 +415,10 @@ struct PthreadPrivate {
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 	std::atomic<uint64_t>   blocked_signal_mask[2] {};
+	std::atomic_int         suspend_requests {0};
+	std::atomic_bool        suspend_parked {false};
+	uint64_t                guest_tcb         = 0;
+	uint64_t                guest_pthread_obj = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -525,6 +529,22 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void PthreadParkForSuspend(Pthread thread) {
+	// a signal helper runs with the target's Pthread as self but isn't the suspended host thread
+	if (thread->suspend_requests == 0 || thread->host_thread_id != GetCurrentThreadId()) {
+		return;
+	}
+
+	// pthread_suspend_user_context_np takes a thread stopped in this window as holding no host
+	// lock, so nothing in here may take one.
+	thread->suspend_parked = true;
+	while (thread->suspend_requests != 0) {
+		SchedulerBackoffOnce();
+	}
+	thread->suspend_parked = false;
+}
+#endif
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
@@ -595,6 +615,7 @@ static thread_local std::unique_ptr<PthreadSpecificValue[]> g_pthread_specific;
 
 static std::mutex                            g_guest_pthread_mutex;
 static std::unordered_map<uint64_t, Pthread> g_guest_pthread_objects;
+
 class PthreadPool {
 public:
 	PthreadPool() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -603,6 +624,7 @@ public:
 	KYTY_CLASS_NO_COPY(PthreadPool);
 
 	Pthread Create();
+	bool    CopyNameByGuestId(int guest_tid, char* name);
 
 	void FreeDetachedThreads();
 
@@ -1019,7 +1041,9 @@ void PthreadInitSelfForMainThread() {
 	}
 #endif
 
+	const auto inherited_mask = PthreadGetSignalMask(nullptr);
 	g_pthread_self = new PthreadPrivate {};
+	PthreadSetSignalMask(g_pthread_self, inherited_mask);
 	PthreadAttrInit(&g_pthread_self->attr);
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
 	g_pthread_self->p               = pthread_self();
@@ -1091,6 +1115,7 @@ uint64_t PthreadGetMainGuestStackTop() {
 	}
 	return (stack_addr + stack_size) & ~uint64_t {0xf};
 }
+
 void Initialize() {
 	PRINT_NAME_ENABLE(false);
 
@@ -1429,11 +1454,21 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 	auto*      current       = static_cast<void**>(addr);
 	auto       current_ref   = std::atomic_ref<void*>(*current);
 	auto*      current_value = current_ref.load(std::memory_order_acquire);
+	auto*      rt                  = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto native_static_mutex = [rt, type](void* value) {
+		if (type != PthreadStaticObject::Type::Mutex || value == nullptr ||
+		    reinterpret_cast<uintptr_t>(value) <= 2) {
+			return false;
+		}
+		const auto* program = rt->FindProgramByAddr(reinterpret_cast<uint64_t>(value));
+		return program != nullptr && program->file_name.filename() == "libkernel.sprx" &&
+		       reinterpret_cast<uint64_t>(value) == program->base_vaddr + 0xa1e80;
+	};
 	const bool adaptive_static_mutex =
 	    (type == PthreadStaticObject::Type::Mutex &&
 	     current_value == reinterpret_cast<void*>(static_cast<uintptr_t>(1)));
 
-	if (current_value != nullptr && !adaptive_static_mutex) {
+	if (current_value != nullptr && !adaptive_static_mutex && !native_static_mutex(current_value)) {
 		return addr;
 	}
 
@@ -1444,11 +1479,15 @@ void* PthreadStaticObjects::CreateObject(void* addr, PthreadStaticObject::Type t
 	    (type == PthreadStaticObject::Type::Mutex &&
 	     current_value == reinterpret_cast<void*>(static_cast<uintptr_t>(1)));
 
-	if (current_value != nullptr && !adaptive_static_mutex_after_lock) {
+	if (current_value != nullptr && !adaptive_static_mutex_after_lock &&
+	    !native_static_mutex(current_value)) {
 		return addr;
 	}
 
-	auto* rt      = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	if (native_static_mutex(current_value)) {
+		LOGF("KERNEL_PTHREAD native static mutex sentinel at 0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(addr));
+	}
 	auto  vaddr   = reinterpret_cast<uint64_t>(addr);
 	auto* program = rt->FindProgramByAddr(vaddr);
 
@@ -1525,6 +1564,12 @@ Pthread PthreadPool::Create() {
 
 	for (auto* p: m_threads) {
 		if (p->free) {
+			if (p->guest_pthread_obj != 0) {
+				std::lock_guard lock(g_guest_pthread_mutex);
+				g_guest_pthread_objects.erase(p->guest_pthread_obj);
+				p->guest_pthread_obj = 0;
+				p->guest_tcb         = 0;
+			}
 			p->free = false;
 			return p;
 		}
@@ -1771,6 +1816,28 @@ int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
 	EXIT_NOT_IMPLEMENTED(*mutex == nullptr);
 
 	int result = NativeMutexLock(*mutex, nullptr);
+	if (result != 0) {
+		const auto* object   = *mutex;
+		const auto  owner_id = object->owner != nullptr ? object->owner->unique_id : -1;
+		const auto  self_id  = g_pthread_self != nullptr ? g_pthread_self->unique_id : -1;
+		if (auto* file = std::fopen("_Build/vsh/mutex_fail.log", "a"); file != nullptr) {
+			std::fprintf(file,
+			             "guest=%016" PRIx64 " object=%016" PRIx64
+			             " name=%s type=%d count=%u result=%d owner=%d self=%d caller=%016" PRIx64
+			             "\n",
+			             reinterpret_cast<uint64_t>(mutex), reinterpret_cast<uint64_t>(object),
+			             object->name.c_str(), object->type, object->count, result, owner_id,
+			             self_id, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+			std::fclose(file);
+		}
+		std::fprintf(stderr,
+		             "mutex lock failed: guest=%016" PRIx64 " object=%016" PRIx64
+		             " name=%s type=%d count=%u result=%d owner=%d self=%d caller=%016" PRIx64 "\n",
+		             reinterpret_cast<uint64_t>(mutex), reinterpret_cast<uint64_t>(object),
+		             object->name.c_str(), object->type, object->count, result, owner_id, self_id,
+		             reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+		std::fflush(stderr);
+	}
 
 	// LOGF("\tmutex lock: %s, %d\n", (*mutex)->name.c_str(), result);
 
@@ -1866,12 +1933,33 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex) {
 	}
 }
 
+static int TracePthreadAttrResult(const char* operation, bool native_called, int native_result,
+                                  int result, uint64_t caller) {
+	if (std::getenv("KYTY_DIAGNOSTIC_VIDEO_ARBITRATION_INIT") == nullptr) return result;
+	auto*      linker  = Common::Singleton<Loader::RuntimeLinker>::ExistingInstance();
+	auto*      program = linker == nullptr ? nullptr : linker->FindProgramByAddr(caller);
+	const auto module  = program == nullptr ? std::string("unavailable")
+	                                        : Common::PathToString(program->file_name.filename());
+	const bool target  = module == "libSceVideoArbitration.sprx";
+	if (target || result != OK) {
+		LOGF("PTHREAD_ATTR_%s guest_pid=%d operation=%s caller_module=%s"
+		     " caller_rva=0x%016" PRIx64 " native_called=%d native_result=%d"
+		     " mapped_result=%08x\n",
+		     target ? "RESULT" : "FAILURE", Process::GetPid(), operation,
+		     Log::EscapeField(module).c_str(),
+		     program == nullptr ? 0 : caller - program->base_vaddr, native_called ? 1 : 0,
+		     native_result, static_cast<unsigned>(result));
+	}
+	return result;
+}
+
 int KYTY_SYSV_ABI PthreadAttrInit(PthreadAttr* attr) {
 	// PRINT_NAME();
 
 	*attr = new PthreadAttrPrivate {};
 
-	int result = pthread_attr_init(&(*attr)->p);
+	const int native_result = pthread_attr_init(&(*attr)->p);
+	int       result        = native_result;
 
 	(*attr)->affinity       = 0x7f;
 	(*attr)->guard_size     = 0x1000;
@@ -1884,21 +1972,51 @@ int KYTY_SYSV_ABI PthreadAttrInit(PthreadAttr* attr) {
 	KernelSchedParam param;
 	param.sched_priority = 700;
 
-	result = (result == 0 ? PthreadAttrSetinheritsched(attr, 4) : result);
-	result = (result == 0 ? PthreadAttrSetschedparam(attr, &param) : result);
-	result = (result == 0 ? PthreadAttrSetschedpolicy(attr, 1) : result);
-	result = (result == 0 ? PthreadAttrSetdetachstate(attr, 0) : result);
-	result = (result == 0 ? PthreadAttrSetstacksize(attr, PTHREAD_STACK_DEFAULT) : result);
+	int inherit_result     = 0x7fffffff;
+	int schedparam_result  = 0x7fffffff;
+	int schedpolicy_result = 0x7fffffff;
+	int detach_result      = 0x7fffffff;
+	int stacksize_result   = 0x7fffffff;
+	if (result == 0) result = inherit_result = PthreadAttrSetinheritsched(attr, 4);
+	if (result == 0) result = schedparam_result = PthreadAttrSetschedparam(attr, &param);
+	if (result == 0) result = schedpolicy_result = PthreadAttrSetschedpolicy(attr, 1);
+	if (result == 0) result = detach_result = PthreadAttrSetdetachstate(attr, 0);
+	if (result == 0)
+		result = stacksize_result = PthreadAttrSetstacksize(attr, PTHREAD_STACK_DEFAULT);
+
+	int mapped_result = KERNEL_ERROR_EINVAL;
+	if (result == 0)
+		mapped_result = OK;
+	else if (result == ENOMEM)
+		mapped_result = KERNEL_ERROR_ENOMEM;
+	if (result != 0 && std::getenv("KYTY_DIAGNOSTIC_VIDEO_ARBITRATION_INIT") != nullptr) {
+		const auto caller  = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+		auto*      linker  = Common::Singleton<Loader::RuntimeLinker>::ExistingInstance();
+		auto*      program = linker == nullptr ? nullptr : linker->FindProgramByAddr(caller);
+		const auto module  = program == nullptr
+		                         ? std::string("unavailable")
+		                         : Common::PathToString(program->file_name.filename());
+		LOGF("PTHREAD_ATTR_INIT_FAILURE guest_pid=%d caller_module=%s caller_rva=0x%016" PRIx64
+		     " native_called=1 native_result=%d inherit_called=%d inherit_result=%d"
+		     " schedparam_called=%d schedparam_result=%d schedpolicy_called=%d"
+		     " schedpolicy_result=%d detach_called=%d detach_result=%d"
+		     " stacksize_called=%d stacksize_result=%d sequence_result=%d mapped_result=%08x\n",
+		     Process::GetPid(), Log::EscapeField(module).c_str(),
+		     program == nullptr ? 0 : caller - program->base_vaddr, native_result,
+		     inherit_result != 0x7fffffff ? 1 : 0, inherit_result,
+		     schedparam_result != 0x7fffffff ? 1 : 0, schedparam_result,
+		     schedpolicy_result != 0x7fffffff ? 1 : 0, schedpolicy_result,
+		     detach_result != 0x7fffffff ? 1 : 0, detach_result,
+		     stacksize_result != 0x7fffffff ? 1 : 0, stacksize_result, result,
+		     static_cast<unsigned>(mapped_result));
+	}
 
 	if (false && PRINT_NAME_ENABLED) {
 		PthreadAttrDbgPrint(attr);
 	}
 
-	switch (result) {
-		case 0: return OK;
-		case ENOMEM: return KERNEL_ERROR_ENOMEM;
-		default: return KERNEL_ERROR_EINVAL;
-	}
+	return TracePthreadAttrResult("init", true, native_result, mapped_result,
+	                              reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 int KYTY_SYSV_ABI PthreadAttrDestroy(PthreadAttr* attr) {
@@ -1923,6 +2041,7 @@ int KYTY_SYSV_ABI PthreadAttrDestroy(PthreadAttr* attr) {
 int KYTY_SYSV_ABI PthreadAttrGet(Pthread thread, PthreadAttr* attr) {
 	// PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr || attr == nullptr || *attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -2088,15 +2207,16 @@ int KYTY_SYSV_ABI PthreadAttrGetstacksize(const PthreadAttr* attr, size_t* stack
 
 int KYTY_SYSV_ABI PthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask) {
 	// PRINT_NAME();
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetaffinity");
 	if (attr_value == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return TracePthreadAttrResult("setaffinity", false, 0, KERNEL_ERROR_EINVAL, caller);
 	}
 
 	attr_value->affinity = mask;
 
-	return OK;
+	return TracePthreadAttrResult("setaffinity", false, 0, OK, caller);
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetdetachstate(PthreadAttr* attr, int state) {
@@ -2140,10 +2260,11 @@ int KYTY_SYSV_ABI PthreadAttrSetguardsize(PthreadAttr* attr, size_t guard_size) 
 
 int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sched) {
 	// PRINT_NAME();
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetinheritsched");
 	if (attr_value == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return TracePthreadAttrResult("setinheritsched", false, 0, KERNEL_ERROR_EINVAL, caller);
 	}
 
 	int pinherit_sched = PTHREAD_INHERIT_SCHED;
@@ -2159,15 +2280,16 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	attr_value->inherit_sched = inherit_sched;
 	(void)pinherit_sched;
 
-	return OK;
+	return TracePthreadAttrResult("setinheritsched", false, 0, OK, caller);
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param) {
 	// PRINT_NAME();
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetschedparam");
 	if (param == nullptr || attr_value == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return TracePthreadAttrResult("setschedparam", false, 0, KERNEL_ERROR_EINVAL, caller);
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2180,21 +2302,32 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 		pparam.sched_priority = 0;
 	}
 
-	if (pthread_attr_setschedparam(&attr_value->p, &pparam) != 0) {
-		return KERNEL_ERROR_EINVAL;
+	const int native_result = pthread_attr_setschedparam(&attr_value->p, &pparam);
+	if (native_result != 0) {
+		return TracePthreadAttrResult("setschedparam", true, native_result, KERNEL_ERROR_EINVAL,
+		                              caller);
 	}
+#else
+	const int native_result = 0;
 #endif
 
 	attr_value->guest_priority = param->sched_priority;
-	return OK;
+	return TracePthreadAttrResult("setschedparam",
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	                              true,
+#else
+	                              false,
+#endif
+	                              native_result, OK, caller);
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
 	// PRINT_NAME();
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
 	auto* attr_value = GetPthreadAttrValue(attr, "PthreadAttrSetschedpolicy");
 	if (attr_value == nullptr) {
-		return KERNEL_ERROR_EINVAL;
+		return TracePthreadAttrResult("setschedpolicy", false, 0, KERNEL_ERROR_EINVAL, caller);
 	}
 
 	// winpthreads supports only SCHED_OTHER policy
@@ -2205,9 +2338,9 @@ int KYTY_SYSV_ABI PthreadAttrSetschedpolicy(PthreadAttr* attr, int policy) {
 	int result = pthread_attr_setschedpolicy(&attr_value->p, ppolicy);
 
 	if (result == 0) {
-		return OK;
+		return TracePthreadAttrResult("setschedpolicy", true, result, OK, caller);
 	}
-	return KERNEL_ERROR_EINVAL;
+	return TracePthreadAttrResult("setschedpolicy", true, result, KERNEL_ERROR_EINVAL, caller);
 }
 
 int KYTY_SYSV_ABI PthreadAttrSetsolosched(PthreadAttr* attr, int solosched) {
@@ -2272,11 +2405,9 @@ int KYTY_SYSV_ABI PthreadAttrSetstacksize(PthreadAttr* attr, size_t stack_size) 
 int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 	PRINT_NAME();
 
-	if (rwlock == nullptr) {
+	if (rwlock == nullptr || *rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
 
 	{
 		std::lock_guard lock((*rwlock)->m);
@@ -2755,11 +2886,9 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 	PRINT_NAME();
 
-	if (cond == nullptr) {
+	if (cond == nullptr || *cond == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
-
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
 	int result = 0;
 
@@ -2841,6 +2970,8 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 	// PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
+
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -2880,6 +3011,17 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 	if (mutex_value->owner != g_pthread_self) {
 		return KERNEL_ERROR_EPERM;
+	}
+
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_WAITS") != nullptr) {
+		static std::atomic<uint32_t> trace_count {0};
+		if (trace_count.fetch_add(1) < 96) {
+			LOGF("PSM_WAIT_TIMED caller=0x%016" PRIx64 " thread=%s usec=%" PRIu64
+			     " cond=0x%016" PRIx64 "\n",
+			     reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+			     g_pthread_self != nullptr ? g_pthread_self->name.c_str() : "(unknown)",
+			     static_cast<uint64_t>(usec), reinterpret_cast<uint64_t>(cond_value));
+		}
 	}
 
 	std::unique_lock cond_lock(cond_value->m);
@@ -3047,6 +3189,16 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return KERNEL_ERROR_EPERM;
 	}
 
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_WAITS") != nullptr) {
+		static std::atomic<uint32_t> trace_count {0};
+		if (trace_count.fetch_add(1) < 96) {
+			LOGF("PSM_WAIT_COND caller=0x%016" PRIx64 " thread=%s cond=0x%016" PRIx64 "\n",
+			     reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+			     g_pthread_self != nullptr ? g_pthread_self->name.c_str() : "(unknown)",
+			     reinterpret_cast<uint64_t>(cond_value));
+		}
+	}
+
 	std::unique_lock cond_lock(cond_value->m);
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
@@ -3082,6 +3234,36 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 }
 
+// libkernel reads fixed pthread fields via fs:[0x10]: +0x00 tid, +0x08/+0x0c umtx, +0x2c/+0x30
+// counters, +0x58 list link, +0x90/+0x98 sched, +0xd0..+0xdc cancel, +0x184 join. Exec-child
+// threads get a separate guest object; pthread_t is its address.
+static uint64_t EnsureGuestPthreadObject(Pthread thread) {
+	if (!Process::IsExecChild() || thread == nullptr) {
+		return 0;
+	}
+	std::lock_guard lock(g_guest_pthread_mutex);
+	if (thread->guest_pthread_obj != 0) {
+		return thread->guest_pthread_obj;
+	}
+	constexpr uint64_t TCB_SIZE = 0x40;
+	constexpr uint64_t OBJ_SIZE = 0x400;
+	const auto         tcb      = Memory::AllocateRuntimeMemory(
+	    0, TCB_SIZE + OBJ_SIZE, Common::VirtualMemory::Mode::ReadWrite, "guest_pthread_tcb");
+	EXIT_IF(tcb == 0);
+	auto*      tcb_words              = reinterpret_cast<uint64_t*>(tcb);
+	const auto obj                    = tcb + TCB_SIZE;
+	tcb_words[0]                      = tcb;
+	tcb_words[2]                      = obj;
+	*reinterpret_cast<uint32_t*>(obj) = static_cast<uint32_t>(thread->guest.thread_id);
+	thread->guest_tcb                 = tcb;
+	thread->guest_pthread_obj         = obj;
+	g_guest_pthread_objects[obj]      = thread;
+	LOGF("EXEC_GUEST_PTHREAD_OBJECT guest_pid=%d guest_tid=%d"
+	     " tcb=0x%016" PRIx64 " pthread_obj=0x%016" PRIx64 " fs10_libkernel_fields\n",
+	     Process::GetPid(), thread->guest.thread_id, tcb, obj);
+	return obj;
+}
+
 Pthread PthreadHostObjectFor(Pthread thread) {
 	if (thread == nullptr) {
 		return nullptr;
@@ -3090,10 +3272,24 @@ Pthread PthreadHostObjectFor(Pthread thread) {
 	const auto      it = g_guest_pthread_objects.find(reinterpret_cast<uint64_t>(thread));
 	return it != g_guest_pthread_objects.end() ? it->second : thread;
 }
+
+uint64_t PthreadPrepareGuestTcbForCurrentThread() {
+	if (!Process::IsExecChild() || g_pthread_self == nullptr) {
+		return 0;
+	}
+	EnsureGuestPthreadObject(g_pthread_self);
+	Loader::SetExecNativeThreadFsBase(g_pthread_self->guest_tcb);
+	return g_pthread_self->guest_tcb;
+}
+
 Pthread KYTY_SYSV_ABI PthreadSelf() {
 	// PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(g_pthread_self == nullptr);
+
+	if (const auto obj = EnsureGuestPthreadObject(g_pthread_self); obj != 0) {
+		return reinterpret_cast<Pthread>(obj);
+	}
 
 	return g_pthread_self;
 }
@@ -3105,6 +3301,11 @@ Pthread PthreadSelfOrNull() {
 Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
 	g_pthread_self = thread;
+
+	if (Process::IsExecChild() && thread != nullptr && EnsureGuestPthreadObject(thread) != 0) {
+		Loader::SetExecNativeThreadFsBase(thread->guest_tcb);
+	}
+
 	return previous;
 }
 
@@ -3112,17 +3313,21 @@ uint64_t PthreadGetHostThreadId(Pthread thread) {
 	return thread != nullptr ? thread->host_thread_id : 0;
 }
 
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
 static thread_local std::atomic<uint64_t> g_unattached_signal_mask[2] {};
+
 PthreadSignalMask PthreadGetSignalMask(Pthread thread) {
 	auto* words = thread != nullptr ? thread->blocked_signal_mask : g_unattached_signal_mask;
 	return {{words[0].load(std::memory_order_acquire), words[1].load(std::memory_order_acquire)}};
 }
+
 void PthreadSetSignalMask(Pthread thread, PthreadSignalMask mask) {
 	mask.words[0] &= ~((1ull << 8) | (1ull << 16) | (1ull << 31));
 	auto* words = thread != nullptr ? thread->blocked_signal_mask : g_unattached_signal_mask;
 	words[0].store(mask.words[0], std::memory_order_release);
 	words[1].store(mask.words[1], std::memory_order_release);
 }
+
 bool PthreadIsSignalBlocked(Pthread thread, int signum) {
 	if (signum < 1 || signum > 128) {
 		return false;
@@ -3131,6 +3336,7 @@ bool PthreadIsSignalBlocked(Pthread thread, int signum) {
 	const auto bit   = static_cast<unsigned>(signum - 1);
 	return (words[bit / 64].load(std::memory_order_acquire) & (1ull << (bit % 64))) != 0;
 }
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 // Raise a host signal on another guest thread.
 bool PthreadKillHost(Pthread thread, int host_signal) {
@@ -3170,6 +3376,7 @@ bool PthreadTakePendingSignal(Pthread thread, int signum) {
 }
 
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size) {
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr || thread->attr == nullptr || stack_addr == nullptr ||
 	    stack_size == nullptr) {
 		return false;
@@ -3214,19 +3421,36 @@ int PthreadGetCurrentPriorityForKernel() {
 static void CleanupThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 
-	LibcInternalExt::RunThreadAtexitDestructors();
+	if (!thread->rfork_exec_retired) {
+		LibcInternalExt::RunThreadAtexitDestructors();
 
-	auto thread_dtors = g_pthread_context->GetThreadDtors();
+		auto thread_dtors = g_pthread_context->GetThreadDtors();
 
-	if (thread_dtors != nullptr) {
-		thread_dtors();
+		if (thread_dtors != nullptr) {
+			thread_dtors();
+		}
+
+		DestructPthreadSpecific();
+	} else {
+		g_pthread_specific.reset();
 	}
 
-	DestructPthreadSpecific();
-
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
-	rt->DeleteTlss(thread->unique_id);
+	if (thread->rfork_exec_retired) {
+		rt->DiscardTlssForExec(thread->unique_id);
+	} else {
+		rt->DeleteTlss(thread->unique_id);
+	}
 
+	if (thread->guest_process_pid > 0 && !thread->rfork_exec_retired) {
+		if (thread->rfork_exit_known) {
+			Process::NotifyRforkChildExited(thread->guest_process_pid, thread->rfork_exit_status);
+		} else {
+			LOGF("SYSCORE_GUEST_RFORK_CHILD_EXIT_STATUS_UNKNOWN guest_pid=%d"
+			     " exit_not_notified\n",
+			     thread->guest_process_pid);
+		}
+	}
 	thread->almost_done = true;
 }
 
@@ -3320,10 +3544,46 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	if (thread->rfork_stack_top != 0) {
+		stack_top = reinterpret_cast<void*>(thread->rfork_stack_top);
+	}
+	if (!Common::HostException::PrepareNativeGuestHandlerHostStackForCurrentThread()) {
+		EXIT("Failed to prepare the native guest handler host stack\n");
+	}
+	Common::HostException::SetCurrentGuestStackBounds(
+	    reinterpret_cast<uint64_t>(thread->attr->stack_addr),
+	    static_cast<uint64_t>(thread->attr->stack_size));
+	PthreadPrepareGuestTcbForCurrentThread();
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
+	Common::HostException::ClearCurrentGuestStackBounds();
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_THREAD_LIFECYCLE") != nullptr) {
+		static std::atomic<uint32_t> trace_count {0};
+		if (trace_count.fetch_add(1) < 1024) {
+			const auto result = reinterpret_cast<uint64_t>(ret);
+			LOGF("PSM_THREAD_RETURN guest_pid=%d guest_tid=%d name=%s"
+			     " result_class=%s result_low32=0x%08x\n",
+			     Process::GetPid(), thread->guest.thread_id, Log::EscapeField(thread->name).c_str(),
+			     result == 0            ? "zero"
+			     : result <= UINT32_MAX ? "scalar"
+			                            : "pointer",
+			     result <= UINT32_MAX ? static_cast<uint32_t>(result) : 0u);
+		}
+	}
+	if (thread->guest_process_pid > 0 && !thread->rfork_exec_retired) {
+		thread->rfork_exit_status =
+		    (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ret)) & 0xffu) << 8;
+		thread->rfork_exit_known = true;
+	}
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_pop(1);
+
+	if (thread->rfork_exec_retired) {
+		const int pid = thread->guest_process_pid;
+		rfork_fd_scope.reset();
+		rfork_pid_scope.reset();
+		Process::NotifyRforkChildContextRetired(pid);
+	}
 
 	return ret;
 }
@@ -3374,13 +3634,46 @@ static int KYTY_SYSV_ABI PthreadCreateImpl(Pthread* thread, const PthreadAttr* a
 		created_thread->name            = (name != nullptr ? name : "");
 		created_thread->entry           = entry;
 		created_thread->arg             = arg;
+		created_thread->guest_process_pid  = guest_process_pid;
+		created_thread->guest_parent_pid   = Process::GetPid();
+		created_thread->rfork_stack_top    = rfork_stack_top;
+		created_thread->rfork_exit_known   = false;
+		created_thread->rfork_exit_status  = 0;
+		created_thread->rfork_exec_retired = false;
 		created_thread->guest.thread_id = ++g_pthread_thread_id;
 		created_thread->almost_done     = false;
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
-
+		created_thread->pending_signal_mask.store(0, std::memory_order_release);
+		PthreadSetSignalMask(created_thread, PthreadGetSignalMask(PthreadSelfOrNull()));
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
+		if (result == 0 && std::getenv("KYTY_DIAGNOSTIC_PSM_THREAD_LIFECYCLE") != nullptr) {
+			static std::atomic<uint32_t> trace_count {0};
+			if (trace_count.fetch_add(1) < 1024) {
+				auto* linker          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+				auto* creator_program = linker->FindProgramByAddr(creator);
+				auto* entry_program = linker->FindProgramByAddr(reinterpret_cast<uint64_t>(entry));
+				const auto creator_module =
+				    creator_program == nullptr
+				        ? std::string("unknown")
+				        : Common::PathToString(creator_program->file_name.filename());
+				const auto entry_module =
+				    entry_program == nullptr
+				        ? std::string("unknown")
+				        : Common::PathToString(entry_program->file_name.filename());
+				LOGF("PSM_THREAD_CREATE guest_pid=%d guest_tid=%d name=%s result=0"
+				     " creator_module=%s creator_rva=0x%016" PRIx64
+				     " entry_module=%s entry_rva=0x%016" PRIx64 "\n",
+				     Process::GetPid(), created_thread->guest.thread_id,
+				     Log::EscapeField(created_thread->name).c_str(), creator_module.c_str(),
+				     creator_program == nullptr ? 0 : creator - creator_program->base_vaddr,
+				     entry_module.c_str(),
+				     entry_program == nullptr
+				         ? 0
+						 : reinterpret_cast<uint64_t>(entry) - entry_program->base_vaddr);
+			}
+		}
 
 		if (result != 0) {
 			FreeGuestStack(created_thread->attr);
@@ -3402,6 +3695,12 @@ static int KYTY_SYSV_ABI PthreadCreateImpl(Pthread* thread, const PthreadAttr* a
 		return result;
 	}
 
+	if (result == 0) {
+		if (const auto obj = EnsureGuestPthreadObject(created_thread); obj != 0) {
+			*thread = reinterpret_cast<Pthread>(obj);
+		}
+	}
+
 	switch (result) {
 		case 0: return OK;
 		case ENOMEM: return KERNEL_ERROR_ENOMEM;
@@ -3410,6 +3709,12 @@ static int KYTY_SYSV_ABI PthreadCreateImpl(Pthread* thread, const PthreadAttr* a
 		case EPERM: return KERNEL_ERROR_EPERM;
 		default: return KERNEL_ERROR_EINVAL;
 	}
+}
+
+int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
+                                pthread_entry_func_t entry, void* arg, const char* name) {
+	return PthreadCreateImpl(thread, attr, entry, arg, name, 0, 0,
+	                         reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
 int PthreadCreateGuestRfork(Pthread* thread, const PthreadAttr* attr, pthread_entry_func_t entry,
@@ -3423,9 +3728,11 @@ int PthreadCreateGuestRfork(Pthread* thread, const PthreadAttr* attr, pthread_en
 	}
 	return rc;
 }
+
 int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -3440,11 +3747,34 @@ int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_WAITS") != nullptr) {
+		LOGF("PSM_WAIT_JOIN caller=0x%016" PRIx64 " target=%s\n",
+		     reinterpret_cast<uint64_t>(__builtin_return_address(0)), thread->name.c_str());
+	}
 
-	int result = pthread_join(thread->p, value);
+	void* captured_value = nullptr;
+	int   result         = pthread_join(thread->p, value != nullptr ? value : &captured_value);
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_THREAD_LIFECYCLE") != nullptr) {
+		static std::atomic<uint32_t> trace_count {0};
+		if (trace_count.fetch_add(1) < 1024) {
+			const auto joined =
+			    result == 0 ? reinterpret_cast<uint64_t>(value != nullptr ? *value : captured_value)
+				            : 0;
+			LOGF("PSM_THREAD_JOIN guest_pid=%d guest_tid=%d name=%s result=%d"
+			     " return_class=%s return_low32=0x%08x\n",
+			     Process::GetPid(), thread->guest.thread_id, Log::EscapeField(thread->name).c_str(),
+			     result,
+			     result != 0            ? "unavailable"
+			     : joined == 0          ? "zero"
+			     : joined <= UINT32_MAX ? "scalar"
+			                            : "pointer",
+			     result == 0 && joined <= UINT32_MAX ? static_cast<uint32_t>(joined) : 0u);
+		}
+	}
 
 	if (PRINT_NAME_ENABLED) {
 		LOGF("\tthread join: %s, %d\n", thread->name.c_str(), result);
@@ -3469,6 +3799,7 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -3487,6 +3818,7 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -3499,6 +3831,7 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 int KYTY_SYSV_ABI PthreadGetaffinity(Pthread thread, KernelCpumask* mask) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -3570,6 +3903,7 @@ int KYTY_SYSV_ABI PthreadSetcanceltype(int type, int* old_type) {
 int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -3590,6 +3924,7 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -3620,6 +3955,22 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	thread->attr->guest_priority = prio;
 	LOGF("\t PthreadSetprio: %d, %d\n", thread->unique_id, prio);
 	return OK;
+}
+
+int KYTY_SYSV_ABI PthreadSetprioAndAffinity(Pthread thread, int prio, KernelCpumask mask) {
+	PRINT_NAME();
+
+	thread = PthreadHostObjectFor(thread);
+	if (mask == 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	int result = PthreadSetprio(thread, prio);
+	if (result == OK) {
+		result = PthreadSetaffinity(thread, mask);
+	}
+
+	return result;
 }
 
 void KYTY_SYSV_ABI PthreadTestcancel() {
@@ -3685,8 +4036,24 @@ void KYTY_SYSV_ABI PthreadExit(void* value) {
 	PthreadExit(nullptr);
 	__builtin_unreachable();
 }
+
+static void RetireRforkChildForExecAfterHandler(void*) {
+	PthreadRetireRforkChildForExec();
+}
+
+void PthreadRequestRetireRforkChildForExec() {
+	if (Common::HostException::QueueNativeGuestPostHandlerAction(
+	        RetireRforkChildForExecAfterHandler, nullptr)) {
+		return;
+	}
+	PthreadRetireRforkChildForExec();
+}
+
 int KYTY_SYSV_ABI PthreadEqual(Pthread thread1, Pthread thread2) {
 	static std::atomic<uint32_t> log_count {0};
+
+	thread1 = PthreadHostObjectFor(thread1);
+	thread2 = PthreadHostObjectFor(thread2);
 
 	const int result = (thread1 == thread2 ? 1 : 0);
 
@@ -3702,6 +4069,7 @@ int KYTY_SYSV_ABI PthreadEqual(Pthread thread1, Pthread thread2) {
 int KYTY_SYSV_ABI PthreadGetname(Pthread thread, char* name) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
@@ -3712,13 +4080,49 @@ int KYTY_SYSV_ABI PthreadGetname(Pthread thread, char* name) {
 
 	strncpy(name, thread->name.c_str(), 32);
 	name[31] = '\0';
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr) {
+		static std::atomic_uint32_t trace_count {0};
+		if (trace_count.fetch_add(1) < 24) {
+			LOGF("SYSCORE_PTHREAD_GETNAME_ABI guest_caller=%p"
+			     " thread=%p output=%p name=%s\n",
+			     __builtin_return_address(0), static_cast<void*>(thread), static_cast<void*>(name),
+			     name);
+		}
+	}
 
 	return OK;
+}
+
+bool PthreadPool::CopyNameByGuestId(int guest_tid, char* name) {
+	Common::LockGuard lock(m_mutex);
+	for (auto* thread: m_threads) {
+		if (thread != nullptr && !thread->free && thread->guest.thread_id == guest_tid) {
+			std::memset(name, 0, 32);
+			std::strncpy(name, thread->name.c_str(), 31);
+			return true;
+		}
+	}
+	return false;
+}
+
+int PthreadGetNameByGuestThreadId(int guest_tid, char* name) {
+	if (name == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	if (guest_tid <= 0 || g_pthread_context == nullptr) {
+		return KERNEL_ERROR_ESRCH;
+	}
+	if (g_pthread_main != nullptr && g_pthread_main->guest.thread_id == guest_tid) {
+		return PthreadGetname(g_pthread_main, name);
+	}
+	auto* pool = g_pthread_context->GetPthreadPool();
+	return pool != nullptr && pool->CopyNameByGuestId(guest_tid, name) ? OK : KERNEL_ERROR_ESRCH;
 }
 
 int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -3727,7 +4131,13 @@ int KYTY_SYSV_ABI PthreadRename(Pthread thread, const char* name) {
 		return OK;
 	}
 
+	const auto previous = thread->name;
 	thread->name = std::string(name);
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_THREAD_LIFECYCLE") != nullptr) {
+		LOGF("PSM_THREAD_RENAME guest_pid=%d guest_tid=%d old=%s new=%s\n", Process::GetPid(),
+		     thread->guest.thread_id, Log::EscapeField(previous).c_str(),
+		     Log::EscapeField(thread->name).c_str());
+	}
 
 	return OK;
 }
@@ -4192,6 +4602,7 @@ int KYTY_SYSV_ABI pthread_getschedparam(LibKernel::Pthread thread, int* policy,
                                         LibKernel::KernelSchedParam* param) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr || policy == nullptr || param == nullptr) {
 		return POSIX_EINVAL;
 	}
@@ -4206,6 +4617,7 @@ int KYTY_SYSV_ABI pthread_setschedparam(LibKernel::Pthread thread, int policy,
                                         const LibKernel::KernelSchedParam* param) {
 	PRINT_NAME();
 
+	thread = PthreadHostObjectFor(thread);
 	if (thread == nullptr || param == nullptr) {
 		return POSIX_EINVAL;
 	}
@@ -4226,6 +4638,12 @@ int KYTY_SYSV_ABI sched_get_priority_max(int policy) {
 	PRINT_NAME();
 
 	LOGF("\t policy = %d\n", policy);
+	// default max=256,min=767 makes PSM's range check reject ScePsP:AudioOutDrv; the env gate swaps
+	// them for SCHED_FIFO
+	if (policy == 1 && std::getenv("KYTY_DIAGNOSTIC_PSM_SCHED_RANGE") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT PSM_SCHED_MAX policy=1 result=767\n");
+		return 767;
+	}
 
 	return 256;
 }
@@ -4234,6 +4652,10 @@ int KYTY_SYSV_ABI sched_get_priority_min(int policy) {
 	PRINT_NAME();
 
 	LOGF("\t policy = %d\n", policy);
+	if (policy == 1 && std::getenv("KYTY_DIAGNOSTIC_PSM_SCHED_RANGE") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT PSM_SCHED_MIN policy=1 result=256\n");
+		return 256;
+	}
 
 	return 767;
 }
@@ -4403,6 +4825,14 @@ int KYTY_SYSV_ABI pthread_cond_timedwait(LibKernel::PthreadCond*          cond,
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadCondTimedwaitAbs(cond, mutex, abstime));
 }
 
+int KYTY_SYSV_ABI pthread_cond_reltimedwait_np(LibKernel::PthreadCond*   cond,
+                                               LibKernel::PthreadMutex*  mutex,
+                                               LibKernel::KernelUseconds usec) {
+	// PRINT_NAME();
+
+	return POSIX_PTHREAD_CALL(LibKernel::PthreadCondTimedwait(cond, mutex, usec));
+}
+
 int KYTY_SYSV_ABI pthread_mutex_lock(LibKernel::PthreadMutex* mutex) {
 	// PRINT_NAME();
 
@@ -4550,6 +4980,269 @@ int KYTY_SYSV_ABI pthread_getstack(const LibKernel::PthreadAttr* __restrict attr
 	return pthread_attr_getstack(attr, stack_addr, stack_size);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+int KYTY_SYSV_ABI pthread_suspend_user_context_np(LibKernel::Pthread thread) {
+	thread = PthreadHostObjectFor(thread);
+	if (thread == nullptr) {
+		return POSIX_EINVAL;
+	}
+	if (thread->free || thread->almost_done) {
+		LOGF("FIRST_FRAME_AUDIT SUSPEND_ESRCH reason=flagged free=%d almost_done=%d host_tid=%llu "
+		     "name=%s\n",
+		     thread->free ? 1 : 0, thread->almost_done ? 1 : 0,
+		     static_cast<unsigned long long>(thread->host_thread_id), thread->name.c_str());
+		return POSIX_ESRCH;
+	}
+	// TODO: chosen value, native result for suspending self not checked
+	if (thread == LibKernel::PthreadSelfOrNull()) {
+		return POSIX_EDEADLK;
+	}
+
+	HANDLE host_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE,
+	                                static_cast<DWORD>(thread->host_thread_id));
+	if (host_thread == nullptr) {
+		LOGF("FIRST_FRAME_AUDIT SUSPEND_ESRCH reason=open_thread_failed host_tid=%llu name=%s "
+		     "gle=%lu\n",
+		     static_cast<unsigned long long>(thread->host_thread_id), thread->name.c_str(),
+		     GetLastError());
+		return POSIX_ESRCH;
+	}
+
+	thread->suspend_requests++;
+	LibKernel::PthreadWakeForSignal(thread);
+
+	int      result             = 0;
+	bool     forced             = false;
+	bool     memory_lock_logged = false;
+	uint64_t last_rip           = 0;
+	uint64_t last_rsp           = 0;
+	uint64_t stalled_since      = GetTickCount64();
+
+	for (uint32_t attempt = 0;; attempt++) {
+		// SuspendThread only queues the suspend, GetThreadContext is what waits for it to land.
+		CONTEXT ctx {};
+		ctx.ContextFlags = CONTEXT_CONTROL;
+		if (SuspendThread(host_thread) == static_cast<DWORD>(-1)) {
+			LOGF("FIRST_FRAME_AUDIT SUSPEND_ESRCH reason=suspend_failed host_tid=%llu name=%s "
+			     "gle=%lu\n",
+			     static_cast<unsigned long long>(thread->host_thread_id), thread->name.c_str(),
+			     GetLastError());
+			result = POSIX_ESRCH;
+			break;
+		}
+		if (GetThreadContext(host_thread, &ctx) == 0) {
+			const DWORD gle = GetLastError();
+			// Already stopped. The context read only feeds the in_host heuristic; libmonosgen
+			// rereads via pthread_get_user_context_np.
+			if (!forced && GetTickCount64() - stalled_since >= 50) {
+				LOGF("\tpthread_suspend_user_context_np: %s context unreadable at suspend (gle=%lu "
+				     "attempts=%u)"
+				     ", leaving it suspended\n",
+				     thread->name.c_str(), gle, attempt + 1);
+				forced = true;
+			}
+			if (forced) {
+				result = 0;
+				break;
+			}
+			ResumeThread(host_thread);
+			continue;
+		}
+
+		// A thread stopped in host code may own a lock the caller needs. Kyty's image is at
+		// 0x140000000, below the guest modules, so any mapped image or anything above the guest
+		// range is host.
+		MEMORY_BASIC_INFORMATION code {};
+		VirtualQuery(reinterpret_cast<void*>(ctx.Rip), &code, sizeof(code));
+		const bool in_host = (code.Type == MEM_IMAGE || ctx.Rip >= 0xfc00000000ull);
+		const bool moved   = (ctx.Rip != last_rip || ctx.Rsp != last_rsp);
+		// read while stopped, or the suspender's own next mmap blocks on the VM lock
+		const bool holds_memory_lock =
+		    LibKernel::Memory::MemoryOperationOwnerThreadId() == thread->host_thread_id;
+		if (!in_host || thread->suspend_parked || (forced && !moved && !holds_memory_lock)) {
+			break;
+		}
+
+		ResumeThread(host_thread);
+
+		const auto now = GetTickCount64();
+		if (moved) {
+			last_rip      = ctx.Rip;
+			last_rsp      = ctx.Rsp;
+			stalled_since = now;
+			forced        = false;
+		} else if (holds_memory_lock) {
+			if (!memory_lock_logged && now - stalled_since >= 50) {
+				LOGF("\tpthread_suspend_user_context_np: %s holds the memory lock in host code at "
+				     "0x%016" PRIx64 ", waiting for it to release\n",
+				     thread->name.c_str(), static_cast<uint64_t>(ctx.Rip));
+				memory_lock_logged = true;
+			}
+		} else if (!forced && now - stalled_since >= 50) {
+			// a host wait that skips KernelDispatchPendingSignalForCurrentThread stalls the caller;
+			// logged after resume, a stopped thread may hold the log lock
+			LOGF("\tpthread_suspend_user_context_np: %s stays in host code at 0x%016" PRIx64
+			     ", suspending it there\n",
+			     thread->name.c_str(), static_cast<uint64_t>(ctx.Rip));
+			if (std::getenv("KYTY_DIAGNOSTIC_SUSPEND_HOST_STACK") != nullptr) {
+				// may exit now, so copy its stack with a non-faulting read. Words above rsp
+				// pointing into Kyty's code are mostly return addresses naming the wait.
+				MEMORY_BASIC_INFORMATION mem {};
+				VirtualQuery(reinterpret_cast<void*>(ctx.Rsp), &mem, sizeof(mem));
+				const auto top = reinterpret_cast<uint64_t>(mem.BaseAddress) + mem.RegionSize;
+				std::vector<uint64_t> stack(std::min<uint64_t>(2048, (top - ctx.Rsp) / 8));
+				SIZE_T                copied = 0;
+				ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(ctx.Rsp),
+				                  stack.data(), stack.size() * 8, &copied);
+				std::string words;
+				int         found = 0;
+				for (size_t i = 0; i < copied / 8 && found < 16; i++) {
+					MEMORY_BASIC_INFORMATION image {};
+					VirtualQuery(reinterpret_cast<void*>(stack[i]), &image, sizeof(image));
+					if (image.AllocationBase == GetModuleHandleW(nullptr) &&
+					    image.Protect == PAGE_EXECUTE_READ) {
+						words += fmt::format(" 0x{:x}", stack[i]);
+						found++;
+					}
+				}
+				auto* self = LibKernel::PthreadSelfOrNull();
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_SUSPEND_HOST_STACK t=%.3f by=%s thread=%s"
+				     " rsp=0x%016" PRIx64 " image_base=0x%016" PRIx64 " code_words=%s\n",
+				     Loader::Timer::GetTimeMs() / 1000.0,
+				     self != nullptr ? self->name.c_str() : "(unknown)", thread->name.c_str(),
+				     static_cast<uint64_t>(ctx.Rsp),
+				     reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr)), words.c_str());
+			}
+			forced = true;
+		}
+
+		if (attempt < 16) {
+			LibKernel::SchedulerBackoffOnce();
+		} else {
+			Common::Thread::SleepMicro(200);
+		}
+	}
+
+	if (result != 0) {
+		thread->suspend_requests--;
+	}
+	CloseHandle(host_thread);
+
+	return result;
+}
+
+// Guest ucontext as libmonosgen reads it, for a signal handler as well: 0x500 bytes with the
+// FreeBSD amd64 mcontext at 0x40.
+struct UserContext {
+	uint8_t  uc_head[0x48];
+	uint64_t mc_rdi;
+	uint64_t mc_rsi;
+	uint64_t mc_rdx;
+	uint64_t mc_rcx;
+	uint64_t mc_r8;
+	uint64_t mc_r9;
+	uint64_t mc_rax;
+	uint64_t mc_rbx;
+	uint64_t mc_rbp;
+	uint64_t mc_r10;
+	uint64_t mc_r11;
+	uint64_t mc_r12;
+	uint64_t mc_r13;
+	uint64_t mc_r14;
+	uint64_t mc_r15;
+	uint8_t  mc_trap[0x20];
+	uint64_t mc_rip;
+	uint8_t  mc_cs_rflags[0x10];
+	uint64_t mc_rsp;
+	uint8_t  uc_tail[0x400];
+};
+
+static_assert(offsetof(UserContext, mc_rip) == 0xe0);
+static_assert(sizeof(UserContext) == 0x500);
+
+int KYTY_SYSV_ABI pthread_get_user_context_np(LibKernel::Pthread thread, void* ucontext) {
+	thread = PthreadHostObjectFor(thread);
+	if (thread == nullptr) {
+		return POSIX_EINVAL;
+	}
+	if (thread->free || thread->almost_done) {
+		return POSIX_ESRCH;
+	}
+
+	HANDLE host_thread =
+	    OpenThread(THREAD_GET_CONTEXT, FALSE, static_cast<DWORD>(thread->host_thread_id));
+	if (host_thread == nullptr) {
+		return POSIX_ESRCH;
+	}
+
+	CONTEXT ctx {};
+	ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+	// can fail while the suspension lands; the thread is already stopped
+	bool captured = false;
+	for (int attempt = 0; attempt < 50 && !captured; attempt++) {
+		captured = (GetThreadContext(host_thread, &ctx) != 0);
+		if (!captured) Common::Thread::SleepMicro(1000);
+	}
+	CloseHandle(host_thread);
+	if (!captured) {
+		LOGF("FIRST_FRAME_AUDIT GETCTX_ESRCH host_tid=%llu name=%s gle=%lu\n",
+		     static_cast<unsigned long long>(thread->host_thread_id), thread->name.c_str(),
+		     GetLastError());
+		return POSIX_ESRCH;
+	}
+
+	// Host registers as-is even in host code: HLE runs on the guest stack, so Mono's scan up from
+	// rsp covers the spilled guest registers.
+	auto* uc = static_cast<UserContext*>(ucontext);
+	std::memset(uc, 0, sizeof(UserContext));
+	uc->mc_rdi = ctx.Rdi;
+	uc->mc_rsi = ctx.Rsi;
+	uc->mc_rdx = ctx.Rdx;
+	uc->mc_rcx = ctx.Rcx;
+	uc->mc_r8  = ctx.R8;
+	uc->mc_r9  = ctx.R9;
+	uc->mc_rax = ctx.Rax;
+	uc->mc_rbx = ctx.Rbx;
+	uc->mc_rbp = ctx.Rbp;
+	uc->mc_r10 = ctx.R10;
+	uc->mc_r11 = ctx.R11;
+	uc->mc_r12 = ctx.R12;
+	uc->mc_r13 = ctx.R13;
+	uc->mc_r14 = ctx.R14;
+	uc->mc_r15 = ctx.R15;
+	uc->mc_rip = ctx.Rip;
+	uc->mc_rsp = ctx.Rsp;
+
+	return 0;
+}
+
+int KYTY_SYSV_ABI pthread_resume_user_context_np(LibKernel::Pthread thread) {
+	thread = PthreadHostObjectFor(thread);
+	if (thread == nullptr) {
+		return POSIX_EINVAL;
+	}
+	if (thread->free || thread->almost_done) {
+		return POSIX_ESRCH;
+	}
+
+	HANDLE host_thread =
+	    OpenThread(THREAD_SUSPEND_RESUME, FALSE, static_cast<DWORD>(thread->host_thread_id));
+	if (host_thread == nullptr) {
+		return POSIX_ESRCH;
+	}
+
+	const auto previous = ResumeThread(host_thread);
+	CloseHandle(host_thread);
+	if (previous == static_cast<DWORD>(-1)) {
+		return POSIX_ESRCH;
+	}
+	if (previous != 0) {
+		thread->suspend_requests--;
+	}
+
+	return 0;
+}
+#endif
 
 } // namespace Posix
 

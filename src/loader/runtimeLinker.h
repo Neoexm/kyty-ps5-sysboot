@@ -19,6 +19,10 @@ struct Elf64_Sym;
 struct Elf64_Rela;
 class RuntimeLinker;
 
+
+// fs:[disp] emulation in the exception handler consults this base on exec-child guest threads; 0
+// disables it.
+void     SetExecNativeThreadFsBase(uint64_t guest_tcb);
 using module_func_t                          = KYTY_SYSV_ABI int (*)(size_t args, const void* argp);
 using application_heap_free_func_t           = KYTY_SYSV_ABI void (*)(void*);
 using application_heap_malloc_func_t         = KYTY_SYSV_ABI void* (*)(uint64_t);

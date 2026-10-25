@@ -3908,6 +3908,8 @@ LIB_DEFINE(InitLibKernel_1_EventFlag) {
 	LIB_FUNC("7uhBFWRAS60", EventFlag::KernelClearEventFlag);
 	LIB_FUNC("BpFoboUJoZU", EventFlag::KernelCreateEventFlag);
 	LIB_FUNC("8mql9OcQnd4", EventFlag::KernelDeleteEventFlag);
+	LIB_FUNC("1vDaenmJtyA", EventFlag::KernelOpenEventFlag);
+	LIB_FUNC("s9-RaxukuzQ", EventFlag::KernelCloseEventFlag);
 	LIB_FUNC("9lvj5DjHZiA", EventFlag::KernelPollEventFlag);
 	LIB_FUNC("JTvBflhYazQ", EventFlag::KernelWaitEventFlag);
 	LIB_FUNC("IOnSvHzqu6A", EventFlag::KernelSetEventFlag);
@@ -3915,6 +3917,8 @@ LIB_DEFINE(InitLibKernel_1_EventFlag) {
 
 LIB_DEFINE(InitLibKernel_1_Semaphore) {
 	LIB_FUNC("188x57JYp0g", Semaphore::KernelCreateSema);
+	LIB_FUNC("MwhHNKdBXq8", Semaphore::KernelOpenSema);
+	LIB_FUNC("HBkUky2PZPA", Semaphore::KernelCloseSema);
 	LIB_FUNC("R1Jvn8bSCW8", Semaphore::KernelDeleteSema);
 	LIB_FUNC("Zxa0VhQVTsk", Semaphore::KernelWaitSema);
 	LIB_FUNC("12wOHk8ywb0", Semaphore::KernelPollSema);

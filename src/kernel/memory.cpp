@@ -943,6 +943,10 @@ private:
 };
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static MemoryOperationMutex g_memory_operation_mutex;
+
+uint64_t MemoryOperationOwnerThreadId() {
+	return g_memory_operation_mutex.Owner();
+}
 class AnonymousSharedMemory {
 public:
 	explicit AnonymousSharedMemory(uint16_t object_mode, uint64_t object_id)

@@ -6,6 +6,10 @@
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "kernel/pthread.h"
+#include "kernel/fileSystem.h"
+#include "kernel/memory.h"
+#include "kernel/process.h"
+#include "kernel/execProcess.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
 #include "libs/libs.h"
@@ -19,21 +23,33 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fmt/format.h>
 #include <list>
+#include <limits>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <vector>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 namespace Libs {
 
 namespace LibKernel {
 void KernelDispatchPendingSignalForCurrentThread();
 } // namespace LibKernel
 
+namespace Jemspace {
+bool ContainsAllocation(const void* pointer, uint64_t size);
+}
 namespace LibC {
 
 LIB_VERSION("libc", 1, "libc", 1, 1);

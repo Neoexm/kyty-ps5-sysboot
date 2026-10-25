@@ -33,6 +33,8 @@ struct SyscallRequest {
 	bool                    stack_arg7_valid = false;
 };
 Reply DispatchSyscall(const SyscallRequest& request);
+// mini-syscore cold-boot event creation, mini-syscore.elf 0x4022A0
+bool InitializeOriginalMiniSyscoreBootEvents();
 } // namespace Libs::NativeKernelBridge
 
 #endif // KYTY_EMULATOR_LIBS_NATIVE_KERNEL_BRIDGE_H_

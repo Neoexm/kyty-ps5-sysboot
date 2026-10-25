@@ -95,6 +95,8 @@ Pthread               PthreadSelfOrNull();
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 // host object for a guest pthread handle, or the argument if it isn't one
 Pthread PthreadHostObjectFor(Pthread thread);
+// exec children: each guest thread has a TCB + pthread object for libkernel fs:[0x10]; 0 elsewhere
+uint64_t              PthreadPrepareGuestTcbForCurrentThread();
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);
 int PthreadCreateGuestRfork(Pthread* thread, const PthreadAttr* attr, pthread_entry_func_t entry,
@@ -107,11 +109,16 @@ int KYTY_SYSV_ABI     PthreadSetcancelstate(int state, int* old_state);
 int KYTY_SYSV_ABI     PthreadSetcanceltype(int type, int* old_type);
 int KYTY_SYSV_ABI     PthreadGetprio(Pthread thread, int* prio);
 int KYTY_SYSV_ABI     PthreadSetprio(Pthread thread, int prio);
+int KYTY_SYSV_ABI     PthreadSetprioAndAffinity(Pthread thread, int prio, KernelCpumask mask);
 void KYTY_SYSV_ABI    PthreadTestcancel();
 int KYTY_SYSV_ABI     PthreadSetaffinity(Pthread thread, KernelCpumask mask);
 void KYTY_SYSV_ABI    PthreadExit(void* value);
+[[noreturn]] void     PthreadRetireRforkChildForExec();
+void                  PthreadRequestRetireRforkChildForExec();
 int KYTY_SYSV_ABI     PthreadEqual(Pthread thread1, Pthread thread2);
 int KYTY_SYSV_ABI     PthreadGetname(Pthread thread, char* name);
+// guest TID -> Pthread registry name, main thread included
+int                   PthreadGetNameByGuestThreadId(int guest_tid, char* name);
 int KYTY_SYSV_ABI     PthreadRename(Pthread thread, const char* name);
 void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
@@ -120,6 +127,7 @@ uint64_t              PthreadGetHostThreadId(Pthread thread);
 struct PthreadSignalMask {
 	uint64_t words[2] {};
 };
+int                   KernelSigprocmask(int how, const void* set, void* oset);
 PthreadSignalMask     PthreadGetSignalMask(Pthread thread);
 void                  PthreadSetSignalMask(Pthread thread, PthreadSignalMask mask);
 bool                  PthreadIsSignalBlocked(Pthread thread, int signum);
@@ -134,6 +142,9 @@ bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_addr
 #endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void PthreadParkForSuspend(Pthread thread);
 #endif
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();
@@ -275,6 +286,9 @@ int KYTY_SYSV_ABI pthread_cond_wait(LibKernel::PthreadCond* cond, LibKernel::Pth
 int KYTY_SYSV_ABI pthread_cond_timedwait(LibKernel::PthreadCond*          cond,
                                          LibKernel::PthreadMutex*         mutex,
                                          const LibKernel::KernelTimespec* abstime);
+int KYTY_SYSV_ABI     pthread_cond_reltimedwait_np(LibKernel::PthreadCond*   cond,
+                                                   LibKernel::PthreadMutex*  mutex,
+                                                   LibKernel::KernelUseconds usec);
 int KYTY_SYSV_ABI pthread_once(void* once_control, void(KYTY_SYSV_ABI* init_routine)());
 int KYTY_SYSV_ABI pthread_mutex_lock(LibKernel::PthreadMutex* mutex);
 int KYTY_SYSV_ABI pthread_mutex_trylock(LibKernel::PthreadMutex* mutex);
@@ -302,6 +316,11 @@ int KYTY_SYSV_ABI   pthread_mutexattr_destroy(LibKernel::PthreadMutexattr* attr)
 int KYTY_SYSV_ABI   pthread_getstack(const LibKernel::PthreadAttr* __restrict attr,
                                      void** __restrict stack_addr, size_t* __restrict stack_size);
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+int KYTY_SYSV_ABI pthread_suspend_user_context_np(LibKernel::Pthread thread);
+int KYTY_SYSV_ABI pthread_get_user_context_np(LibKernel::Pthread thread, void* ucontext);
+int KYTY_SYSV_ABI pthread_resume_user_context_np(LibKernel::Pthread thread);
+#endif
 
 } // namespace Posix
 

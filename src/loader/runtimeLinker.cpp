@@ -5290,7 +5290,16 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
-	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
+	Libs::LibKernel::PthreadPrepareGuestTcbForCurrentThread();
+	auto*    main_stack_top  = Libs::LibKernel::PthreadCreateMainGuestStack();
+	uint64_t main_stack_base = 0;
+	uint64_t main_stack_size = 0;
+	if (!Libs::LibKernel::PthreadGetGuestStack(Libs::LibKernel::PthreadSelfOrNull(),
+	                                           &main_stack_base, &main_stack_size) ||
+	    !Common::HostException::PrepareNativeGuestHandlerHostStackForCurrentThread()) {
+		EXIT("Failed to prepare the main native guest handler host stack\n");
+	}
+	Common::HostException::SetCurrentGuestStackBounds(main_stack_base, main_stack_size);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	size_t expanded_size = 0;

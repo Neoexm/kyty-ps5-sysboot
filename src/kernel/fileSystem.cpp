@@ -1151,6 +1151,7 @@ public:
 	File* GetFile(const std::filesystem::path& real_name);
 	void  CloseAll();
 	std::shared_ptr<GuestSocketReadSource>  PinSocketReadSource(int fd);
+	bool                                    ResolveKqueue(int fd, int64_t* handle);
 	int  GetFlags(int fd);
 	int  SetFlags(int fd, int flags);
 	int  Export(std::string* manifest);
@@ -5495,8 +5496,49 @@ int CreateEqueueDescriptor(int64_t handle) {
 	return fd;
 }
 
+int CreateNativeKqueueDescriptor() {
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_NATIVE_KQUEUE_BACKEND") == nullptr) {
+		return KERNEL_ERROR_ENOSYS;
+	}
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	const int rc = EventQueue::KernelCreateEqueue(&queue, "SceSysAvControl Native Kqueue");
+	if (rc != OK) {
+		return rc;
+	}
+	const int fd   = g_files->CreateDescriptor();
+	auto*     file = g_files->GetFile(fd);
+	EXIT_IF(file == nullptr);
+	file->name         = "native-kqueue";
+	file->real_name    = "/dev/kqueue";
+	file->special      = SpecialFile::NativeKqueue;
+	file->special_size = static_cast<uint64_t>(queue);
+	file->opened       = true;
+	LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KQUEUE_FD fd=%d guest_event_queue=%" PRId64 "\n", fd,
+	     queue);
+	return fd;
+}
 
+bool ResolveNativeKqueueDescriptor(int fd, int64_t* handle) {
+	return g_files != nullptr && g_files->ResolveKqueue(fd, handle);
+}
 
+bool FileDescriptors::ResolveKqueue(int fd, int64_t* handle) {
+	if (handle == nullptr || fd < DESCRIPTOR_MIN) {
+		return false;
+	}
+	Common::LockGuard lock(m_mutex);
+	const auto        index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size()) return false;
+	const auto* file = m_files[index];
+	if (file == nullptr || !file->opened ||
+	    (file->special != SpecialFile::NativeKqueue &&
+	     file->special != SpecialFile::NativeEqueueDescriptor)) {
+		return false;
+	}
+	*handle = static_cast<int64_t>(file->special_size);
+	return static_cast<bool>(EventQueue::KernelPinEqueue(*handle));
+}
 
 bool IsNativeDmemDescriptor(int fd) {
 	if (fd < DESCRIPTOR_MIN || g_files == nullptr) {

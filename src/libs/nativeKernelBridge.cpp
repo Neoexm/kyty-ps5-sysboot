@@ -819,6 +819,70 @@ Reply MiniSyscorePread(const SyscallRequest& request) {
 	}
 	return reply;
 }
+Reply MiniSyscoreSemaphore(const SyscallRequest& request) {
+	using namespace LibKernel::Semaphore;
+	const int owner = LibKernel::Process::GetPid();
+	if (request.number == 0x225 || request.number == 0x227) {
+		std::string name;
+		const int   rc = ReadExecveGuestString(request.args[0], 256,
+		                                       LibKernel::KERNEL_ERROR_ENAMETOOLONG, &name);
+		if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+		KernelSema sem = nullptr;
+		int        result;
+		if (request.number == 0x225) {
+			if (request.args[1] > UINT32_MAX || request.args[2] > INT32_MAX ||
+			    request.args[3] > INT32_MAX) {
+				return {-1, Libs::Posix::POSIX_EINVAL};
+			}
+			result = KernelCreateSema(&sem, name.c_str(), static_cast<uint32_t>(request.args[1]),
+			                          static_cast<int>(request.args[2]),
+			                          static_cast<int>(request.args[3]), nullptr);
+		} else {
+			result = KernelOpenExistingSema(&sem, name.c_str());
+		}
+		if (result != 0) return {-1, LibKernel::KernelToPosix(result)};
+		const auto handle = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sem));
+		LOGF("MINI_NATIVE_SEMA_OBJECT op=0x%llx pid=%d name=%s handle=%u\n",
+		     static_cast<unsigned long long>(request.number), owner, name.c_str(), handle);
+		return {handle, 0};
+	}
+	LibKernel::KernelUseconds  timeout = 0;
+	LibKernel::KernelUseconds* output  = nullptr;
+	if (request.number == 0x229) {
+		if (request.args[1] == 0 || request.args[1] > INT32_MAX)
+			return {-1, Libs::Posix::POSIX_EINVAL};
+		output = reinterpret_cast<LibKernel::KernelUseconds*>(request.args[2]);
+		if (output != nullptr &&
+		    (!LibKernel::Memory::CanWriteGuest(output, sizeof(timeout)) ||
+		     !ReadExecveGuestMemory(request.args[2], &timeout, sizeof(timeout)))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+	}
+	if (request.args[0] > INT32_MAX) return {-1, Libs::Posix::POSIX_ESRCH};
+	const auto sem = reinterpret_cast<KernelSema>(static_cast<uintptr_t>(request.args[0]));
+	if (request.number == 0x226 || request.number == 0x228) {
+		const int rc = request.number == 0x226 ? KernelDeleteSema(sem) : KernelCloseSema(sem);
+		return rc == 0 ? Reply {0, 0} : Reply {-1, LibKernel::KernelToPosix(rc)};
+	}
+	if (request.args[1] > INT32_MAX) return {-1, Libs::Posix::POSIX_EINVAL};
+	int rc;
+	if (request.number == 0x22b) {
+		rc = KernelSignalSema(sem, static_cast<int>(request.args[1]));
+	} else if (request.number == 0x229) {
+		rc                = KernelWaitSema(sem, static_cast<int>(request.args[1]),
+		                                   output != nullptr ? &timeout : nullptr);
+		const bool waited = rc == 0 || rc == LibKernel::KERNEL_ERROR_ETIMEDOUT ||
+		                    rc == LibKernel::KERNEL_ERROR_ECANCELED ||
+		                    rc == LibKernel::KERNEL_ERROR_EACCES;
+		if (waited && output != nullptr &&
+		    !LibKernel::Memory::CopyToGuest(output, &timeout, sizeof(timeout))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+	} else {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	return rc == 0 ? Reply {0, 0} : Reply {-1, LibKernel::KernelToPosix(rc)};
+}
 Reply MiniSyscoreSocketpair(const SyscallRequest& request) {
 	if (request.args[0] != 1 || request.args[1] != 1 || request.args[2] != 0) {
 		return {-1, Libs::Posix::POSIX_ENOSYS};
@@ -1238,11 +1302,113 @@ struct NativeEventFlag {
 	std::string                           name;
 };
 std::mutex                                    g_native_event_lock;
+std::unordered_map<uint32_t, NativeEventFlag> g_native_event_flags;
 uint32_t                                      g_native_event_next = 0;
 bool UseNativeEventFlags() {
 	return std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr ||
 	       (LibKernel::Process::IsExecChild() &&
 	        std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr);
+}
+Reply NativeEventFlagOperation(const SyscallRequest& request) {
+	using namespace LibKernel::EventFlag;
+	std::unique_lock lock(g_native_event_lock);
+	const int        owner = LibKernel::Process::GetPid();
+	if (request.number == 0x21a || request.number == 0x21c) {
+		std::string name;
+		const int   error =
+		    ReadExecveGuestString(request.args[0], 32, LibKernel::KERNEL_ERROR_ENAMETOOLONG, &name);
+		if (error != 0) return {-1, LibKernel::KernelToPosix(error)};
+		if (name.empty()) return {-1, Libs::Posix::POSIX_EINVAL};
+		const bool create = request.number == 0x21a;
+		if (create && (request.args[1] > UINT32_MAX || (request.args[1] & 0x100) == 0)) {
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		if (g_native_event_next >= 0x3fffffffu) return {-1, Libs::Posix::POSIX_EAGAIN};
+		KernelEventFlag flag = nullptr;
+		const int       rc = create ? KernelCreateEventFlag(&flag, name.c_str(),
+		                                                    static_cast<uint32_t>(request.args[1]),
+		                                                    request.args[2], nullptr)
+		                            : KernelOpenExistingEventFlag(&flag, name.c_str());
+		if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+		++g_native_event_next;
+		g_native_event_flags.emplace(g_native_event_next,
+		                             NativeEventFlag {flag, owner, create, name});
+		LOGF("NATIVE_EVENTFLAG_HANDLE pid=%d id=%u name=%s create=%d initial=0x%llx attr=0x%llx\n",
+		     owner, g_native_event_next, name.c_str(), create ? 1 : 0,
+		     static_cast<unsigned long long>(create ? request.args[2] : 0),
+		     static_cast<unsigned long long>(create ? request.args[1] : 0));
+		return {g_native_event_next, 0};
+	}
+	if (request.args[0] > INT32_MAX) return {-1, Libs::Posix::POSIX_ESRCH};
+	const auto found = g_native_event_flags.find(static_cast<uint32_t>(request.args[0]));
+	if (found == g_native_event_flags.end() || found->second.owner != owner) {
+		return {-1, Libs::Posix::POSIX_ESRCH};
+	}
+	const auto handle = found->second;
+	int        rc     = LibKernel::KERNEL_ERROR_ENOSYS;
+	if (request.number == 0x21b || request.number == 0x21d) {
+		rc = request.number == 0x21b ? KernelDeleteEventFlag(handle.flag)
+		                             : KernelCloseEventFlag(handle.flag);
+		if (rc == 0) g_native_event_flags.erase(found);
+		LOGF("NATIVE_EVENTFLAG_RELEASE pid=%d id=%llu name=%s delete=%d result=0x%08x\n", owner,
+		     static_cast<unsigned long long>(request.args[0]), handle.name.c_str(),
+		     handle.creator ? 1 : 0, static_cast<uint32_t>(rc));
+	} else if (request.number == 0x220 || request.number == 0x221) {
+		rc = request.number == 0x220 ? KernelSetEventFlag(handle.flag, request.args[1])
+		                             : KernelClearEventFlag(handle.flag, request.args[1]);
+		static std::atomic<uint32_t> changes {0};
+		if (changes.fetch_add(1) < 256) {
+			LOGF("NATIVE_EVENTFLAG_CHANGE pid=%d id=%llu name=%s operation=%s pattern=0x%llx "
+			     "result=0x%08x\n",
+			     owner, static_cast<unsigned long long>(request.args[0]), handle.name.c_str(),
+			     request.number == 0x220 ? "set" : "clear",
+			     static_cast<unsigned long long>(request.args[1]), static_cast<uint32_t>(rc));
+		}
+	} else if (request.number == 0x21e || request.number == 0x21f) {
+		const uint64_t mode = request.args[2];
+		if ((mode & ~uint64_t(0x3f)) != 0 || ((mode & 0xf) != 1 && (mode & 0xf) != 2) ||
+		    (mode & 0x30) == 0x30 || request.args[1] == 0)
+			return {-1, Libs::Posix::POSIX_EINVAL};
+		uint64_t                  pattern = 0;
+		LibKernel::KernelUseconds timeout = 0;
+		if (request.args[3] != 0 &&
+		    !LibKernel::Memory::CanWriteGuest(reinterpret_cast<void*>(request.args[3]),
+		                                      sizeof(pattern))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		const bool wait = request.number == 0x21e;
+		if (wait && request.args[4] != 0 &&
+		    (!LibKernel::Memory::CanWriteGuest(reinterpret_cast<void*>(request.args[4]),
+		                                       sizeof(timeout)) ||
+		     !ReadExecveGuestMemory(request.args[4], &timeout, sizeof(timeout))))
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		if (wait) {
+			std::string scope;
+			if (!LibKernel::Process::GetScope(&scope)) return {-1, Libs::Posix::POSIX_ENOSYS};
+			lock.unlock();
+			rc = KernelWaitEventFlag(handle.flag, request.args[1], static_cast<uint32_t>(mode),
+			                         &pattern, request.args[4] != 0 ? &timeout : nullptr);
+		} else {
+			rc = KernelPollEventFlag(handle.flag, request.args[1], static_cast<uint32_t>(mode),
+			                         &pattern);
+		}
+		if (request.args[3] != 0 &&
+		    !LibKernel::Memory::CopyToGuest(reinterpret_cast<void*>(request.args[3]), &pattern,
+		                                    sizeof(pattern))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		if (wait && request.args[4] != 0 &&
+		    !LibKernel::Memory::CopyToGuest(reinterpret_cast<void*>(request.args[4]), &timeout,
+		                                    sizeof(timeout))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		LOGF("NATIVE_EVENTFLAG_WAIT_RESULT pid=%d id=%llu wait=%d requested=0x%llx actual=0x%llx "
+		     "result=0x%08x\n",
+		     owner, static_cast<unsigned long long>(request.args[0]), wait ? 1 : 0,
+		     static_cast<unsigned long long>(request.args[1]),
+		     static_cast<unsigned long long>(pattern), static_cast<uint32_t>(rc));
+	}
+	return rc == 0 ? Reply {0, 0} : Reply {-1, LibKernel::KernelToPosix(rc)};
 }
 struct NativeNamedObject {
 	std::string name;
@@ -1287,6 +1453,91 @@ Reply NativeNamedObjectOperation(const SyscallRequest& request) {
 	     owner, name.c_str(), registry.next, static_cast<unsigned long long>(request.args[1]),
 	     type);
 	return {registry.next, 0};
+}
+Reply NamedObject(const SyscallRequest& request) {
+	if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr ||
+	    LibKernel::Process::IsExecChild()) {
+		return NativeNamedObjectOperation(request);
+	}
+	// 0x22d (name, object, type) / 0x22e (id, type). The 16-bit id sits beside the type (mutex
+	// +0x3c, semaphore +2) and comes back on destroy; sceKernelDeleteEqueue reads errno 3 as
+	// already gone.
+	static const bool table = std::getenv("KYTY_DIAGNOSTIC_NAMEDOBJ_ID_TABLE") != nullptr;
+	static std::mutex mutex;
+	static std::unordered_map<uint32_t, uint32_t> types;
+	static std::unordered_map<uint32_t, int64_t>  named_live_equeues;
+	static uint32_t                               last = 0;
+	static std::atomic<uint32_t>                  count {0};
+	static std::atomic<uint32_t>                  failures {0};
+	if (!table) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	const bool      trace = count.fetch_add(1) < 512;
+	std::lock_guard lock(mutex);
+	if (request.number == 0x22e) {
+		const auto id    = static_cast<uint32_t>(request.args[0]);
+		const auto found = types.find(id);
+		if (found == types.end()) {
+			if (failures.fetch_add(1) < 64) {
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NAMEDOBJ delete id=%u type=0x%x is not in the "
+				     "table, ESRCH NON_AUTHENTIC\n",
+				     id, static_cast<uint32_t>(request.args[1]));
+			}
+			return {-1, Libs::Posix::POSIX_ESRCH};
+		}
+		if (trace) {
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NAMEDOBJ delete id=%u type=0x%x created=0x%x "
+			     "NON_AUTHENTIC\n",
+			     id, static_cast<uint32_t>(request.args[1]), found->second);
+		}
+		types.erase(found);
+		named_live_equeues.erase(id);
+		return {0, 0};
+	}
+	const auto* name = reinterpret_cast<const char*>(request.args[0]);
+	const auto  type = static_cast<uint32_t>(request.args[2]);
+	if (name == nullptr) {
+		if (failures.fetch_add(1) < 64) {
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NAMEDOBJ create object=0x%" PRIx64
+			     " type=0x%x has no name, EFAULT NON_AUTHENTIC\n",
+			     request.args[1], type);
+		}
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	int64_t real_backing_queue = 0;
+	if (type == 0x107) {
+		// splash 0x439610 names its kqueue; naming must not signal it
+		if (request.args[1] > INT32_MAX || std::strcmp(name, "SceAvControlSplash") != 0 ||
+		    !LibKernel::FileSystem::ResolveNativeKqueueDescriptor(static_cast<int>(request.args[1]),
+		                                                          &real_backing_queue)) {
+			return {-1, Libs::Posix::POSIX_EINVAL};
+		}
+	}
+	if (types.size() >= 0xfffe) {
+		if (failures.fetch_add(1) < 64) {
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NAMEDOBJ create name=%s type=0x%x has no free "
+			     "16-bit id, EAGAIN NON_AUTHENTIC\n",
+			     name, type);
+		}
+		return {-1, Libs::Posix::POSIX_EAGAIN};
+	}
+	do {
+		last = last % 0xfffe + 1;
+	} while (types.count(last) != 0);
+	types[last] = type;
+	if (type == 0x107) {
+		named_live_equeues[last] = real_backing_queue;
+		LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_NAMED_EQUEUE_BACKING"
+		     " fd=%" PRIu64 " queue=%" PRId64 " process_local_name_id=%u\n",
+		     request.args[1], real_backing_queue, last);
+	}
+	if (trace) {
+		LOGF(
+		    "FIRST_FRAME_AUDIT DIAGNOSTIC_NAMEDOBJ create name=%s object=0x%" PRIx64
+		    " type=0x%x id=%u process-local id table, no kernel registry behind it NON_AUTHENTIC\n",
+		    name, request.args[1], type, last);
+	}
+	return {last, 0};
 }
 } // namespace
 bool ShouldLogMiniSyscallTrace(uint64_t ordinal) {
@@ -1340,6 +1591,50 @@ Reply DispatchSyscall(const SyscallRequest& request) {
 			}
 		}
 	}
+}
+bool InitializeOriginalMiniSyscoreBootEvents() {
+	// stands in for mini-syscore 0x4022A0. Bit 0x2 (0x40E850) needs subsystem-board init and stays
+	// clear
+	static std::mutex                                           init_mutex;
+	static bool                                                 initialized = false;
+	static std::array<LibKernel::EventFlag::KernelEventFlag, 3> producer_handles {};
+	std::lock_guard                                             lock(init_mutex);
+	if (initialized) return true;
+
+	struct OriginalSonyCreation {
+		const char* name;
+		uint32_t    attributes;
+	};
+	constexpr OriginalSonyCreation authentic_creations[] = {
+	    {"SceSysCoreReboot", 0x121},
+	    {"SceBootStatusFlags", 0x121},
+	    {"SceSysCoreSuspend", 0x101},
+	};
+
+	for (size_t i = 0; i < std::size(authentic_creations); ++i) {
+		auto*       handle = &producer_handles[i];
+		const auto& spec   = authentic_creations[i];
+		const int   rc = LibKernel::EventFlag::KernelCreateEventFlag(handle, spec.name,
+		                                                             spec.attributes, 0, nullptr);
+		if (rc != 0 || *handle == nullptr) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_MINI_SYSCORE_EVENT_CREATE_FAILED"
+			     " name=%s attr=0x%x"
+			     " result=0x%08x\n",
+			     spec.name, spec.attributes, static_cast<uint32_t>(rc));
+			for (size_t j = 0; j < i; ++j) {
+				(void)LibKernel::EventFlag::KernelDeleteEventFlag(producer_handles[j]);
+				producer_handles[j] = nullptr;
+			}
+			return false;
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_MINI_SYSCORE_EVENT_CREATED"
+		     " creator_pc=0x4022A0 name=%s"
+		     " attributes=0x%x initial_bits=0"
+		     " backed_by_named_event_registry\n",
+		     spec.name, spec.attributes);
+	}
+	initialized = true;
+	return true;
 }
 bool RunSelfTests() {
 	const Reply page     = Dispatch({Service::SysconfExport, {47}});
