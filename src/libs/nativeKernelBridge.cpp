@@ -61,6 +61,13 @@ namespace Libs::NativeKernelBridge {
 
 namespace {
 constexpr uint64_t           kGuestPageSize = 0x4000;
+// libkernel stubs may sign-extend a 32-bit handle into the 64-bit register
+static bool OriginalNativeHandle32IsCanonical(uint64_t raw) {
+	if (raw == 0) return false;
+	const auto low = static_cast<uint32_t>(raw);
+	return raw == static_cast<uint64_t>(low) ||
+	       raw == static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(low)));
+}
 void Trace(const char* name, const Request& request, int64_t rc, int guest_errno) {
 	static std::atomic<uint32_t> count {0};
 	const uint32_t               nth = count.fetch_add(1);
@@ -1153,6 +1160,75 @@ Reply SysctlPageSize(const SyscallRequest& request) {
 	}
 	std::string name;
 }
+struct SysAvIpmiServer {
+	std::string service_name;
+	uint64_t    original_guest_server  = 0;
+	uint64_t    original_guest_config  = 0;
+	uint32_t    owner_pid              = 0;
+	int64_t     registered_event_queue = 0;
+	uint32_t    notification_limit     = 0;
+	// TODO: no client message producer yet
+	std::deque<std::vector<uint8_t>> pending_requests;
+};
+static std::mutex                                    g_sysav_ipmi_lock;
+static std::condition_variable                       g_sysav_ipmi_message_cv;
+static std::unordered_map<uint32_t, SysAvIpmiServer> g_sysav_ipmi_servers;
+Reply SysAvIpmiManagerCall(const SyscallRequest& request) {
+	if (std::getenv("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI") != nullptr) {
+		if (request.args[0] > UINT32_MAX ||
+		    (request.args[1] != 0 && !OriginalNativeHandle32IsCanonical(request.args[1]))) {
+			return {-1, Libs::Posix::POSIX_EINVAL};
+		}
+		int        status  = -1;
+		const bool handled = LibKernel::IpmiManager::TryCall(
+		    static_cast<uint32_t>(request.args[0]), static_cast<int32_t>(request.args[1]),
+		    reinterpret_cast<int32_t*>(request.args[2]), reinterpret_cast<void*>(request.args[3]),
+		    request.args[4], request.args[5], &status);
+		if (!handled) return {-1, Libs::Posix::POSIX_ENOSYS};
+		LOGF("NATIVE_IPMI_SHARED_ADAPTER command=0x%" PRIx64 " pid=%d handle=0x%" PRIx64
+		     " transport=%d\n",
+		     request.args[0], LibKernel::Process::GetPid(), request.args[1], status);
+		return {status, status == -1 ? *Libs::Posix::GetErrorAddr() : 0};
+	}
+	const bool create_server =
+	    request.args[0] == 0 && request.args[1] == 0 && request.args[4] == 0x18;
+	const bool following_ipmi_call = request.args[0] == 0x10 && request.args[1] >= 0x1f00 &&
+	                                 request.args[1] <= 0x1f05 && request.args[4] == 0x40;
+	const bool create_client =
+	    request.args[0] == 2 && request.args[1] == 0 && request.args[4] == 0x18;
+	const bool client_control = request.args[0] == 0x400 && request.args[1] > 0 &&
+	                            request.args[1] <= UINT32_MAX && request.args[4] == 0x20;
+	const bool destroy_client = request.args[0] == 3 && request.args[1] > 0 &&
+	                            request.args[1] <= UINT32_MAX && request.args[3] == 0 &&
+	                            request.args[4] == 0;
+	const bool original_client_followup =
+	    request.args[0] == 0x46b && request.args[4] == sizeof(uint64_t);
+	const bool failed_server_name = request.args[0] == 0x46a && request.args[1] == 0x8002004e &&
+	                                request.args[4] == sizeof(uint64_t);
+	const bool receive_packet_201 =
+	    request.args[0] == 0x201 && request.args[1] != 0 && request.args[4] == 0x20;
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
+	    (!create_server && !following_ipmi_call && !create_client && !client_control &&
+	     !destroy_client && !original_client_followup && !failed_server_name &&
+	     !receive_packet_201)) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	if (following_ipmi_call) {
+		if (!ValidateSysctlSpan(reinterpret_cast<const void*>(request.args[3]), 0x40, false) ||
+		    !ValidateSysctlSpan(reinterpret_cast<void*>(request.args[2]), sizeof(uint32_t), true)) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		const uint32_t operation_result = 0;
+		if (!WriteSysctlMemory(reinterpret_cast<void*>(request.args[2]), &operation_result,
+		                       sizeof(operation_result))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_IPMI_TRACE"
+		     " suboperation=0x%04" PRIx64 " record_bytes=0x40 result=0 nonblocking\n",
+		     request.args[1]);
+		return {0, 0};
+	}
+}
 enum class ExecutableImageKind {
 	Invalid,
 	Self,
@@ -1545,6 +1621,34 @@ bool ShouldLogMiniSyscallTrace(uint64_t ordinal) {
 }
 Reply PreflightSyscoreExecve(const SyscallRequest& request) {
 	return SyscoreExecvePreflight(request);
+}
+int WaitForImportedGuestIpmiServerRequest(uint32_t server_id, uint64_t capacity) {
+	if (server_id == 0 || capacity == 0 || capacity > 0x10000) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	std::unique_lock lock(g_sysav_ipmi_lock);
+	auto             it = g_sysav_ipmi_servers.find(server_id);
+	if (it == g_sysav_ipmi_servers.end()) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+	LOGF("FIRST_FRAME_AUDIT IMPORTED_IPMI_SERVER_RECEIVE_WAIT"
+	     " server_id=%u service=%s requested_capacity=%" PRIu64 " pending=%zu\n",
+	     server_id, it->second.service_name.c_str(), capacity, it->second.pending_requests.size());
+	if (std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_TRACE_RESULT") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT AUDIO_IPMI_TRACE_0X10_RESULT"
+		     " server_id=%u name=%s registered_server=1"
+		     " rpcsx_trace_0x10_contract\n",
+		     server_id, it->second.service_name.c_str());
+		return 0;
+	}
+	g_sysav_ipmi_message_cv.wait(lock, [server_id] {
+		const auto server = g_sysav_ipmi_servers.find(server_id);
+		return server == g_sysav_ipmi_servers.end() || !server->second.pending_requests.empty();
+	});
+	if (g_sysav_ipmi_servers.find(server_id) == g_sysav_ipmi_servers.end()) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+	return LibKernel::KERNEL_ERROR_ENOSYS;
 }
 Reply Dispatch(const Request& request) {
 	Reply       result {};

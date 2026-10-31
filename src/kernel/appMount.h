@@ -19,5 +19,6 @@ int Begin(const std::function<int(Request&)>&                  copyin,
           const std::function<int(uint64_t, void*, uint64_t)>& read);
 // Raw syscall 0x2c3; copyin reads the int the argument points at.
 int         End(const std::function<int(int32_t*)>& copyin);
+bool        GetAttachedApp(int pid, int32_t* app_id);
 } // namespace Libs::LibKernel::AppMount
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_APP_MOUNT_H_ */

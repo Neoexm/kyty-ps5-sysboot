@@ -326,4 +326,12 @@ void Exit(int pid) {
 	proc->used = false;
 	if (budget != -1) LOGF("BUDGET_EXIT pid=%d detached=%d\n", pid, budget);
 }
+bool Ptype(int pid, int32_t* ptype) {
+	TableLock lock;
+	if (lock.table == nullptr || ptype == nullptr) return false;
+	const auto* proc = FindProc(*lock.table, pid);
+	if (proc == nullptr || proc->ptype < 0) return false;
+	*ptype = proc->ptype;
+	return true;
+}
 } // namespace Libs::LibKernel::Budget

@@ -124,6 +124,7 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 bool                   CanWriteGuest(const void* destination, uint64_t size);
+bool                   QueryGuestRangeNoTrace(const void* address, VirtualQueryInfo* info);
 bool     CopyToGuest(void* destination, const void* source, uint64_t size);
 bool     CopyFromGuest(void* destination, const void* source, uint64_t size);
 uint64_t MemoryOperationOwnerThreadId();

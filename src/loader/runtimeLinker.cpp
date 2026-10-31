@@ -896,7 +896,81 @@ struct InitializerStackTestState {
 	bool     closed         = false;
 };
 
+static KYTY_SYSV_ABI int TestModuleInitializer(size_t args, const void* argp, module_func_t func) {
+	if (args != sizeof(InitializerStackTestState) || argp == nullptr || func != nullptr)
+		return Libs::LibKernel::KERNEL_ERROR_EINVAL;
+	auto* state =
+	    const_cast<InitializerStackTestState*>(static_cast<const InitializerStackTestState*>(argp));
+	int32_t  result = -1;
+	uint64_t object = 0;
+	char     name[] = "InitializerAbsentService";
+	uint64_t config[42] {};
+	config[0] = sizeof(config);
+	uint64_t descriptor[3] {reinterpret_cast<uint64_t>(&object), reinterpret_cast<uint64_t>(name),
+	                        reinterpret_cast<uint64_t>(config)};
+	state->result_address = reinterpret_cast<uint64_t>(&result);
+	state->guest_output   = Libs::LibKernel::Memory::CanWriteGuest(&result, sizeof(result));
+	const auto reply      = Libs::NativeKernelBridge::DispatchSyscall(
+	    {0x26e,
+		 {2, 0, reinterpret_cast<uint64_t>(&result), reinterpret_cast<uint64_t>(descriptor),
+		  sizeof(descriptor), 0xdeadbadecafebeafull}});
+	state->transport   = static_cast<int>(reply.value);
+	state->posix_error = reply.posix_errno;
+	state->operation   = result;
+	if (reply.value == 0 && result > 0) {
+		int32_t    close_result = -1;
+		const auto close        = Libs::NativeKernelBridge::DispatchSyscall(
+		    {0x26e,
+			 {3, static_cast<uint64_t>(result), reinterpret_cast<uint64_t>(&close_result), 0, 0,
+			  0}});
+		state->closed = close.value == 0 && close.posix_errno == 0 && close_result == 0;
+	}
+	return reply.value == 0 ? result : static_cast<int32_t>(0x80020000u + reply.posix_errno);
+}
 
+bool TestInitialModuleStageUsesGuestStack() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	constexpr uint64_t stack_size = 0x200000;
+	const auto         stack_base = Libs::LibKernel::Memory::AllocateGuestStackMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "module_init_stack_test");
+	if (stack_base == 0) return false;
+	const char*       setting       = std::getenv("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI");
+	const std::string saved_adapter = setting != nullptr ? setting : "";
+	setting                         = std::getenv("KYTY_DIAGNOSTIC_IPMI_SHARED_SCOPE");
+	const std::string saved_scope   = setting != nullptr ? setting : "";
+	const auto        scope         = "mi_" + std::to_string(GetCurrentProcessId());
+	const bool configured = _putenv_s("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI", "1") == 0 &&
+	                        _putenv_s("KYTY_DIAGNOSTIC_IPMI_SHARED_SCOPE", scope.c_str()) == 0;
+	InitializerStackTestState host {};
+	const int                 host_result = TestModuleInitializer(sizeof(host), &host, nullptr);
+	auto* prepared_params = reinterpret_cast<uint8_t*>(stack_base + stack_size - 0x100);
+	std::memset(prepared_params, 0xa7, sizeof(EntryParams));
+	auto*                     execution_stack = prepared_params - 0x1000;
+	InitializerStackTestState guest {};
+	auto                      initialize = [&guest] {
+		guest.returned = TestModuleInitializer(sizeof(guest), &guest, nullptr);
+	};
+	RunEntry(reinterpret_cast<uint64_t>(RunInitializerStage<decltype(initialize)>),
+	         reinterpret_cast<EntryParams*>(&initialize), nullptr, execution_stack);
+	bool params_unchanged = true;
+	for (size_t i = 0; i < sizeof(EntryParams); ++i)
+		params_unchanged &= prepared_params[i] == 0xa7;
+	const bool restored =
+	    _putenv_s("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI", saved_adapter.c_str()) == 0 &&
+	    _putenv_s("KYTY_DIAGNOSTIC_IPMI_SHARED_SCOPE", saved_scope.c_str()) == 0;
+	const bool freed = Libs::LibKernel::Memory::KernelMunmap(stack_base, stack_size) == 0;
+	return configured && !host.guest_output && host.transport == -1 &&
+	       host.posix_error == Libs::Posix::POSIX_EFAULT &&
+	       host_result == Libs::LibKernel::KERNEL_ERROR_EFAULT && guest.guest_output &&
+	       guest.result_address >= stack_base &&
+	       guest.result_address < reinterpret_cast<uint64_t>(execution_stack) &&
+	       guest.transport == 0 && guest.posix_error == 0 && guest.operation > 0 &&
+	       guest.returned == guest.operation && guest.closed && params_unchanged && restored &&
+	       freed;
+#else
+	return true;
+#endif
+}
 
 bool TestModuleRelocationUsesWritableHostMapping() {
 	constexpr uint64_t page_size = 0x4000;
@@ -3424,6 +3498,198 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					     " val=0x%016" PRIx64 " tid=%d\n",
 					     info->rsi, info->rdi, rw_words[0], rw_words[1], rw_words[2], rw_words[3],
 					     info->rdx, Libs::LibKernel::PthreadGetthreadid());
+				}
+			}
+			if (info->rax == 0x1c6 && (info->rsi == 12 || info->rsi == 13 || info->rsi == 14) &&
+			    IsWritableRange(info->rdi, 8)) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			// sys_ipmimgr_call (0x26e).
+			const bool allow_sysav_connect_handshake =
+			    std::getenv("KYTY_DIAGNOSTIC_SYSAV_IPMI_201_PASSTHROUGH") != nullptr &&
+			    ((info->rdi == 0x201 && info->rsi > 0 && info->rsi <= INT32_MAX &&
+				  info->r8 == 0x20) ||
+				 (std::getenv("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI") != nullptr &&
+				  ((info->rdi == 4 && info->rsi == UINT32_MAX && info->r8 == 0x10) ||
+				   (info->rdi == 0x302 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 8) ||
+				   (info->rdi == 0x468 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 8) ||
+				   (info->rdi == 0x232 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 24) ||
+				   (info->rdi == 0x212 && info->rsi > 0 && info->rsi <= UINT32_MAX &&
+				    info->r8 == 4) ||
+				   (info->rdi == 0x320 && info->exception_address == 0x46f0aa) ||
+				   // 0x310 from the client disconnect helper 0x469e90/0x46d710
+				   (info->rdi == 0x310 && info->exception_address == 0x46f0aa) ||
+				   // 0x444 from the async completion helper (0x46bdc0/0x46dba0), peer token in r9
+				   (info->rdi == 0x444 && info->rsi > 0 && info->rsi <= UINT32_MAX &&
+				    info->r8 == 4 && info->exception_address == 0x46f0aa) ||
+				   // async issue 0x241 (48B uap), server post 0x242 (32B), client fetch 0x243 (40B)
+				   (info->rdi == 0x241 && info->rsi > 0 && info->rsi <= UINT32_MAX &&
+				    info->r8 == 0x30) ||
+				   (info->rdi == 0x242 && info->rsi > 0 && info->rsi <= UINT32_MAX &&
+				    info->r8 == 0x20) ||
+				   (info->rdi == 0x243 && info->rsi > 0 && info->rsi <= UINT32_MAX &&
+				    info->r8 == 0x28) ||
+				   (info->rdi == 0x251 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x20000000ull && info->r8 == 0x28 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x252 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x20000000ull && info->r8 == 0x20 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x253 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 0x20 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x254 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 24 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x255 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 4 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x202 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x10000000ull && info->r8 == 0x18 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x222 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x20000000ull && info->r8 == 4 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x463 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 8 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x464 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 8 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x490 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x20000000ull && info->r8 == 0x28 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x491 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x20000000ull && info->r8 == 0x20 &&
+				    info->exception_address == 0x46f0aa) ||
+				   (info->rdi == 0x493 && info->rsi <= UINT32_MAX &&
+				    (info->rsi & 0x70000000ull) == 0x30000000ull && info->r8 == 0x10 &&
+				    info->exception_address == 0x46f0aa))));
+			const bool sysav_invoke = info->rdi == 0x320 && allow_sysav_connect_handshake;
+			// ipmi manager does the 0x310 checks, a bad record gets an error result rather than a
+			// ud2
+			const bool sysav_disconnect = info->rdi == 0x310 && allow_sysav_connect_handshake;
+			if (info->rax == 0x26e &&
+			    (((info->rdi == 0 || info->rdi == 2) && info->rsi == 0 && info->r8 == 0x18) ||
+			     (info->rdi == 0x10 && info->rsi >= 0x1f00 && info->rsi <= 0x1f05 &&
+			      info->r8 == 0x40) ||
+			     (info->rdi == 0x400 && info->rsi > 0 && info->rsi <= UINT32_MAX &&
+			      info->r8 == 0x20) ||
+			     (info->rdi == 3 && info->rsi > 0 && info->rsi <= UINT32_MAX && info->r10 == 0 &&
+			      info->r8 == 0) ||
+			     (info->rdi == 0x46a && info->rsi == 0x8002004e && info->r8 == 0x8) ||
+			     (info->rdi == 0x46b && info->r8 == 0x8) || allow_sysav_connect_handshake) &&
+			    (sysav_invoke || sysav_disconnect ||
+			     (IsWritableRange(info->rdx, sizeof(uint32_t)) &&
+			      (info->r8 == 0 ? info->r10 == 0 : IsReadableRange(info->r10, info->r8))))) {
+				uint64_t original_ipmi_input[8] {};
+				uint32_t original_output_value    = 0;
+				uint64_t original_caller_return   = 0;
+				uint64_t original_dispatch_return = 0;
+				if (info->rdi == 0x400 && IsReadableRange(info->rbp, 16)) {
+					std::memcpy(&original_caller_return,
+					            reinterpret_cast<const void*>(info->rbp + 8), 8);
+					uint64_t parent_frame = 0;
+					std::memcpy(&parent_frame, reinterpret_cast<const void*>(info->rbp), 8);
+					if (parent_frame > info->rbp && parent_frame - info->rbp < 0x10000 &&
+					    IsReadableRange(parent_frame, 16)) {
+						std::memcpy(&original_dispatch_return,
+						            reinterpret_cast<const void*>(parent_frame + 8), 8);
+					}
+				}
+				const auto input_copy = std::min<uint64_t>(info->r8, sizeof(original_ipmi_input));
+				const bool input_readable =
+				    input_copy != 0 && IsReadableRange(info->r10, input_copy);
+				if (input_readable) {
+					std::memcpy(original_ipmi_input, reinterpret_cast<const void*>(info->r10),
+					            input_copy);
+				}
+				if (IsReadableRange(info->rdx, 4)) {
+					std::memcpy(&original_output_value, reinterpret_cast<const void*>(info->rdx),
+					            4);
+				}
+				LOGF("FIRST_FRAME_AUDIT SYSAV_IPMI_REQUEST"
+				     " op=%" PRIu64 " subop=%" PRIu64 " guest_out=0x%016" PRIx64
+				     " prior_out_word=0x%08x input_guest_ptr=0x%016" PRIx64 " input_len=0x%" PRIx64
+				     " copied_len=0x%" PRIx64 " input_readable=%u"
+				     " syscall_site=0x%016" PRIx64 " guest_frame_return=0x%016" PRIx64
+				     " guest_dispatch_return=0x%016" PRIx64 " raw_words=%016" PRIx64 ",%016" PRIx64
+				     ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+				     ",%016" PRIx64 "\n",
+				     info->rdi, info->rsi, info->rdx, original_output_value, info->r10, info->r8,
+				     input_readable ? input_copy : uint64_t {0}, input_readable ? 1u : 0u,
+				     info->exception_address, original_caller_return, original_dispatch_return,
+				     original_ipmi_input[0], original_ipmi_input[1], original_ipmi_input[2],
+				     original_ipmi_input[3], original_ipmi_input[4], original_ipmi_input[5],
+				     original_ipmi_input[6], original_ipmi_input[7]);
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					uint32_t   operation_result = 0;
+					const bool output_readable =
+					    IsReadableRange(info->rdx, sizeof(operation_result));
+					if (output_readable)
+						std::memcpy(&operation_result, reinterpret_cast<const void*>(info->rdx), 4);
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_IPMI_SYSCALL_RETURN"
+					     " op=%" PRIu64 " subop=%" PRIu64 " transport_value=%" PRId64
+					     " transport_errno=%d"
+					     " output_readable=%u operation_result=0x%08x"
+					     " guest_CF=%u guest_rax=0x%016" PRIx64 " resumed_pc=0x%016" PRIx64 "\n",
+					     info->rdi, info->rsi, reply.value, reply.posix_errno,
+					     output_readable ? 1u : 0u, operation_result,
+					     static_cast<unsigned>(context->EFlags & 1), context->Rax, context->Rip);
+					return true;
+				}
+			}
+			// no whitelisted 0x26e pattern matched, this ud2 will be fatal
+			if (info->rax == 0x26e &&
+			    std::getenv("KYTY_DIAGNOSTIC_SYSAV_IPMI_UNMATCHED_AUDIT") != nullptr) {
+				static std::atomic<uint32_t> unmatched_ipmi_count {0};
+				if (unmatched_ipmi_count.fetch_add(1) < 8) {
+					uint64_t       input_words[8] {};
+					uint32_t       output_word     = 0;
+					bool           output_readable = false;
+					const uint64_t len =
+					    info->r8 > sizeof(input_words) ? sizeof(input_words) : info->r8;
+					if (info->r8 > 0 && IsReadableRange(info->r10, len)) {
+						std::memcpy(input_words, reinterpret_cast<const void*>(info->r10), len);
+					}
+					if (IsReadableRange(info->rdx, sizeof(output_word))) {
+						std::memcpy(&output_word, reinterpret_cast<const void*>(info->rdx),
+						            sizeof(output_word));
+						output_readable = true;
+					}
+					LOGF("FIRST_FRAME_AUDIT SYSAV_IPMI_UNMATCHED_INVOCATION"
+					     " op=0x%" PRIx64 " subop=0x%" PRIx64 " output_ptr=0x%016" PRIx64
+					     " output_readable=%u output_word=0x%08x"
+					     " input_ptr=0x%016" PRIx64 " input_len=0x%" PRIx64 " r9=0x%016" PRIx64
+					     " site=0x%016" PRIx64 " input_words=%016" PRIx64 ",%016" PRIx64
+					     ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+					     ",%016" PRIx64 "\n",
+					     info->rdi, info->rsi, info->rdx, static_cast<unsigned>(output_readable),
+					     output_word, info->r10, info->r8, info->r9, info->exception_address,
+					     input_words[0], input_words[1], input_words[2], input_words[3],
+					     input_words[4], input_words[5], input_words[6], input_words[7]);
+					Log::Flush();
 				}
 			}
 			// sys_thr_get_name at 0x47092A, answered from Kyty pthread state

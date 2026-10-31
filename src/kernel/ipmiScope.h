@@ -69,4 +69,5 @@ EventStatus ResetClientEvents(uint32_t client_id, uint32_t event_count, uint32_t
 EventStatus CancelClientEvents(uint32_t client_id);
 bool        WaitClientEventHint(uint32_t client_id, uint32_t milliseconds);
 } // namespace Libs::LibKernel::IpmiScope
+
 #endif

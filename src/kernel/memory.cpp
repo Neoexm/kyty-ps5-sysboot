@@ -1081,6 +1081,13 @@ bool CanWriteGuest(const void* destination, uint64_t size) {
 bool CanWriteGuestNoTrace(const void* destination, uint64_t size) {
 	return CanWriteGuestInternal(destination, size, false);
 }
+bool QueryGuestRangeNoTrace(const void* address, VirtualQueryInfo* info) {
+	if (address == nullptr || info == nullptr) return false;
+	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
+	if (g_virtual_ranges == nullptr) return false;
+	return KernelVirtualQueryLocked(reinterpret_cast<uint64_t>(address), 0, info, sizeof(*info)) ==
+	       OK;
+}
 bool CopyToGuest(void* destination, const void* source, uint64_t size) {
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
 	if (!CanWriteGuestNoTrace(destination, size)) return false;

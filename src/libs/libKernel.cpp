@@ -66,6 +66,13 @@ int          GetArgc();
 const char** GetArgv();
 } // namespace LibC
 
+static std::filesystem::path ResolveNativeModulePath(const std::string& guest_path) {
+	auto host_path = LibKernel::FileSystem::GetRealFilename(guest_path);
+	if (host_path.empty()) {
+		LibKernel::DirectoryPassthrough::ResolveHostPath(guest_path, &host_path);
+	}
+	return host_path;
+}
 struct NativeModuleSource {
 	std::filesystem::path                                    file_name;
 	std::shared_ptr<LibKernel::DirectoryPassthrough::Handle> provider_handle;
@@ -2169,6 +2176,96 @@ static void KYTY_SYSV_ABI KernelDebugRaiseExceptionOnReleaseMode(int /*c1*/, int
 static int KYTY_SYSV_ABI KernelIpmiManagerCall(uint32_t command, int32_t client_id, int32_t* result,
                                                void* args, size_t args_size, uint64_t magic) {
 	PRINT_NAME();
+	int transport_status = 0;
+	if (IpmiManager::TryCall(command, client_id, result, args, args_size, magic, &transport_status))
+		return transport_status;
+
+	if (!Memory::CanWriteGuest(result, sizeof(*result))) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+
+	if (command == 0x201 &&
+	    std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_RECEIVE_ABI2") != nullptr) {
+		Memory::VirtualQueryInfo region {};
+		const uint64_t           address = reinterpret_cast<uint64_t>(args);
+		const bool readable = args_size == 0x20 && address != 0 &&
+		                      Memory::KernelVirtualQuery(args, 0, &region, sizeof(region)) == 0 &&
+		                      region.is_committed && region.start <= address &&
+		                      region.end >= address + 0x20 && (region.protection & 1u) != 0;
+		uint64_t   descriptor[4] {};
+		if (readable) {
+			std::memcpy(descriptor, args, sizeof(descriptor));
+		}
+		LOGF("AUDIO_IPMI_RECEIVE_PACKET_ABI"
+		     " command=0x201 server_id=%d argument_size=%zu"
+		     " descriptor_readable=%d result_ptr=%p"
+		     " descriptor=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
+		     client_id, args_size, readable, static_cast<void*>(result), descriptor[0],
+		     descriptor[1], descriptor[2], descriptor[3]);
+	}
+	if (command == 0x10 && std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_AUDIT") != nullptr) {
+		Memory::VirtualQueryInfo region {};
+		const auto               address = reinterpret_cast<uint64_t>(args);
+		if (address != 0 && args_size >= sizeof(uint64_t) * 3 &&
+		    args_size <= sizeof(uint64_t) * 8 &&
+		    Memory::KernelVirtualQuery(args, 0, &region, sizeof(region)) == 0 &&
+		    region.is_committed && region.start <= address && region.end >= address + args_size &&
+		    (region.protection & 1u) != 0) {
+			uint64_t original[8] {};
+			std::memcpy(original, args, args_size);
+			LOGF("FIRST_FRAME_AUDIT AUDIO_IPMI_RECEIVE_ABI"
+			     " op=0x10 subop=0x%08x size=%zu"
+			     " descriptor=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+			     ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
+			     static_cast<uint32_t>(client_id), args_size, original[0], original[1], original[2],
+			     original[3], original[4], original[5], original[6], original[7]);
+		}
+	}
+
+	if (command == 0x10 && client_id == 0x1f00 &&
+	    std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_REGISTRY") != nullptr &&
+	    std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_RECEIVE_WAIT") != nullptr) {
+		Memory::VirtualQueryInfo region {};
+		const auto               address = reinterpret_cast<uint64_t>(args);
+		if (address == 0 || args_size != 0x40 ||
+		    Memory::KernelVirtualQuery(args, 0, &region, sizeof(region)) != 0 ||
+		    !region.is_committed || region.start > address || region.end < address + args_size ||
+		    (region.protection & 1u) == 0) {
+			return -22;
+		}
+		uint64_t receive[8] {};
+		std::memcpy(receive, args, sizeof(receive));
+		if (receive[0] == 0 || receive[0] > UINT32_MAX || receive[2] == 0 || receive[2] > 0x10000) {
+			return -22;
+		}
+		for (int i = 3; i < 8; ++i) {
+			if (receive[i] != 0) return -22;
+		}
+		Memory::VirtualQueryInfo buffer {};
+		if (receive[1] == 0 || receive[2] > UINT64_MAX - receive[1] ||
+		    Memory::KernelVirtualQuery(reinterpret_cast<const void*>(receive[1]), 0, &buffer,
+		                               sizeof(buffer)) != 0 ||
+		    !buffer.is_committed || buffer.start > receive[1] ||
+		    buffer.end < receive[1] + receive[2] || (buffer.protection & 2u) == 0) {
+			return -22;
+		}
+		const int kernel_result = NativeKernelBridge::WaitForImportedGuestIpmiServerRequest(
+		    static_cast<uint32_t>(receive[0]), receive[2]);
+		if (kernel_result == 0 &&
+		    std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_TRACE_RESULT") != nullptr) {
+			Memory::VirtualQueryInfo output {};
+			const uint64_t           address = reinterpret_cast<uint64_t>(result);
+			if (Memory::KernelVirtualQuery(result, 0, &output, sizeof(output)) != 0 ||
+			    !output.is_committed || output.start > address ||
+			    output.end < address + sizeof(*result) || (output.protection & 2u) == 0) {
+				return -14;
+			}
+			Memory::InvalidateMemory(address, sizeof(*result));
+			*result = 0;
+		}
+		return kernel_result;
+	}
 }
 static int32_t KYTY_SYSV_ABI KernelDebugRaiseException(int32_t code, const void* context) {
 	PRINT_NAME();
@@ -3544,6 +3641,28 @@ int KYTY_SYSV_ABI KernelGetProcessName(int pid, char* name) {
 	name[31] = '\0';
 	LOGF("\t pid = %d, name = %s\n", pid, name);
 	return OK;
+}
+int KYTY_SYSV_ABI TraceIpmiCreateClient(void** out_client, void* config, void* arg, void* storage) {
+	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceIpmi.sprx");
+	auto* program     = rt->FindProgramByFileName(module_path);
+	EXIT_IF(program == nullptr);
+
+	const auto before = storage != nullptr ? *reinterpret_cast<uint64_t*>(storage) : 0;
+	LOGF("IPMI create before: out=%016" PRIx64 " storage=%016" PRIx64 " first=%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(out_client), reinterpret_cast<uint64_t>(storage), before);
+
+	using create_func_t = KYTY_SYSV_ABI int (*)(void**, void*, void*, void*);
+	const auto result   = reinterpret_cast<create_func_t>(program->base_vaddr +
+	                                                      0x10a0)(out_client, config, arg, storage);
+
+	const auto client = out_client != nullptr ? reinterpret_cast<uint64_t>(*out_client) : 0;
+	const auto vtable = client != 0 ? *reinterpret_cast<const uint64_t*>(client) : 0;
+	const auto slot58 = vtable != 0 ? *reinterpret_cast<const uint64_t*>(vtable + 0x58) : 0;
+	LOGF("IPMI create after: result=0x%08x client=%016" PRIx64 " vtable=%016" PRIx64
+	     " slot58=%016" PRIx64 " expected_vtable=%016" PRIx64 "\n",
+	     static_cast<unsigned>(result), client, vtable, slot58, program->base_vaddr + 0xc010);
+	return result;
 }
 int KYTY_SYSV_ABI KernelAioInitializeImpl(void* param, int32_t size) {
 	PRINT_NAME();
