@@ -826,6 +826,26 @@ Reply MiniSyscorePread(const SyscallRequest& request) {
 	}
 	return reply;
 }
+Reply MiniSyscoreOpen(const SyscallRequest& request) {
+	const uint64_t address = request.args[0];
+	std::string    path;
+	const int      rc =
+	    ReadExecveGuestString(address, 4096, LibKernel::KERNEL_ERROR_ENAMETOOLONG, &path);
+	if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+	const bool creates = (request.args[1] & 0x200) != 0;
+	if (request.args[1] > INT32_MAX || (creates && request.args[2] > UINT16_MAX)) {
+		return {-1, Libs::Posix::POSIX_EINVAL};
+	}
+	const int fd =
+	    LibKernel::FileSystem::KernelOpen(path.c_str(), static_cast<int>(request.args[1]),
+		                                  creates ? static_cast<uint16_t>(request.args[2]) : 0);
+	const Reply reply = fd >= 0 ? Reply {fd, 0} : Reply {-1, LibKernel::KernelToPosix(fd)};
+	LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_OPEN"
+	     " path=%s guest_path=0x%016" PRIx64 " guest_flags=0x%016" PRIx64
+	     " guest_mode=0x%016" PRIx64 " fd=%" PRId64 " errno=%d\n",
+	     path.c_str(), address, request.args[1], request.args[2], reply.value, reply.posix_errno);
+	return reply;
+}
 Reply MiniSyscoreSemaphore(const SyscallRequest& request) {
 	using namespace LibKernel::Semaphore;
 	const int owner = LibKernel::Process::GetPid();
@@ -889,6 +909,64 @@ Reply MiniSyscoreSemaphore(const SyscallRequest& request) {
 		return {-1, Libs::Posix::POSIX_ENOSYS};
 	}
 	return rc == 0 ? Reply {0, 0} : Reply {-1, LibKernel::KernelToPosix(rc)};
+}
+Reply MiniSyscoreKevent(const SyscallRequest& request) {
+	if (request.args[0] > INT32_MAX || request.args[2] > 1 || request.args[4] > 1) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	int64_t queue = 0;
+	if (!LibKernel::FileSystem::ResolveNativeKqueueDescriptor(static_cast<int>(request.args[0]),
+	                                                          &queue)) {
+		return {-1, Libs::Posix::POSIX_EBADF};
+	}
+	auto* output = reinterpret_cast<LibKernel::EventQueue::KernelEvent*>(request.args[3]);
+	if (request.args[4] != 0 && !LibKernel::Memory::CanWriteGuest(output, sizeof(*output))) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	LibKernel::KernelUseconds timeout = 0;
+	if (request.args[5] != 0) {
+		LibKernel::KernelTimespec original;
+		if (!ReadExecveGuestMemory(request.args[5], &original, sizeof(original))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		if (original.tv_sec < 0 || original.tv_sec > UINT32_MAX / 1000000 || original.tv_nsec < 0 ||
+		    original.tv_nsec >= 1000000000) {
+			return {-1, Libs::Posix::POSIX_EINVAL};
+		}
+		const uint64_t micros = static_cast<uint64_t>(original.tv_sec) * 1000000 +
+		                        (static_cast<uint64_t>(original.tv_nsec) + 999) / 1000;
+		if (micros > UINT32_MAX) return {-1, Libs::Posix::POSIX_EINVAL};
+		timeout = static_cast<LibKernel::KernelUseconds>(micros);
+	}
+	if (request.args[2] != 0) {
+		LibKernel::EventQueue::KernelEvent change;
+		if (!ReadExecveGuestMemory(request.args[1], &change, sizeof(change))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		int rc;
+		if (change.filter == LibKernel::EventQueue::KERNEL_EVFILT_PROC) {
+			rc = LibKernel::EventQueue::KernelAddNativeProcEvent(queue, change);
+		} else if (change.filter == LibKernel::EventQueue::KERNEL_EVFILT_VIDEO_OUT &&
+		           change.flags == 1 && change.fflags == 0 && change.data == 0 &&
+		           change.udata == nullptr) {
+			rc = LibKernel::FileSystem::RegisterNativeDceFlipEvent(queue, change.ident);
+		} else {
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+	}
+	if (request.args[4] == 0) return {0, 0};
+	LibKernel::EventQueue::KernelEvent event;
+	int                                received = 0;
+	const int                          rc       = LibKernel::EventQueue::KernelWaitEqueue(
+	    queue, &event, 1, &received, request.args[5] != 0 ? &timeout : nullptr);
+	if (rc == LibKernel::KERNEL_ERROR_ETIMEDOUT) return {0, 0};
+	if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+	if (received != 0 && !LibKernel::Memory::CopyToGuest(output, &event, sizeof(event))) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	LOGF("MINI_NATIVE_KEVENT received=%d\n", received);
+	return {received, 0};
 }
 Reply MiniSyscoreSocketpair(const SyscallRequest& request) {
 	if (request.args[0] != 1 || request.args[1] != 1 || request.args[2] != 0) {
@@ -1159,6 +1237,214 @@ Reply SysctlPageSize(const SyscallRequest& request) {
 		return {LibKernel::KERNEL_ERROR_EFAULT, 0};
 	}
 	std::string name;
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "kern.smp.cpus") {
+		LOGF("FIRST_FRAME_AUDIT SYSAV_SYSCTL_NAME_MISSING"
+		     " name=kern.smp.cpus result=ENOENT\n");
+		return {-1, Libs::Posix::POSIX_ENOENT};
+	}
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "kern.kern_type") {
+		const uint32_t oid[2] = {1, 0x7ffffcb3};
+		return PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+	}
+	if (count == 2 && mib[0] == 1 && static_cast<uint32_t>(mib[1]) == 0x7ffffcb3) {
+		if (input != nullptr || input_len != 0) return {-1, Libs::Posix::POSIX_EPERM};
+		const int32_t kernel_type = 1;
+		const Reply   result =
+		    PublishSysctlValue(output, length, capacity, &kernel_type, sizeof(kernel_type));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_KERN_TYPE value=1 width=4"
+			     " source=kernel_13_60_captured_oid_readonly\n");
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "hw.config.bd_drive") {
+		const uint32_t oid[3] = {6, 0x7ffffe22u, 0x7ffffe1au};
+		const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSCTL_BD_DRIVE_NAMETOMIB oid=6.2147483170.2147483162"
+			     " source=live_13_60_sysctl\n");
+		}
+		return result;
+	}
+	if (count == 3 && mib[0] == 6 && static_cast<uint32_t>(mib[1]) == 0x7ffffe22u &&
+	    static_cast<uint32_t>(mib[2]) == 0x7ffffe1au) {
+		if (input != nullptr || input_len != 0) return {-1, Libs::Posix::POSIX_EPERM};
+		const uint32_t bd_drive = 3;
+		const Reply    result =
+		    PublishSysctlValue(output, length, capacity, &bd_drive, sizeof(bd_drive));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSCTL_BD_DRIVE value=%u width=4"
+			     " source=live_13_60_sysctl\n",
+			     bd_drive);
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "kern.backup_restore_mode") {
+		const uint32_t oid[2] = {1, 0x7ffffeb8};
+		return PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+	}
+	if (count == 2 && mib[0] == 1 && static_cast<uint32_t>(mib[1]) == 0x7ffffeb8) {
+		// RD|INT: only a new value is refused; the handler fetches the cache before it looks at
+		// oldptr, so a size query fetches too.
+		if (input != nullptr) return {-1, Libs::Posix::POSIX_EPERM};
+		int32_t     mode   = 0;
+		int32_t     status = 0;
+		const char* reason = nullptr;
+		if (LibKernel::RegMgr::BackupRestoreMode(&mode, &status, &reason) != 0) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_BACKUP_RESTORE_MODE_UNMODELED reason=%s result=ENOSYS\n",
+			     reason);
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		if (status != 0) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_BACKUP_RESTORE_MODE_REGMGR status=0x%08x\n",
+			     static_cast<uint32_t>(status));
+			return {-1, status};
+		}
+		const Reply result = PublishSysctlValue(output, length, capacity, &mode, sizeof(mode));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_BACKUP_RESTORE_MODE width=4 regmgr_key=0x20c0000"
+			     " source=kernel_13_60_handler_cache\n");
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "kern.init_safe_mode") {
+		const uint32_t oid[2] = {1, 0x7ffffebb};
+		const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT MINI_SAFE_MODE_NAMETOMIB"
+			     " name=kern.init_safe_mode oid=1.0x7ffffebb "
+			     "kernel_13_60_object=0xffffffff9fec0720\n");
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 1 && static_cast<uint32_t>(mib[1]) == 0x7ffffebb) {
+		if (output != nullptr && length != nullptr && input == nullptr && input_len == 0) {
+			const int fd = LibKernel::FileSystem::KernelOpen("/dev/iccnvs4", 0, 0);
+			if (fd < 0) return {-1, LibKernel::KernelToPosix(fd)};
+			uint8_t       stored = 0;
+			const int64_t bytes  = LibKernel::FileSystem::KernelPread(fd, &stored, 1, 0x20);
+			const int     closed = LibKernel::FileSystem::KernelClose(fd);
+			if (bytes != 1) return {-1, LibKernel::KernelToPosix(static_cast<int>(bytes))};
+			if (closed != 0) return {-1, LibKernel::KernelToPosix(closed)};
+			const int32_t value = stored;
+			const Reply   result =
+			    PublishSysctlValue(output, length, capacity, &value, sizeof(value));
+			if (result.value == 0) {
+				LOGF("FIRST_FRAME_AUDIT MINI_SAFE_MODE_READ value=0x%02x"
+				     " iccnvs_partition=4 offset=0x20 captured_backing=1\n",
+				     stored);
+			}
+			return result;
+		}
+		if (output == nullptr && length == nullptr && input != nullptr &&
+		    input_len == sizeof(int32_t)) {
+			int32_t value = 0;
+			if (!ReadSysctlMemory(input, &value, sizeof(value))) {
+				return {-1, Libs::Posix::POSIX_EFAULT};
+			}
+			if (value < 0 || value > 0xff) return {-1, Libs::Posix::POSIX_EINVAL};
+			const int fd = LibKernel::FileSystem::KernelOpen("/dev/iccnvs4", 0x10002, 0);
+			if (fd < 0) return {-1, LibKernel::KernelToPosix(fd)};
+			const uint8_t stored = static_cast<uint8_t>(value);
+			const int64_t bytes  = LibKernel::FileSystem::KernelPwrite(fd, &stored, 1, 0x20);
+			const int     closed = LibKernel::FileSystem::KernelClose(fd);
+			if (bytes != 1) return {-1, LibKernel::KernelToPosix(static_cast<int>(bytes))};
+			if (closed != 0) return {-1, LibKernel::KernelToPosix(closed)};
+			LOGF("FIRST_FRAME_AUDIT MINI_SAFE_MODE_WRITE value=0x%02x"
+			     " iccnvs_partition=4 offset=0x20\n",
+			     stored);
+			return {0, 0};
+		}
+		return {-1, Libs::Posix::POSIX_EINVAL};
+	}
+	if (count == 2 && mib[0] == 1 && mib[1] == 33 && input == nullptr && input_len == 0) {
+		const uint64_t stack_top = LibKernel::PthreadGetMainGuestStackTop();
+		if (stack_top == 0) {
+			return {-1, Libs::Posix::POSIX_ENOENT};
+		}
+		const Reply result =
+		    PublishSysctlValue(output, length, capacity, &stack_top, sizeof(stack_top));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KERN_USRSTACK"
+			     " guest_stack_top=0x%016" PRIx64 "\n",
+			     stack_top);
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 1 && mib[1] == 37 && input == nullptr && input_len == 0 &&
+	    output != nullptr && capacity > 0 && capacity <= 256) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		std::array<uint8_t, 256> bytes {};
+		const auto               size = static_cast<ULONG>(capacity);
+		const NTSTATUS           result =
+		    BCryptGenRandom(nullptr, bytes.data(), size, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+		if (result < 0) {
+			return {-1, Libs::Posix::POSIX_EAGAIN};
+		}
+		return PublishSysctlValue(output, length, capacity, bytes.data(), capacity);
+#else
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+#endif
+	}
+	if (count == 4 && mib[0] == 1 && mib[1] == 14 && mib[2] == 1) {
+		const char* source   = "none";
+		uint32_t    host_pid = 0;
+		Reply       result {-1, Libs::Posix::POSIX_ENOSYS};
+		// TODO: 13.60 handling of a new value (CTLFLAG_RD) not decoded
+		if (input == nullptr) {
+			const int exists =
+			    LibKernel::Process::QueryGuestProcessExists(mib[3], &source, &host_pid);
+			if (exists != 0) {
+				result.posix_errno = LibKernel::KernelToPosix(exists);
+			} else {
+				// kinfo_proc is 0x448 bytes; only ki_structsize and ki_pid (+0x48) are set
+				std::array<uint8_t, 0x448> record {};
+				const int32_t              structsize = static_cast<int32_t>(record.size());
+				std::memcpy(record.data(), &structsize, sizeof(structsize));
+				std::memcpy(record.data() + 0x48, &mib[3], sizeof(mib[3]));
+				result = PublishSysctlValue(output, length, capacity, record.data(), record.size());
+			}
+		}
+		static std::atomic<uint32_t> logged {0};
+		// always log failures - the watchdog acts on a live pid reading as gone
+		if (logged.fetch_add(1) < 64 || result.value != 0) {
+			LOGF("FIRST_FRAME_AUDIT KERN_PROC_PID caller_pid=%d caller_tid=%d pid=%d op=%s "
+			     "out_capacity=%" PRIu64 " source=%s host_pid=%u result=%" PRId64
+			     " errno=%d partial_record=%d fields=structsize,pid\n",
+			     LibKernel::Process::GetPid(), LibKernel::PthreadGetthreadid(), mib[3],
+			     input != nullptr    ? "write"
+			     : output != nullptr ? "read"
+			                         : "size",
+			     capacity, source, host_pid, result.value, result.posix_errno,
+			     result.value == 0 ? 1 : 0);
+		}
+		return result;
+	}
+	// userland_sysctl only takes newlen when new is non-null.
+	const uint64_t new_len = input != nullptr ? input_len : 0;
+	if (count == 4 && mib[0] == 1 && mib[1] == 14 && mib[2] == 0x51) {
+		// K+0x5a9740 only moves 8 byte values. req->oldlen is *oldlenp even with a null old
+		// pointer, and an untouched oldidx reports 0.
+		bool published = false;
+		int  result    = LibKernel::Budget::Builtin(
+		    static_cast<uint32_t>(mib[3]), capacity, new_len,
+		    [&](int64_t value) {
+			    published = true;
+			    return PublishSysctlValue(output, length, capacity, &value, sizeof(value)).value ==
+				               0
+			               ? 0
+						   : Libs::Posix::POSIX_EFAULT;
+		    },
+		    [&](int64_t* value) {
+			    return ReadSysctlMemory(input, value, sizeof(*value)) ? 0
+				                                                      : Libs::Posix::POSIX_EFAULT;
+		    });
+		const uint64_t zero = 0;
+		if (result == 0 && !published && length != nullptr &&
+		    !WriteSysctlMemory(length, &zero, sizeof(zero)))
+			result = Libs::Posix::POSIX_EFAULT;
+		return result == 0 ? Reply {0, 0} : Reply {-1, result};
+	}
 }
 struct SysAvIpmiServer {
 	std::string service_name;
@@ -1317,6 +1603,148 @@ Reply SyscoreNativeRdup(const SyscallRequest& request) {
 	const int fd = LibKernel::FileSystem::DuplicateParentSocketForRdup(
 	    static_cast<int>(request.args[0]), static_cast<int>(request.args[1]));
 	return fd >= 0 ? Reply {fd, 0} : Reply {-1, LibKernel::KernelToPosix(fd)};
+}
+Reply SysAvNativeKqueue(const SyscallRequest& request) {
+	if (request.number != 0x16a ||
+	    (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr &&
+	     std::getenv("KYTY_DIAGNOSTIC_SYSCORE_NATIVE_KQUEUE_BACKEND") == nullptr)) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	const int fd = LibKernel::FileSystem::CreateNativeKqueueDescriptor();
+	if (fd < 0) {
+		return {-1, LibKernel::KernelToPosix(fd)};
+	}
+	if (fd < 3) {
+		return {-1, Libs::Posix::POSIX_EBADF};
+	}
+	return {fd, 0};
+}
+Reply NativeKeventChanges(const SyscallRequest& request) {
+	using namespace LibKernel::EventQueue;
+	int64_t queue = 0;
+	if (request.args[0] > INT32_MAX || !LibKernel::FileSystem::ResolveNativeKqueueDescriptor(
+	                                       static_cast<int>(request.args[0]), &queue)) {
+		return {-1, Libs::Posix::POSIX_EBADF};
+	}
+	const auto count = request.args[2];
+	if (count == 0 || count > 8) return {-1, Libs::Posix::POSIX_ENOSYS};
+	std::array<KernelEvent, 64> changes {};
+	if (!LibKernel::Memory::CopyFromGuest(changes.data(),
+	                                      reinterpret_cast<const void*>(request.args[1]),
+	                                      count * sizeof(KernelEvent))) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	for (size_t i = 0; i != count; ++i) {
+		const auto& change  = changes[i];
+		bool        modeled = false;
+		if (change.filter == KERNEL_EVFILT_NOTIFY) {
+			modeled =
+			    change.flags == 1 && change.fflags == 0 && change.data >= 0 && change.data <= 255;
+		} else if (change.filter == KERNEL_EVFILT_USER) {
+			modeled = change.ident <= INT32_MAX && change.flags == 0x21 && change.fflags == 0;
+		} else if (change.filter == KERNEL_EVFILT_READ && change.flags == 1 && change.fflags == 0 &&
+		           change.data == 0 && change.ident <= INT32_MAX) {
+			const int fd     = static_cast<int>(change.ident);
+			int64_t   nested = 0;
+			modeled          = LibKernel::FileSystem::GetDescriptorFlags(fd) < 0 ||
+			                   LibKernel::FileSystem::PinGuestSocketReadSource(fd) != nullptr ||
+			                   LibKernel::FileSystem::PinNativeMbusReceiveQueue(fd) != nullptr ||
+			                   LibKernel::FileSystem::ResolveNativeKqueueDescriptor(fd, &nested);
+		}
+		if (!modeled) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_KEVENT5_UNMODELED_CHANGE queue=%" PRId64 " index=%zu"
+			     " ident=%" PRIuPTR " filter=%d flags=0x%04x fflags=0x%08x data=%" PRIdPTR
+			     " udata=0x%016" PRIxPTR " nothing_applied\n",
+			     queue, i, change.ident, change.filter, change.flags, change.fflags, change.data,
+			     reinterpret_cast<uintptr_t>(change.udata));
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+	}
+	for (size_t i = 0; i != count; ++i) {
+		const auto& change = changes[i];
+		int         rc     = 0;
+		LOGF("NATIVE_KEVENT_CHANGE guest_pid=%d queue=%" PRId64 " index=%zu ident=%" PRIuPTR
+		     " filter=%d flags=0x%x fflags=0x%x data=%" PRIdPTR " udata=0x%" PRIxPTR "\n",
+		     LibKernel::Process::GetPid(), queue, i, change.ident, change.filter, change.flags,
+		     change.fflags, change.data, reinterpret_cast<uintptr_t>(change.udata));
+		if (change.filter == KERNEL_EVFILT_NOTIFY) {
+			rc = KernelAddNativeNotificationEvent(queue, change);
+		} else if (change.filter == KERNEL_EVFILT_USER) {
+			rc = KernelAddOriginalNativeUserEvent(queue, change);
+		} else if (LibKernel::FileSystem::GetDescriptorFlags(static_cast<int>(change.ident)) < 0) {
+			rc = LibKernel::KERNEL_ERROR_EBADF;
+		} else {
+			rc = KernelAddReadEvent(queue, static_cast<int>(change.ident), 0, change.udata);
+		}
+		if (rc != 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_KEVENT5_CHANGE_FAILED queue=%" PRId64 " index=%zu"
+			     " ident=%" PRIuPTR " filter=%d error=0x%08x earlier_changes_kept=%zu\n",
+			     queue, i, change.ident, change.filter, static_cast<uint32_t>(rc), i);
+			return {-1, LibKernel::KernelToPosix(rc)};
+		}
+	}
+	LOGF("NATIVE_KEVENT_CHANGES_REGISTERED guest_fd=%" PRIu64 " queue=%" PRId64 " count=%" PRIu64
+	     " nothing_triggered\n",
+	     request.args[0], queue, count);
+	return {0, 0};
+}
+Reply NativeKeventWait(const SyscallRequest& request) {
+	using namespace LibKernel::EventQueue;
+	int64_t queue = 0;
+	if (request.args[0] > INT32_MAX || !LibKernel::FileSystem::ResolveNativeKqueueDescriptor(
+	                                       static_cast<int>(request.args[0]), &queue)) {
+		return {-1, Libs::Posix::POSIX_EBADF};
+	}
+	const auto count = request.args[4];
+	if (count == 0 || count > 64) return {-1, Libs::Posix::POSIX_ENOSYS};
+	auto* output = reinterpret_cast<KernelEvent*>(request.args[3]);
+	if (!LibKernel::Memory::CanWriteGuest(output, count * sizeof(KernelEvent))) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	LibKernel::KernelUseconds timeout = 0;
+	if (request.args[5] != 0) {
+		LibKernel::KernelTimespec ts {};
+		if (!LibKernel::Memory::CopyFromGuest(&ts, reinterpret_cast<const void*>(request.args[5]),
+		                                      sizeof(ts))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000 ||
+		    static_cast<uint64_t>(ts.tv_sec) > UINT32_MAX / 1000000ull) {
+			return {-1, Libs::Posix::POSIX_EINVAL};
+		}
+		const auto micros = static_cast<uint64_t>(ts.tv_sec) * 1000000ull +
+		                    (static_cast<uint64_t>(ts.tv_nsec) + 999) / 1000;
+		if (micros > UINT32_MAX) return {-1, Libs::Posix::POSIX_EINVAL};
+		timeout = static_cast<LibKernel::KernelUseconds>(micros);
+	}
+	std::array<KernelEvent, 64> events {};
+	int                         received = 0;
+	const int rc = KernelWaitEqueue(queue, events.data(), static_cast<int>(count), &received,
+	                                request.args[5] != 0 ? &timeout : nullptr);
+	if (rc == LibKernel::KERNEL_ERROR_ETIMEDOUT) return {0, 0};
+	if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+	for (int i = 0; i < received; ++i)
+		events[i].flags &= 0xfef0u;
+	if (received != 0 &&
+	    !LibKernel::Memory::CopyToGuest(output, events.data(), received * sizeof(KernelEvent))) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_GUEST_SOCKET_IO")) {
+		static std::atomic_uint32_t logged {0};
+		for (int i = 0; i < received; ++i) {
+			if (events[i].filter != KERNEL_EVFILT_READ || events[i].ident > INT32_MAX ||
+			    !LibKernel::FileSystem::PinGuestSocketReadSource(static_cast<int>(events[i].ident)))
+				continue;
+			if (logged.fetch_add(1) >= 64) break;
+			const auto& event = events[i];
+			LOGF("NATIVE_KEVENT_OUTPUT guest_pid=%d guest_fd=%" PRIu64 " queue=%" PRId64
+			     " index=%d ident=%" PRIuPTR " filter=%d flags=0x%x fflags=0x%x data=%" PRIdPTR
+			     " udata=0x%" PRIxPTR " guest_output=1\n",
+			     LibKernel::Process::GetPid(), request.args[0], queue, i, event.ident, event.filter,
+			     event.flags, event.fflags, event.data, reinterpret_cast<uintptr_t>(event.udata));
+		}
+	}
+	return {received, 0};
 }
 Reply RegMgrCall(const SyscallRequest& request) {
 	// 0x214 (op, key, int* status, void* value, size); *status is the answer when the call returns
@@ -1762,5 +2190,106 @@ bool RunSelfTests() {
 	    {0xca,
 		 {reinterpret_cast<uint64_t>(app_mib), 4, reinterpret_cast<uint64_t>(extended_info.data()),
 		  reinterpret_cast<uint64_t>(&extended_size), 0, 0}});
+	bool        named_mutex_passed       = false;
+	bool        event_flag_passed        = false;
+	bool        proc_event_passed        = false;
+	bool        ignored_open_mode_passed = false;
+	void*       socket_output            = nullptr;
+	bool        socketpair_passed =
+	    LibKernel::Memory::KernelMapNamedFlexibleMemory(&socket_output, kGuestPageSize, 3, 0,
+		                                                "native-socket-fixture") == 0;
+	if (socketpair_passed) {
+		const Reply pair_reply =
+		    MiniSyscoreSocketpair({0x87, {1, 1, 0, reinterpret_cast<uint64_t>(socket_output)}});
+		auto*      pair     = static_cast<int*>(socket_output);
+		const char sent     = 'Q';
+		char       received = 0;
+		socketpair_passed =
+		    pair_reply.value == 0 && LibKernel::FileSystem::KernelWrite(pair[0], &sent, 1) == 1 &&
+		    LibKernel::FileSystem::KernelRead(pair[1], &received, 1) == 1 && received == sent;
+		if (pair_reply.value == 0) {
+			socketpair_passed =
+			    LibKernel::FileSystem::KernelClose(pair[0]) == 0 && socketpair_passed;
+			socketpair_passed =
+			    LibKernel::FileSystem::KernelClose(pair[1]) == 0 && socketpair_passed;
+		}
+		auto* sema_name    = static_cast<char*>(socket_output) + 128;
+		auto* mutex_name   = static_cast<char*>(socket_output) + 256;
+		auto* mutex_object = static_cast<char*>(socket_output) + 512;
+		auto* missing_path = static_cast<char*>(socket_output) + 384;
+		std::memcpy(missing_path, "/__kyty_native_open_missing_fixture__",
+		            sizeof("/__kyty_native_open_missing_fixture__"));
+		const int   expected_open = LibKernel::FileSystem::KernelOpen(missing_path, 2, 0);
+		const Reply ignored_mode =
+		    MiniSyscoreOpen({0x05, {reinterpret_cast<uint64_t>(missing_path), 2, UINT64_MAX}});
+		ignored_open_mode_passed =
+		    (expected_open == LibKernel::KERNEL_ERROR_ENOENT ||
+			 expected_open == LibKernel::KERNEL_ERROR_EIO) &&
+		    ignored_mode.value == -1 &&
+		    ignored_mode.posix_errno == LibKernel::KernelToPosix(expected_open);
+		std::memcpy(mutex_name, "NativeMiniMutexFixture", sizeof("NativeMiniMutexFixture"));
+		const auto  event_name    = reinterpret_cast<uint64_t>(mutex_name);
+		const auto  event_pattern = reinterpret_cast<uint64_t>(socket_output) + 1024;
+		const Reply absent_event  = NativeEventFlagOperation({0x21c, {event_name}});
+		const Reply created_event = NativeEventFlagOperation({0x21a, {event_name, 0x121, 0}});
+		const Reply opened_event  = NativeEventFlagOperation({0x21c, {event_name}});
+		std::memset(mutex_object, 0, 80);
+		const Reply opaque_mutex = NativeNamedObjectOperation(
+		    {0x22d, {reinterpret_cast<uint64_t>(mutex_name), UINT64_MAX, 0x101}});
+		const Reply removed_opaque =
+		    NativeNamedObjectOperation({0x22e, {static_cast<uint64_t>(opaque_mutex.value), 0x101}});
+		const Reply registered_mutex =
+		    NativeNamedObjectOperation({0x22d,
+			                            {reinterpret_cast<uint64_t>(mutex_name),
+			                             reinterpret_cast<uint64_t>(mutex_object), 0x101}});
+		const Reply deleted_mutex = NativeNamedObjectOperation(
+		    {0x22e, {static_cast<uint64_t>(registered_mutex.value), 0x101}});
+		const Reply stale_mutex = NativeNamedObjectOperation(
+		    {0x22e, {static_cast<uint64_t>(registered_mutex.value), 0x101}});
+		const auto  cond_address = reinterpret_cast<uint64_t>(socket_output) + kGuestPageSize - 32;
+		const Reply registered_cond = NativeNamedObjectOperation(
+		    {0x22d, {reinterpret_cast<uint64_t>(mutex_name), cond_address, 0x102}});
+		const Reply wrong_cond_type = NativeNamedObjectOperation(
+		    {0x22e, {static_cast<uint64_t>(registered_cond.value), 0x101}});
+		const Reply deleted_cond = NativeNamedObjectOperation(
+		    {0x22e, {static_cast<uint64_t>(registered_cond.value), 0x102}});
+		const int queue_fd = LibKernel::FileSystem::CreateNativeKqueueDescriptor();
+		if (queue_fd >= 3) {
+			constexpr int fixture_pid = 0x60000400;
+			LibKernel::Process::RegisterRforkChild(fixture_pid, LibKernel::Process::GetPid());
+			auto* change = reinterpret_cast<LibKernel::EventQueue::KernelEvent*>(socket_output);
+			*change = {fixture_pid, LibKernel::EventQueue::KERNEL_EVFILT_PROC, 1, 0xa0000000u, 0,
+			           nullptr};
+			auto* event = reinterpret_cast<LibKernel::EventQueue::KernelEvent*>(
+			    static_cast<char*>(socket_output) + 32);
+			auto* poll = reinterpret_cast<LibKernel::KernelTimespec*>(
+			    static_cast<char*>(socket_output) + 96);
+			*poll                      = {0, 0};
+			const uint64_t descriptor  = static_cast<uint64_t>(queue_fd);
+			const uint64_t change_addr = reinterpret_cast<uint64_t>(change);
+			const uint64_t event_addr  = reinterpret_cast<uint64_t>(event);
+			const Reply    registered =
+			    MiniSyscoreKevent({0x16b, {descriptor, change_addr, 1, 0, 0, 0}});
+			const Reply empty = MiniSyscoreKevent(
+			    {0x16b, {descriptor, 0, 0, event_addr, 1, reinterpret_cast<uint64_t>(poll)}});
+			LibKernel::Process::NotifyRforkChildExited(fixture_pid, 0x5500);
+			const Reply exited = MiniSyscoreKevent({0x16b, {descriptor, 0, 0, event_addr, 1, 0}});
+			proc_event_passed  = registered.value == 0 && empty.value == 0 && exited.value == 1 &&
+			                     event->ident == fixture_pid && event->fflags == 0x80000000u &&
+			                     event->data == 0x5500;
+			uint32_t   status  = 0;
+			const bool waited =
+			    LibKernel::Process::WaitForChild(fixture_pid, &status, 0) == fixture_pid &&
+			    status == 0x5500;
+			const bool closed   = LibKernel::FileSystem::KernelClose(queue_fd) == 0;
+			const bool released = LibKernel::Process::ReleaseReapedRforkChild(fixture_pid);
+			proc_event_passed   = waited && closed && released &&
+			                      !LibKernel::Process::IsTrackedRforkChild(fixture_pid) &&
+			                      proc_event_passed;
+		}
+		socketpair_passed = LibKernel::Memory::KernelMunmap(
+		                        reinterpret_cast<uint64_t>(socket_output), kGuestPageSize) == 0 &&
+		                    socketpair_passed;
+	}
 }
 } // namespace Libs::NativeKernelBridge

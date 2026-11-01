@@ -12,6 +12,7 @@ namespace Libs::LibKernel::FileSystem {
 struct NativeMbusReceiveQueue;
 struct GuestSocketReadSource;
 } // namespace Libs::LibKernel::FileSystem
+
 namespace Libs::LibKernel::EventQueue {
 
 constexpr int16_t KERNEL_EVFILT_TIMER     = -7;
@@ -24,6 +25,8 @@ constexpr int16_t KERNEL_EVFILT_GRAPHICS  = -14;
 constexpr int16_t KERNEL_EVFILT_VIDEO_OUT = -13;
 constexpr int16_t KERNEL_EVFILT_HRTIMER   = -15;
 constexpr int16_t KERNEL_EVFILT_AMPR      = -25;
+constexpr int16_t KERNEL_EVFILT_DYNLIB    = -33;
+constexpr int16_t KERNEL_EVFILT_NOTIFY    = -19;
 
 class KernelEqueuePrivate;
 struct KernelEqueueEvent;
@@ -58,24 +61,39 @@ struct KernelEqueueEvent {
 	bool                    triggered   = false;
 	uint64_t                deadline_ns = 0;
 	uint64_t                interval_ns = 0;
+	// nested kqueue watched via EVFILT_READ
+	KernelEqueue                                        watched_kqueue = KERNEL_EQUEUE_INVALID;
+	std::shared_ptr<FileSystem::NativeMbusReceiveQueue> watched_mbus_receive;
+	std::shared_ptr<FileSystem::GuestSocketReadSource>  watched_guest_socket;
 	KernelEvent             event;
 	KernelFilter            filter;
 	std::deque<KernelEvent> pending_events;
 };
 
 [[nodiscard]] KernelEqueueRef KernelPinEqueue(KernelEqueue eq);
+// Checks source readiness without consuming guest events or blocking on nested queue locks.
+bool KernelEqueueHasPendingEvents(KernelEqueue eq);
 
 int KYTY_SYSV_ABI KernelAddEvent(KernelEqueue eq, const KernelEqueueEvent& event);
 int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t filter,
                                      void* trigger_data);
+int               KernelAddNativeNotificationEvent(KernelEqueue eq, const KernelEvent& original);
 int KYTY_SYSV_ABI KernelDeleteEvent(KernelEqueue eq, uintptr_t ident, int16_t filter);
 
 int KYTY_SYSV_ABI KernelCreateEqueue(KernelEqueue* eq, const char* name);
 int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq);
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo);
+int KYTY_SYSV_ABI  KernelAddDynlibEvent(KernelEqueue eq, int id);
+int KYTY_SYSV_ABI  KernelAddReadEvent(KernelEqueue eq, int fd, size_t size, void* udata);
+int KYTY_SYSV_ABI  KernelDeleteReadEvent(KernelEqueue eq, int fd);
+void KYTY_SYSV_ABI KernelDeleteReadEventForAll(int fd);
 int KYTY_SYSV_ABI KernelAddUserEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddUserEventEdge(KernelEqueue eq, int id);
+// Native kevent lists carry an opaque udata; keep it on the EV_ADD|EV_CLEAR user event.
+int KernelAddOriginalNativeUserEvent(KernelEqueue eq, const KernelEvent& original);
+// in-process RFPROC guests
+int               KernelAddNativeProcEvent(KernelEqueue eq, const KernelEvent& original);
 void              KernelNotifyNativeProcExitForAll(int pid, uint32_t exit_status);
 void              KernelNotifyNativeProcExecForAll(int pid);
 int KYTY_SYSV_ABI KernelTriggerUserEvent(KernelEqueue eq, int id, void* udata);

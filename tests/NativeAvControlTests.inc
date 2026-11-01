@@ -1,6 +1,35 @@
 #if defined(_WIN32)
 namespace NativeAvTest {
 namespace Memory = Libs::LibKernel::Memory;
+class Environment {
+public:
+  Environment() {
+    for (const char* key : controls) {
+      Save(key);
+      Set(key, key == controls.back() ? "" : "1");
+    }
+    for (const char* key : {
+        "KYTY_DIAGNOSTIC_HOLD_FIRST_PRESENT",
+        "KYTY_DIAGNOSTIC_SYSAV_FRAME_READBACK",
+        "KYTY_DIAGNOSTIC_PRESENT_READBACK",
+        "KYTY_DIAGNOSTIC_SYSTEM_BUS_TO_MAIN_LAYER"}) {
+      Save(key);
+      Set(key, "");
+    }
+  }
+  ~Environment() {
+    for (const auto& entry : saved) Set(entry.first.c_str(), entry.second.c_str());
+  }
+  static void Set(const char* key, const char* value) {
+    Check(_putenv_s(key, value) == 0, "native AV fixture controls environment");
+  }
+private:
+  void Save(const char* key) {
+    const char* value = std::getenv(key);
+    saved.emplace_back(key, value ? value : "");
+  }
+  std::vector<std::pair<std::string, std::string>> saved;
+};
 class Requests {
 public:
   Requests() {

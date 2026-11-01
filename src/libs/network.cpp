@@ -1338,6 +1338,43 @@ bool KYTY_SYSV_ABI IsSocket(int s) {
 	return g_sockets[static_cast<size_t>(s)].transport != nullptr;
 }
 
+int KYTY_SYSV_ABI SocketReadReady(int s, int64_t* pending, bool* eof) {
+	NativeSocket                     socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
+		return -1;
+	}
+
+	fd_set read {};
+	FD_ZERO(&read);
+	FD_SET(socket, &read);
+	timeval   no_wait {};
+	const int ready = ::select(static_cast<int>(socket) + 1, &read, nullptr, nullptr, &no_wait);
+	if (ready < 0) {
+		return SetHostSocketError();
+	}
+
+	int          listening = 0;
+	SocketLength length    = sizeof(listening);
+	getsockopt(socket, SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<char*>(&listening), &length);
+	if (listening != 0) {
+		*pending = ready;
+		*eof     = false;
+		return 0;
+	}
+
+#if defined(_WIN32)
+	u_long available = 0;
+	ioctlsocket(socket, FIONREAD, &available);
+	*pending = static_cast<int64_t>(available + transport->buffered_bytes.load());
+#else
+	int available = 0;
+	::ioctl(socket, FIONREAD, &available);
+	*pending = available;
+#endif
+	*eof = ready != 0 && *pending == 0;
+	return 0;
+}
 static bool TakeSocketBackend(int guest_fd, SocketSlot* out) {
 	EXIT_IF(out == nullptr);
 

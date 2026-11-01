@@ -2566,6 +2566,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 	}
+	const uint64_t kqueue_native_site =
+	    g_syscore_native_kqueue_syscall_site.load(std::memory_order_acquire);
+	if (kqueue_native_site != 0 &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_NATIVE_KQUEUE_BACKEND") != nullptr &&
+	    info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    info->exception_address == kqueue_native_site && info->rax == 0x16a &&
+	    IsReadableRange(kqueue_native_site, 2)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(kqueue_native_site);
+		if (code[0] == 0x0f && code[1] == 0x0b) {
+			const auto result = Libs::NativeKernelBridge::DispatchSyscall(
+			    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+			const bool kernel_enosys =
+			    result.value == Libs::LibKernel::KERNEL_ERROR_ENOSYS && result.posix_errno == 0;
+			const int guest_errno =
+			    kernel_enosys ? Libs::LibKernel::KernelToPosix(static_cast<int>(result.value))
+				              : result.posix_errno;
+			const bool failure = kernel_enosys || (result.value == -1 && guest_errno > 0);
+			if ((result.value >= 0 && guest_errno == 0) || failure) {
+				auto* ctx   = reinterpret_cast<CONTEXT*>(info->native_context);
+				ctx->Rax    = failure ? static_cast<uint64_t>(guest_errno)
+				                      : static_cast<uint64_t>(result.value);
+				ctx->EFlags = (ctx->EFlags & ~uint32_t {1}) | (failure ? 1u : 0u);
+				ctx->Rip += 2;
+				static std::atomic_uint32_t observed {0};
+				if (observed.fetch_add(1) < 16) {
+					LOGF("SYSCORE_NATIVE_KQUEUE_BACKEND"
+					     " syscall=0x16a descriptor=%" PRId64 " guest_result=%" PRIu64
+					     " cf=%u errno=%d"
+					     " existing_guest_kernel_event_queue\n",
+					     result.value, ctx->Rax, failure ? 1u : 0u, guest_errno);
+				}
+				return true;
+			}
+		}
+	}
 	const uint64_t kqueue_test =
 	    g_syscore_native_kqueue_result_site.load(std::memory_order_acquire);
 	if (kqueue_test != 0 && std::getenv("KYTY_DIAGNOSTIC_SYSCORE_KQUEUE_RESULT_AUDIT") != nullptr &&
@@ -6831,6 +6866,36 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		LOGF("AGC_NATIVE_KEVENT_TRAP_VALIDATED"
 		     " site=%016" PRIx64 " number=0x16b\n",
 		     program->base_vaddr + syscall_offset);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr &&
+	    program->file_name.filename() == "libkernel.sprx") {
+		constexpr uint64_t native_rdup = 0x204a;
+		EXIT_IF(native_rdup + 2 > program->base_size_aligned);
+		auto* syscall = reinterpret_cast<uint8_t*>(program->base_vaddr + native_rdup);
+		EXIT_IF(syscall[0] != 0x0f || syscall[1] != 0x05);
+		syscall[1] = 0x0b;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_syscore_native_rdup_syscall_site.store(program->base_vaddr + native_rdup,
+		                                         std::memory_order_release);
+		LOGF("SYSCORE_NATIVE_RDUP_TRAP_VALIDATED"
+		     " instruction=%016" PRIx64 " syscall=0x25b\n",
+		     program->base_vaddr + native_rdup);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_NATIVE_KQUEUE_BACKEND") != nullptr &&
+	    program->file_name.filename() == "libkernel.sprx") {
+		constexpr uint64_t kqueue_offset = 0x142a;
+		EXIT_IF(kqueue_offset + 2 > program->base_size_aligned);
+		auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + kqueue_offset);
+		EXIT_IF(code[0] != 0x0f || code[1] != 0x05);
+		code[1] = 0x0b;
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_syscore_native_kqueue_syscall_site.store(program->base_vaddr + kqueue_offset,
+		                                           std::memory_order_release);
+		LOGF("SYSCORE_NATIVE_KQUEUE_VALIDATED_TRAP"
+		     " syscall=0x16a site=%016" PRIx64 " queue_created_on_demand\n",
+		     program->base_vaddr + kqueue_offset);
 	}
 	if ((std::getenv("KYTY_DIAGNOSTIC_SYSCORE_RFORK_AUDIT") != nullptr ||
 	     std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr) &&

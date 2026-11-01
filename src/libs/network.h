@@ -54,6 +54,7 @@ int KYTY_SYSV_ABI         EpollControl(int eid, int op, int id, const NetEpollEv
 int KYTY_SYSV_ABI         EpollWait(int eid, NetEpollEvent* events, int maxevents, int timeout);
 int KYTY_SYSV_ABI         EpollDestroy(int eid);
 bool KYTY_SYSV_ABI        IsSocket(int s);
+int KYTY_SYSV_ABI         SocketReadReady(int s, int64_t* pending, bool* eof);
 int KYTY_SYSV_ABI         SocketClose(int s);
 int KYTY_SYSV_ABI         Socket(int family, int type, int protocol);
 int KYTY_SYSV_ABI         Ioctl(int s, uint64_t request, void* arg);

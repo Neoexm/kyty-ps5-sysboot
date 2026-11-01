@@ -601,6 +601,39 @@ struct SharedGuestPipe {
 		}
 	}
 
+	int64_t Write(const void* buffer, size_t length) {
+		size_t      written = 0;
+		const auto* input   = static_cast<const uint8_t*>(buffer);
+		while (written != length) {
+			if (!Lock()) {
+				return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EIO;
+			}
+			if (!Valid()) {
+				ReleaseMutex(mutex);
+				return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EIO;
+			}
+			const auto [readers, writers] = Owners(true);
+			if (readers == 0) {
+				Notify(readers, writers);
+				ReleaseMutex(mutex);
+				return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EPIPE;
+			}
+			const size_t count =
+			    std::min(length - written, static_cast<size_t>(capacity - state->size));
+			const uint32_t tail  = (state->head + state->size) % capacity;
+			const size_t   first = std::min(count, static_cast<size_t>(capacity - tail));
+			std::memcpy(state->bytes + tail, input + written, first);
+			std::memcpy(state->bytes, input + written + first, count - first);
+			state->size += static_cast<uint32_t>(count);
+			written += count;
+			Notify(readers, writers);
+			ReleaseMutex(mutex);
+			if (count == 0 && WaitForSingleObject(writable, 100) == WAIT_FAILED) {
+				return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EIO;
+			}
+		}
+		return static_cast<int64_t>(written);
+	}
 };
 #endif
 
@@ -813,6 +846,7 @@ struct NativeDceScope {
 	}
 #else
 	static std::shared_ptr<NativeDceScope> Open(const std::string&) { return nullptr; }
+	int Validate(const NativeDceLeaseIdentity&) const { return KERNEL_ERROR_ENOSYS; }
 	int Release(const NativeDceLeaseIdentity&) const { return KERNEL_ERROR_ENOSYS; }
 #endif
 };
@@ -1071,6 +1105,44 @@ struct NativeDceClient {
 static std::mutex g_native_dce_client_mutex;
 static uint64_t g_native_dce_client_sequence = 1;
 
+int RegisterNativeDceFlipEvent(int64_t queue, uint64_t ident) {
+	if (ident != 0x0006010000000000ull) return KERNEL_ERROR_EINVAL;
+	std::shared_ptr<NativeDceClient> client;
+	{
+		std::lock_guard lock(g_native_dce_client_mutex);
+		std::string     scope;
+		if (!Process::GetScope(&scope)) scope.clear();
+		const auto found = g_native_dce_clients.find(scope);
+		if (found != g_native_dce_clients.end()) client = found->second[1].lock();
+	}
+	if (client == nullptr || client->pid != Process::GetPid()) return KERNEL_ERROR_EINVAL;
+	Common::LockGuard lock(client->mutex);
+	if (!client->live) return KERNEL_ERROR_EINVAL;
+	if (client->scope != nullptr) {
+		const int rc = client->scope->Validate(client->lease);
+		if (rc != OK) return rc;
+	}
+	if (client->display_handle < 0) {
+		const int rc = VideoOut::VideoOutNativeAcquireSplashHandle(&client->display_handle,
+		                                                           &client->display_generation);
+		if (rc != OK)
+			return rc == VideoOut::VIDEO_OUT_ERROR_RESOURCE_BUSY ? KERNEL_ERROR_EBUSY
+			                                                     : KERNEL_ERROR_EINVAL;
+	}
+	const int rc = VideoOut::VideoOutNativeRegisterOriginalSplashFlipEvent(
+	    queue, ident, client->display_handle, client->display_generation);
+	if (rc != OK) return KERNEL_ERROR_EINVAL;
+	const std::pair<int64_t, uint64_t> event {queue, ident};
+	if (std::find(client->flip_events.begin(), client->flip_events.end(), event) ==
+	    client->flip_events.end()) {
+		client->flip_events.push_back(event);
+	}
+	LOGF("NATIVE_DCE_CLIENT_FLIP_EVENT_BOUND pid=%d cookie=0x%x queue=%" PRId64 " ident=0x%" PRIx64
+	     " handle=%d generation=%" PRIu64 "\n",
+	     client->pid, client->cookie, queue, ident, client->display_handle,
+	     client->display_generation);
+	return OK;
+}
 
 struct File {
 	Common::File                        f;
@@ -1152,6 +1224,8 @@ public:
 	void  CloseAll();
 	std::shared_ptr<GuestSocketReadSource>  PinSocketReadSource(int fd);
 	bool                                    ResolveKqueue(int fd, int64_t* handle);
+	std::shared_ptr<NativeMbusReceiveQueue> PinNativeMbus(int fd);
+	int  AcquireSocketPipe(int fd, bool receive, std::shared_ptr<GuestPipe>* pipe);
 	int  GetFlags(int fd);
 	int  SetFlags(int fd, int flags);
 	int  Export(std::string* manifest);
@@ -1160,6 +1234,7 @@ public:
 
 private:
 	std::vector<File*> m_files;
+	std::vector<std::weak_ptr<NativeMbusReceiveQueue>> m_mbus_pins;
 	std::array<bool, 3>                                m_standard_deci {};
 	std::array<bool, 3>                                m_standard_console {};
 	std::array<int, 3>                                 m_standard_flags {};
@@ -1361,6 +1436,30 @@ static int64_t ReadGuestPipe(const std::shared_ptr<GuestPipe>& pipe, void* buf, 
 	return static_cast<int64_t>(count);
 }
 
+static int64_t WriteGuestPipe(const std::shared_ptr<GuestPipe>& pipe, const void* buf,
+                              size_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (pipe->shared) {
+		return pipe->shared->Write(buf, size);
+	}
+#endif
+	constexpr size_t limit   = 1024 * 1024;
+	const auto*      input   = static_cast<const uint8_t*>(buf);
+	size_t           written = 0;
+	while (written != size) {
+		std::unique_lock lock(pipe->mutex);
+		pipe->cv.wait(lock, [&] { return pipe->data.size() < limit || pipe->readers == 0; });
+		if (pipe->readers == 0) {
+			return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EPIPE;
+		}
+		const auto count = std::min(limit - pipe->data.size(), size - written);
+		pipe->data.insert(pipe->data.end(), input + written, input + written + count);
+		written += count;
+		lock.unlock();
+		pipe->cv.notify_all();
+	}
+	return static_cast<int64_t>(written);
+}
 static std::atomic_bool g_diagnostic_gc_device_ready = false;
 static Common::Mutex    g_hmd_shm_mutex;
 static bool             g_hmd_shm_exists = false;
@@ -1710,7 +1809,52 @@ std::shared_ptr<GuestSocketReadSource> PinGuestSocketReadSource(int fd) {
 }
 
 
+std::shared_ptr<NativeMbusReceiveQueue> FileDescriptors::PinNativeMbus(int fd) {
+	if (fd < DESCRIPTOR_MIN) return {};
+	Common::LockGuard lock(m_mutex);
+	const auto        index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size()) return {};
+	const auto* file  = m_files[index];
+	auto        inbox = file != nullptr && file->opened ? file->native_mbus_receive : nullptr;
+	if (inbox && inbox->system) {
+		m_mbus_pins.erase(std::remove_if(m_mbus_pins.begin(), m_mbus_pins.end(),
+		                                 [](const auto& pin) { return pin.expired(); }),
+		                  m_mbus_pins.end());
+		if (std::none_of(m_mbus_pins.begin(), m_mbus_pins.end(),
+		                 [&](const auto& pin) { return pin.lock() == inbox; }))
+			m_mbus_pins.emplace_back(inbox);
+	}
+	return inbox;
+}
 
+int FileDescriptors::AcquireSocketPipe(int fd, bool receive, std::shared_ptr<GuestPipe>* pipe) {
+	if (fd < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+	Common::LockGuard lock(m_mutex);
+	if (fd < DESCRIPTOR_MIN) {
+		return m_standard_deci[fd] || !m_explicit_standard ? KERNEL_ERROR_ENOTSOCK
+		                                                   : KERNEL_ERROR_EBADF;
+	}
+	const size_t index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size() || m_files[index] == nullptr || !m_files[index]->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	auto* file = m_files[index];
+	if (file->special != SpecialFile::GuestSocketPair) {
+		return KERNEL_ERROR_ENOTSOCK;
+	}
+	const auto source = file->socket_read_source;
+	if (!source) {
+		return KERNEL_ERROR_EBADF;
+	}
+	std::lock_guard source_lock(source->mutex);
+	if (source->closed) {
+		return KERNEL_ERROR_EBADF;
+	}
+	*pipe = receive ? source->pipe : file->socket_send;
+	return ReferenceGuestPipe(*pipe, receive, 1);
+}
 
 static bool NativeDceReadable(uint64_t addr, uint64_t size, bool need_write);
 
@@ -2193,8 +2337,66 @@ static int64_t TransferIccnvs4Snapshot(File* file, void* buf, size_t length, uin
 
 static std::atomic_bool g_guest_socket_fixture_trace {false};
 
+static int64_t TransferGuestSocket(int fd, void* buf, uint64_t len, int flags, bool receive) {
+	if (g_files == nullptr) {
+		return KERNEL_ERROR_EBADF;
+	}
+	struct Operation {
+		std::shared_ptr<GuestPipe> pipe;
+		bool                       receive;
+		~Operation() {
+			if (pipe) {
+				ReferenceGuestPipe(pipe, receive, -1);
+			}
+		}
+	} operation {{}, receive};
+	const int acquired = g_files->AcquireSocketPipe(fd, receive, &operation.pipe);
+	if (acquired != OK) {
+		operation.pipe.reset();
+		return acquired;
+	}
+	if ((flags & ~(receive ? 0 : 0x20000)) != 0) {
+		return KERNEL_ERROR_EOPNOTSUPP;
+	}
+	if (len > INT64_MAX) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (!GuestSocketBufferAccessible(buf, len, receive)) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	const auto result = receive ? ReadGuestPipe(operation.pipe, buf, static_cast<size_t>(len))
+	                            : WriteGuestPipe(operation.pipe, buf, static_cast<size_t>(len));
+	if (result > 0 && std::getenv("KYTY_DIAGNOSTIC_GUEST_SOCKET_IO") != nullptr) {
+		static std::array<std::atomic_uint32_t, 2> trace_count {};
+		const bool                                 fixture = g_guest_socket_fixture_trace.load();
+		if (trace_count[fixture ? 1 : 0].fetch_add(1) < 64) {
+			char        prefix[73] {};
+			const auto* bytes = static_cast<const uint8_t*>(buf);
+			const auto  count = std::min<int64_t>(result, 36);
+			for (int64_t index = 0; index < count; ++index) {
+				std::snprintf(prefix + 2 * index, 3, "%02x", bytes[index]);
+			}
+			const char* queue_name = "process_local";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (operation.pipe->shared) queue_name = operation.pipe->shared->name.c_str();
+#endif
+			LOGF("GUEST_SOCKET_IO guest_pid=%d fd=%d operation=%s requested=%" PRIu64
+			     " transferred=%" PRId64 " flags=0x%x prefix=%s queue=%s host_fixture_only=%d\n",
+			     Process::GetPid(), fd, receive ? "recv" : "send", len, result, flags, prefix,
+			     queue_name, fixture ? 1 : 0);
+			Log::Flush();
+		}
+	}
+	return result;
+}
 
+int64_t SendGuestSocket(int fd, const void* buf, uint64_t len, int flags) {
+	return TransferGuestSocket(fd, const_cast<void*>(buf), len, flags, false);
+}
 
+int64_t RecvGuestSocket(int fd, void* buf, uint64_t len, int flags) {
+	return TransferGuestSocket(fd, buf, len, flags, true);
+}
 
 int QueryGuestSocketReadSource(const std::shared_ptr<GuestSocketReadSource>& source,
                                int64_t* pending, bool* eof) {
@@ -5585,6 +5787,9 @@ bool IsA53StorageDescriptor(int fd) {
 	        file->special == SpecialFile::NativeSsd || file->special == SpecialFile::BfsCtl);
 }
 
+std::shared_ptr<NativeMbusReceiveQueue> PinNativeMbusReceiveQueue(int fd) {
+	return g_files == nullptr ? nullptr : g_files->PinNativeMbus(fd);
+}
 
 bool IsNativeDipswDescriptor(int fd) {
 	if (fd < DESCRIPTOR_MIN || g_files == nullptr) {

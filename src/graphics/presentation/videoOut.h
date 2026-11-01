@@ -51,9 +51,48 @@ private:
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
 bool                          VideoOutIsInitialized() noexcept;
+// Binds a raw EVFILT_VIDEO_OUT change to the MAIN head's flip-completion queue.
+int  VideoOutNativeRegisterOriginalSplashFlipEvent(LibKernel::EventQueue::KernelEqueue eq,
+                                                   uint64_t original_ident, int handle = -1,
+                                                   uint64_t expected_generation = 0);
 void VideoOutNativeReleaseClientHandle(int* handle, uint64_t expected_generation);
+struct VideoOutNativeTimingSnapshot {
+	uint32_t                 width             = 0;
+	uint32_t                 height            = 0;
+	uint32_t                 h_total           = 0;
+	uint32_t                 v_total           = 0;
+	uint32_t                 pixel_clock_10khz = 0;
+	uint32_t                 ppll_rate_100hz   = 0;
+	float                    refresh_hz        = 0.0f;
+	std::array<uint32_t, 16> otg_timing {};
+	uint32_t                 pixel_encoding                                        = 0;
+	uint32_t                 subsampling                                           = 0;
+	bool                     ppll_programmed                                       = false;
+	bool                     timing_programmed                                     = false;
+	bool                     double_buffer_enabled                                 = false;
+	bool                     otg_enabled                                           = false;
+	bool                     pixel_encoding_programmed                             = false;
+	bool                     subsampling_programmed                                = false;
+	bool                     operator==(const VideoOutNativeTimingSnapshot&) const = default;
+};
 
+struct VideoOutNativeControllerSnapshot {
+	uint32_t                     display_clock_10khz = 0;
+	uint64_t                     transaction_id      = 0;
+	uint64_t                     timing_generation   = 0;
+	uint64_t                     bound_generation    = 0;
+	int32_t                      bound_handle        = -1;
+	bool                         pending             = false;
+	bool                         committed           = false;
+	bool                         master_locked       = false;
+	bool                         scanout_enabled     = false;
+	VideoOutNativeTimingSnapshot pending_timing;
+	VideoOutNativeTimingSnapshot committed_timing;
+	bool operator==(const VideoOutNativeControllerSnapshot&) const = default;
+};
 uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle);
+int      VideoOutNativeAcquireSplashHandle(int*      native_display_handle,
+                                           uint64_t* native_display_generation);
 // Backend 0, only for the linear 1920x1080 SceSysAvControlSplash buffers.
 int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_index,
                                        uint64_t  original_guest_address,

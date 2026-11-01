@@ -117,6 +117,9 @@ int  ImportExecSandboxMounts(const std::string& root, const std::string& word);
 int  GetDescriptorFlags(int fd);
 int  SetDescriptorFlags(int fd, int flags);
 struct GuestSocketReadSource;
+std::shared_ptr<GuestSocketReadSource> PinGuestSocketReadSource(int fd);
+int  QueryGuestSocketReadSource(const std::shared_ptr<GuestSocketReadSource>& source,
+                                int64_t* pending, bool* eof);
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();
@@ -157,9 +160,11 @@ bool ReadPsmShellUiApplicationSnapshot(const std::string& guest_path, std::vecto
 bool IsNullfsNoExec(const std::string& mounted_file_name);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
+int                   CreateNativeKqueueDescriptor();
 int                   DuplicateParentSocketForRdup(int parent_pid, int parent_fd);
 int                   CreateEqueueDescriptor(int64_t handle);
 bool                  ResolveNativeKqueueDescriptor(int fd, int64_t* handle);
+int                   RegisterNativeDceFlipEvent(int64_t queue, uint64_t ident);
 bool                  IsNativeDmemDescriptor(int fd);
 bool                  IsSectorPayloadDescriptor(int fd);
 bool                  IsNativeAvProbeDescriptor(int fd);
@@ -182,6 +187,7 @@ struct NativeMbusReceiveQueue {
 	std::shared_ptr<NativeSystemMbusState> system;
 	std::mutex&                            GetMutex() { return system ? system->mutex : mutex; }
 };
+std::shared_ptr<NativeMbusReceiveQueue> PinNativeMbusReceiveQueue(int fd);
 bool                                    IsNativeDipswDescriptor(int fd);
 int KYTY_SYSV_ABI     KernelPhyshmOpen(const char* path, int flags, uint16_t mode, int memory_type);
 int KYTY_SYSV_ABI     KernelShmUnlink(const char* path);

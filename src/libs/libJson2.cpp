@@ -1,11 +1,19 @@
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "kernel/fileSystem.h"
+#include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
+#include <cinttypes>
+#include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -1033,6 +1041,10 @@ static int32_t KYTY_SYSV_ABI JsonParserParse(JsonValue* dst, const char* src, si
 	return 0;
 }
 
+struct JsonParseBuffer {
+	const char* pos;
+	const char* end;
+};
 static int32_t KYTY_SYSV_ABI JsonInitializerSetGlobalNullAccessCallback(void* self, void* callback,
                                                                         void* context) {
 	PRINT_NAME();

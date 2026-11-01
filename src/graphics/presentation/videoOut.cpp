@@ -206,6 +206,13 @@ struct VideoOutConfig {
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
 };
 
+struct VideoOutVblankPhase {
+	VideoOutConfig* config            = nullptr;
+	uint64_t        generation        = 0;
+	uint64_t        timing_generation = 0;
+	bool            due               = false;
+	bool            flip_available    = false;
+};
 
 enum class VideoOutCloseMode { Direct, User, Native, NativeClient };
 class FlipQueue {
@@ -222,7 +229,7 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
-	bool Flip(uint32_t micros);
+	bool Flip(std::span<VideoOutVblankPhase> phases);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index, uint64_t generation = 0);
 
@@ -1213,7 +1220,7 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index, uint64_t generation) {
 	}
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+bool FlipQueue::Flip(std::span<VideoOutVblankPhase> phases) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
@@ -1323,8 +1330,9 @@ KYTY_SYSV_ABI void VideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* at
 	attribute->option |= option;
 }
 
-KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
+KYTY_SYSV_ABI int VideoOutGetOccupiedPrivacyMask(uint64_t* mask) {
 	PRINT_NAME();
+}
 
 static int OpenVideoOut(int user_id, int bus_type, int index, const void* param,
                         uint64_t* generation, bool native_client = false) {
@@ -1333,6 +1341,18 @@ static int OpenVideoOut(int user_id, int bus_type, int index, const void* param,
 
 	return DriverState().Open(bus_type, index);
 }
+int VideoOutNativeAcquireSplashHandle(int*      native_display_handle,
+                                      uint64_t* native_display_generation) {
+	if (!VideoOutIsInitialized() || native_display_handle == nullptr ||
+	    native_display_generation == nullptr || *native_display_handle >= 0) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	uint64_t  generation = 0;
+	const int handle     = OpenVideoOut(0, VIDEO_OUT_BUS_TYPE_MAIN, 0, nullptr, &generation, true);
+	if (handle < 0) return handle;
+	*native_display_handle     = handle;
+	*native_display_generation = generation;
+	return OK;
 }
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {
@@ -1585,6 +1605,26 @@ KYTY_SYSV_ABI int VideoOutAddFlipEvent(EventQueue::KernelEqueue eq, int handle, 
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Flip, udata);
 }
 
+int VideoOutNativeRegisterOriginalSplashFlipEvent(EventQueue::KernelEqueue eq,
+                                                  uint64_t original_ident, int handle,
+                                                  uint64_t expected_generation) {
+	// flip completions here carry the EVFILT_VIDEO_OUT (-13) ident back
+	if (!VideoOutIsInitialized() || original_ident != 0x0006010000000000ull || handle < 0 ||
+	    expected_generation == 0 ||
+	    VideoOutNativeGetHandleGeneration(handle) != expected_generation) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	const int rc =
+	    RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Flip, nullptr,
+		                      static_cast<uintptr_t>(original_ident), expected_generation);
+	if (rc == OK) {
+		LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_FLIP_EVENT_REGISTERED"
+		     " ident=0x%016" PRIx64 " filter=EVFILT_VIDEO_OUT"
+		     " queue=%" PRId64 " handle=%d generation=%" PRIu64 " NO_FLIP_QUEUED\n",
+		     original_ident, eq, handle, expected_generation);
+	}
+	return rc;
+}
 KYTY_SYSV_ABI int VideoOutDeleteVblankEvent(EventQueue::KernelEqueue eq, int handle) {
 	PRINT_NAME();
 	return DeleteVideoOutEvent(handle, eq, VideoOutEventKind::Vblank);
