@@ -2718,6 +2718,18 @@ File* FileDescriptors::GetFile(const std::filesystem::path& real_name) {
 
 void FileDescriptors::CloseAll() {
 	Common::LockGuard lock(m_mutex);
+	for (const auto& pin: m_mbus_pins) {
+		if (auto inbox = pin.lock()) {
+			std::lock_guard inbox_lock(inbox->GetMutex());
+			inbox->closed       = true;
+			inbox->tearing_down = true;
+			inbox->system->cv.notify_all();
+		}
+	}
+	m_mbus_pins.clear();
+	m_standard_deci.fill(false);
+	m_standard_console.fill(false);
+	m_standard_flags.fill(0);
 
 	for (auto& f: m_files) {
 		if (f != nullptr) {
@@ -3614,6 +3626,16 @@ void Initialize() {
 }
 
 void EmergencyShutdown() {
+	if (g_native_system_mbus) {
+		std::lock_guard lock(g_native_system_mbus->mutex);
+		g_native_system_mbus->shutting_down = true;
+		g_native_system_mbus->cv.notify_all();
+	}
+	if (g_native_metadbg_stream) {
+		std::lock_guard lock(g_native_metadbg_stream->mutex);
+		g_native_metadbg_stream->shutting_down = true;
+		g_native_metadbg_stream->cv.notify_all();
+	}
 	if (g_files != nullptr) {
 		g_files->CloseAll();
 	}
@@ -5258,6 +5280,26 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		Log::Flush();
 		return descriptor;
 	}
+	if (!directory && file->name == "/dev/mbus_av" &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr) {
+		if ((flags & ~0x00100004) != 2 || mode != 0) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		file->real_name      = file->name;
+		const bool discovery = std::getenv("KYTY_DIAGNOSTIC_SYSAV_AV_DEVICE_PROBE") != nullptr;
+		file->special        = discovery ? SpecialFile::NativeAvProbe : SpecialFile::NativeMbus;
+		file->special_size   = 0;
+		file->native_mbus_receive = std::make_shared<NativeMbusReceiveQueue>();
+		file->opened              = true;
+		LOGF("MBUS_DEVICE_OPEN guest_pid=%d fd=%d flags=0x%x receive_queue=empty"
+		     " legacy_nonblocking_discovery=%d\n",
+		     Process::GetPid(), descriptor, flags, discovery ? 1 : 0);
+		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_MBUS_RX_QUEUE_CREATED"
+		     " fd=%d bytes_available=0\n",
+		     descriptor);
+		return descriptor;
+	}
 	if (native_sshot_path) {
 		file->real_name              = file->name;
 		file->special                = SpecialFile::NativeSshot;
@@ -6730,6 +6772,33 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 	return KERNEL_ERROR_ENOTTY;
 }
 
+static int64_t ReadNativeSystemMbus(const std::shared_ptr<NativeMbusReceiveQueue>& opened, int fd,
+                                    void* buf, size_t nbytes) {
+	if (!opened->readable) return KERNEL_ERROR_EBADF;
+	if (nbytes < 80) return KERNEL_ERROR_EWOULDBLOCK;
+	const auto              state = opened->system;
+	std::array<uint8_t, 80> bytes {};
+	{
+		std::unique_lock lock(state->mutex);
+		if (!opened->closed && !state->shutting_down && state->priority.empty() &&
+		    state->received.empty()) {
+			LOGF("SYSTEM_MBUS_READ_WAIT guest_pid=%d fd=%d queued_records=0\n", Process::GetPid(),
+			     fd);
+			Log::Flush();
+		}
+		state->cv.wait(lock, [&] {
+			return opened->tearing_down || state->shutting_down ||
+			       state->priority.size() >= bytes.size() || state->received.size() >= bytes.size();
+		});
+		if (opened->tearing_down || state->shutting_down) return KERNEL_ERROR_ECANCELED;
+		auto& queued = state->priority.size() >= bytes.size() ? state->priority : state->received;
+		std::copy_n(queued.begin(), bytes.size(), bytes.begin());
+		queued.erase(queued.begin(), queued.begin() + bytes.size());
+		state->cv.notify_all();
+	}
+	if (!Memory::CopyToGuest(buf, bytes.data(), bytes.size())) return KERNEL_ERROR_EFAULT;
+	return static_cast<int64_t>(bytes.size());
+}
 
 
 static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {

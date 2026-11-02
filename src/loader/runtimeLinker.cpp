@@ -661,6 +661,10 @@ bool TestAgcPoolMallocOutcomeDiagnostic() {
 
 static std::atomic<uint32_t> g_test_mbus_set_volume_down_calls {0};
 
+static int KYTY_SYSV_ABI TestMbusSetVolumeDown(int type, int value) {
+	g_test_mbus_set_volume_down_calls.fetch_add(1, std::memory_order_relaxed);
+	return type * 100 + value;
+}
 
 bool TestOriginalPadProviderDiagnosticRouting() {
 	static constexpr char variable[]       = "KYTY_DIAGNOSTIC_HOST_INPUT_HID_PAD";
@@ -806,6 +810,49 @@ bool TestOriginalPadProviderDiagnosticRouting() {
 	const bool mapped_null_client_rejected =
 	    guard_selected && guard_call(1, 12) == static_cast<int32_t>(0x809b00ffu);
 
+	uint64_t test_client = 0;
+	g_test_mbus_set_volume_down_calls.store(0, std::memory_order_relaxed);
+	Libs::Mbus::SetOriginalSetVolumeDown(reinterpret_cast<uint64_t>(TestMbusSetVolumeDown),
+	                                     reinterpret_cast<uint64_t>(&test_client));
+	const bool null_client_rejected =
+	    guard_selected && guard_call(1, 12) == static_cast<int32_t>(0x809b00ffu) &&
+	    g_test_mbus_set_volume_down_calls.load(std::memory_order_relaxed) == 0;
+	const bool invalid_argument_preserved =
+	    guard_selected && guard_call(0, 12) == 12 &&
+	    g_test_mbus_set_volume_down_calls.load(std::memory_order_relaxed) == 1;
+	test_client = 1;
+	const bool initialized_passthrough =
+	    guard_selected && guard_call(1, 12) == 112 &&
+	    g_test_mbus_set_volume_down_calls.load(std::memory_order_relaxed) == 2;
+	Libs::Mbus::SetOriginalSetVolumeDown(0, 0);
+
+	mbus_importer.file_name                                  = "libSceSysBridge.sprx";
+	const auto [other_volume_output, other_volume_bind_self] = resolve_mbus_volume();
+	const bool guard_importer_narrow =
+	    !other_volume_bind_self && other_volume_output.vaddr == mbus_provider.base_vaddr + 0x66e0u;
+	mbus_importer.file_name = "libSceAudioOut.sprx";
+	mbus_image[0x6718u] ^= 0xffu;
+	const auto [mutated_volume_output, mutated_volume_bind_self] = resolve_mbus_volume();
+	const bool guard_signature_required =
+	    !mutated_volume_bind_self &&
+	    mutated_volume_output.vaddr == mbus_provider.base_vaddr + 0x66e0u;
+	mbus_image[0x6718u] ^= 0xffu;
+
+	const bool zero_disables                 = set_environment(variable, "0");
+	const auto [zero_output, zero_bind_self] = resolve("xk0AcarP3V4");
+	const bool exact_gate_required           = !zero_bind_self && zero_output.vaddr == 0x1111;
+	const bool restored = set_environment(variable, present ? saved.c_str() : nullptr);
+	const bool guard_restored =
+	    set_environment(guard_variable, guard_present ? guard_saved.c_str() : nullptr);
+	linker.m_programs.clear();
+
+	return disabled && hle_without_gate && configured && original_selected &&
+	       unrelated_device_original && psm_bridge_selected && react_bridge_selected &&
+	       provider_identity_required && mbus_bridge_narrow && zero_disables &&
+	       guard_environment_disabled && guard_disabled && guard_configured && guard_selected &&
+	       mapped_null_client_rejected && null_client_rejected && invalid_argument_preserved &&
+	       initialized_passthrough && guard_importer_narrow && guard_signature_required &&
+	       exact_gate_required && restored && guard_restored;
 }
 
 struct MainEntryStackTestState {
@@ -5680,6 +5727,129 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	auto initialize_modules = [this, libc, shellui_npcommon_owner] {
 		if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 			StartModule(libc, 0, nullptr, nullptr);
+		}
+		for (auto* module: m_needed_modules) {
+			const bool hle_npmanager =
+			    std::strcmp(module->dynamic_info->so_name, "libSceNpManager.prx") == 0 &&
+			    std::getenv("KYTY_DIAGNOSTIC_NATIVE_NPMANAGER_INIT") == nullptr;
+			if (std::strcmp(module->dynamic_info->so_name, "libSceSysmodule.prx") == 0 ||
+			    std::strcmp(module->dynamic_info->so_name, "libSceAgc.prx") == 0 ||
+			    (std::strcmp(module->dynamic_info->so_name, "libSceAgcDriver.prx") == 0 &&
+			     std::getenv("KYTY_DIAGNOSTIC_NATIVE_AGC_DRIVER_INIT") == nullptr) ||
+			    std::strcmp(module->dynamic_info->so_name, "libSceHmd.prx") == 0 ||
+			    std::strcmp(module->dynamic_info->so_name, "libSceHmd2.prx") == 0 ||
+			    hle_npmanager ||
+			    std::strcmp(module->dynamic_info->so_name, "libSceNpTrophy.prx") == 0 ||
+			    std::strcmp(module->dynamic_info->so_name, "libSceNpSns.prx") == 0 ||
+			    std::strcmp(module->dynamic_info->so_name, "libSceNpWebApi2.prx") == 0 ||
+			    std::strcmp(module->dynamic_info->so_name, "libSceNpUtility.prx") == 0) {
+				LOGF("Using HLE module initialization: %s\n", module->dynamic_info->so_name);
+				// the skipped init stores the device page pointer. Readers only test it against -1,
+				// so 0 is a null read
+				const bool hmd2 = std::strcmp(module->dynamic_info->so_name, "libSceHmd2.prx") == 0;
+				if (hmd2 || std::strcmp(module->dynamic_info->so_name, "libSceHmd.prx") == 0) {
+					constexpr uint8_t hmd_store[7]  = {0x48, 0x89, 0x05, 0x41, 0xfe, 0x08, 0x00};
+					constexpr uint8_t hmd2_store[7] = {0x48, 0x89, 0x05, 0x1f, 0xd1, 0x08, 0x00};
+					const uint64_t    store = module->base_vaddr + (hmd2 ? 0x2af42u : 0x1e8u);
+					const uint64_t    slot  = module->base_vaddr + (hmd2 ? 0xb8068u : 0x90030u);
+					if (IsReadableRange(store, 7) && IsReadableRange(slot, sizeof(uint64_t)) &&
+					    std::memcmp(reinterpret_cast<const void*>(store),
+					                hmd2 ? hmd2_store : hmd_store, 7) == 0 &&
+					    *reinterpret_cast<uint64_t*>(slot) == 0) {
+						*reinterpret_cast<uint64_t*>(slot) = UINT64_MAX;
+						LOGF("FIRST_FRAME_AUDIT HMD_PAGE_SLOT %s +0x%" PRIx64
+						     " = -1 emulator-defined, no HMD device\n",
+						     module->dynamic_info->so_name, slot - module->base_vaddr);
+					} else {
+						LOGF("FIRST_FRAME_AUDIT HMD_PAGE_SLOT %s signature mismatch; slot left "
+						     "alone\n",
+						     module->dynamic_info->so_name);
+					}
+				}
+				if (hle_npmanager && shellui_npcommon_owner) {
+					const int result = AcquireShellUiNpCommonPool();
+					LOGF("NPCOMMON_POOL_OWNER process=SceShellUI provider=native"
+					     " owner=hle_npmanager result=0x%08x\n",
+					     static_cast<uint32_t>(result));
+					if (result < 0) {
+						EXIT("ShellUI NP Common pool acquisition failed: result=0x%08x\n",
+						     static_cast<uint32_t>(result));
+					}
+				}
+				continue;
+			}
+			if (std::strcmp(module->dynamic_info->so_name, "libSceAgcDriver.prx") == 0 &&
+			    std::getenv("KYTY_DIAGNOSTIC_NATIVE_AGC_DRIVER_INIT") != nullptr) {
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NATIVE_AGC_DRIVER_INIT NON_AUTHENTIC\n");
+			}
+			if (std::strcmp(module->dynamic_info->so_name, "libSceNpManager.prx") == 0 &&
+			    std::getenv("KYTY_DIAGNOSTIC_NATIVE_NPMANAGER_INIT") != nullptr) {
+				// module_start (+0x27920) runs sceNpManagerPrxStart unless the arg is 1. That sets
+				// up the IPC client memory; without it IPC-backed entries return 0x80550002
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NATIVE_NPMANAGER_INIT native module_start\n");
+			}
+			if (started_modules.insert(module).second && module->dynamic_info->init_vaddr != 0) {
+				int result = 0;
+				if (std::getenv("KYTY_DIAGNOSTIC_UDS_STAGE_TRACE") != nullptr &&
+				    std::strcmp(module->dynamic_info->so_name, "libSceNpUniversalDataSystem.prx") ==
+				        0) {
+					// DT_INIT +0x10 -> +0x6f30 -> +0x4dd0, the last calls these four in order
+					LOGF("FIRST_FRAME_AUDIT UDS_STAGE_TRACE DIAGNOSTIC_NON_AUTHENTIC "
+					     "base=0x%016" PRIx64 "\n",
+					     module->base_vaddr);
+					using heap_stage_func_t = KYTY_SYSV_ABI int (*)(const char*, size_t);
+					using stage_func_t      = KYTY_SYSV_ABI int (*)();
+					const auto stage1 =
+					    reinterpret_cast<heap_stage_func_t>(module->base_vaddr + 0x8b50u);
+					result = stage1(reinterpret_cast<const char*>(module->base_vaddr + 0x14f97u),
+					                0x20000u);
+					LOGF("FIRST_FRAME_AUDIT UDS_STAGE +0x8b50 result=0x%08x\n",
+					     static_cast<uint32_t>(result));
+					for (const uint64_t stage_offset: {0x4eb0u, 0x43f0u, 0x5820u}) {
+						if (result < 0) {
+							break;
+						}
+						result =
+						    reinterpret_cast<stage_func_t>(module->base_vaddr + stage_offset)();
+						LOGF("FIRST_FRAME_AUDIT UDS_STAGE +0x%04" PRIx64 " result=0x%08x\n",
+						     stage_offset, static_cast<uint32_t>(result));
+					}
+				} else {
+					result = StartModule(module, 0, nullptr, nullptr);
+				}
+				if (result == 0 && std::getenv("KYTY_DIAGNOSTIC_NATIVE_NPCOMMON_INIT") != nullptr &&
+				    std::strcmp(module->dynamic_info->so_name, "libSceNpCommon.prx") == 0) {
+					// NP Common heap init is kgDwlmy78k0 (+0x2850), may be skipped while NpManager
+					// init is HLE
+					using npcommon_init_t = KYTY_SYSV_ABI int (*)();
+					const auto entry =
+					    reinterpret_cast<npcommon_init_t>(module->base_vaddr + 0x2850u);
+					result = entry();
+					LOGF("FIRST_FRAME_AUDIT NATIVE_NPCOMMON_INIT DIAGNOSTIC"
+					     " export=kgDwlmy78k0 result=0x%08x\n",
+					     static_cast<uint32_t>(result));
+				}
+				if (result < 0) {
+					if (std::strcmp(module->dynamic_info->so_name, "libSceCamera.prx") == 0 &&
+					    result == static_cast<int32_t>(0x802e00ffu)) {
+						LOGF("Optional camera hardware unavailable, continuing: result=0x%08x\n",
+						     result);
+						continue;
+					}
+					if (m_shellui_npcommon_pool_owned) {
+						const int release_result = ReleaseShellUiNpCommonPool();
+						LOGF("NPCOMMON_POOL_OWNER process=SceShellUI release_after_start_failure"
+						     " result=0x%08x\n",
+						     static_cast<uint32_t>(release_result));
+					}
+					// failed module start exits the process; record a status so the parent's
+					// EVFILT_PROC sees NOTE_EXIT
+					Libs::LibKernel::Process::RecordExecChildExitStatus(0x100);
+					EXIT("Module initialization failed: %s (%s), result=0x%08x\n",
+					     module->dynamic_info->so_name,
+					     Common::PathToString(module->file_name).c_str(), result);
+				}
+			}
 		}
 	};
 	const auto init_start = std::chrono::steady_clock::now();

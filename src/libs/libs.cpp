@@ -22,9 +22,14 @@ namespace VideoDec2 {
 LIB_DEFINE(InitVideoDec2_1);
 } // namespace VideoDec2
 
+
 namespace LibMouse {
 LIB_DEFINE(InitMouse_1);
 } // namespace LibMouse
+
+namespace Mbus {
+LIB_DEFINE(InitMbus_1);
+} // namespace Mbus
 
 namespace LibKeyboard {
 LIB_DEFINE(InitKeyboard_1);
@@ -87,9 +92,12 @@ LIB_DEFINE(InitDialog_1);
 LIB_DEFINE(InitFont_1);
 LIB_DEFINE(InitFontFt_1);
 LIB_DEFINE(InitAgcDriver_1);
+LIB_DEFINE(InitHmd_1);
 LIB_DEFINE(InitHmd2_1);
+LIB_DEFINE(InitJemspace_1);
 LIB_DEFINE(InitLibKernel_1);
 LIB_DEFINE(InitNet_1);
+LIB_DEFINE(InitNpCommon_1);
 LIB_DEFINE(InitPad_1);
 LIB_DEFINE(InitPlayGo_1);
 LIB_DEFINE(InitPngDec_1);
@@ -126,12 +134,16 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitBluetoothHid_1(s);
 	InitDeviceService_1(s);
 	InitUsbd_1(s);
+	InitHmd_1(s);
 	InitHmd2_1(s);
+	InitJemspace_1(s);
 	InitLibKernel_1(s);
+	Mbus::InitMbus_1(s);
 	LibMouse::InitMouse_1(s);
 	LibKeyboard::InitKeyboard_1(s);
 	Ime::InitPlatform_1_Ime(s);
 	InitNet_1(s);
+	InitNpCommon_1(s);
 	InitPad_1(s);
 	InitPlayGo_1(s);
 	LibPsml::InitPsml_1(s);
