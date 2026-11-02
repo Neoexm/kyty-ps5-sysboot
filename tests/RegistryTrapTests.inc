@@ -656,6 +656,134 @@ void CheckSysctlSpanCalls(Loader::Program* program, const std::filesystem::path&
         "scope the app-info setter");
   invoke(mib, 4, nullptr, nullptr, edge - 0x97, 0x98, Libs::Posix::POSIX_EFAULT,
          "native sysctl app-info setter validates its complete input span");
+  Check(unchanged(input, output_bytes) && *length == 0x98 && unchanged(output, output_bytes),
+        "native sysctl invalid app-info setter stores no record");
+  invoke(mib, 4, output, length, nullptr, 0, Libs::Posix::POSIX_ENOSYS,
+         "native sysctl extended read still has no record after a faulting set");
+  invoke(mib, 4, nullptr, nullptr, input, 0x98, 0,
+         "native sysctl commits the write-only 152-byte app-info setter");
+  Check(unchanged(input, output_bytes) && *length == 0x98 && unchanged(output, output_bytes),
+        "native sysctl app-info setter changes no caller buffer");
+  invoke(mib, 4, output, length, nullptr, 0, 0, "native sysctl extended read returns the committed record");
+  Check(*length == 0x98 && std::memcmp(output, input, 0x98) == 0, "the committed record is the caller's 152 bytes");
+  Check(_putenv_s("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE", "") == 0 &&
+            _putenv_s("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY", "") == 0,
+        "leave the app-info setter scope");
+
+  Process::PeerProcess app_peer {};
+  Check(Process::FindPeerByPid(static_cast<int>(pid.value), &app_peer) && !app_peer.has_category,
+        "app-info fixture begins with absent process category metadata");
+  const auto missing_category = [&] {
+    reset();
+    mib[0] = 1;
+    mib[1] = 14;
+    mib[2] = 35;
+    mib[3] = static_cast<uint32_t>(pid.value);
+    *length = 0x58;
+    *hle_errno = Libs::Posix::POSIX_EBUSY;
+    Check(Libs::KernelGetAppInfo(static_cast<int>(pid.value), output) == KERNEL_ERROR_ENOENT &&
+              unchanged(output, output_bytes) && *hle_errno == Libs::Posix::POSIX_EBUSY,
+          "HLE app-info missing category returns ENOENT without a zero record");
+    Check(Libs::KernelGetAppCategoryType(static_cast<int>(pid.value), reinterpret_cast<int*>(output)) ==
+              KERNEL_ERROR_ENOENT && unchanged(output, output_bytes) &&
+              *hle_errno == Libs::Posix::POSIX_EBUSY,
+          "category getter preserves missing metadata instead of returning zero");
+    Check(Libs::KernelGetAppCategoryType(static_cast<int>(pid.value),
+              reinterpret_cast<int*>(uintptr_t {1})) == KERNEL_ERROR_ENOENT &&
+              Libs::KernelGetAppCategoryType(-1, reinterpret_cast<int*>(output)) == KERNEL_ERROR_ESRCH &&
+              unchanged(output, output_bytes),
+          "category metadata lookup fails before publishing caller output");
+    invoke(mib, 4, output, length, nullptr, 0, Libs::Posix::POSIX_ENOENT,
+           "native app-info and HLE agree when process category is absent");
+    Check(*length == 0x58 && unchanged(output, output_bytes),
+          "missing category preserves native output and returned length");
+  };
+  missing_category();
+  Check(Libs::KernelGetAppCategoryType(static_cast<int>(pid.value), nullptr) == KERNEL_ERROR_EINVAL &&
+            Libs::KernelGetAppCategoryType(-1, nullptr) == KERNEL_ERROR_EINVAL,
+        "original category getter rejects null before process lookup");
+  Check(Libs::KernelGetAppInfo(static_cast<int>(pid.value), nullptr) == KERNEL_ERROR_EFAULT &&
+            Libs::KernelGetAppInfo(static_cast<int>(pid.value), reinterpret_cast<void*>(uintptr_t {1})) ==
+                KERNEL_ERROR_EFAULT &&
+            Libs::KernelGetAppInfo(static_cast<int>(pid.value),
+                reinterpret_cast<void*>(base + RegistryTrapReadOnlyOffset)) == KERNEL_ERROR_EFAULT &&
+            Libs::KernelGetAppInfo(static_cast<int>(pid.value), edge - 0x57) == KERNEL_ERROR_EFAULT,
+        "HLE app-info validates full output before missing-category handling");
+  Check(Libs::KernelGetAppInfo(-1, output) == KERNEL_ERROR_ESRCH && unchanged(output, output_bytes),
+        "HLE app-info preserves unknown-pid errors and caller output");
+  const auto load_metadata = [&](const char* filename, const std::string& json) {
+    const auto path = directory / filename;
+    Common::File metadata;
+    Check(metadata.Create(path), "create disposable app-info metadata fixture");
+    uint32_t written = 0;
+    metadata.Write(json.data(), static_cast<uint32_t>(json.size()), &written);
+    Check(written == json.size() && metadata.Flush(), "write app-info metadata fixture");
+    metadata.Close();
+    Loader::SystemContentLoadParamSfo(path);
+  };
+  for (const int32_t category: {0, 0x1234}) {
+    load_metadata(category == 0 ? "category_zero.json" : "category_nonzero.json",
+                  "{\"applicationCategoryType\":" + std::to_string(category) + "}");
+    app_peer = {};
+    Check(Process::FindPeerByPid(static_cast<int>(pid.value), &app_peer) &&
+              app_peer.has_category && app_peer.category == category,
+          "app-info fixture category comes from explicit metadata including zero");
+    reset();
+    auto* category_output = reinterpret_cast<int*>(output);
+    *hle_errno = Libs::Posix::POSIX_EBUSY;
+    Check(Libs::KernelGetAppCategoryType(static_cast<int>(pid.value), category_output) == 0 &&
+              *category_output == category && unchanged(output + sizeof(int), output_bytes - sizeof(int)) &&
+              *hle_errno == Libs::Posix::POSIX_EBUSY,
+          "category getter copies exactly four metadata-derived bytes including explicit zero");
+    Check(Libs::KernelGetAppCategoryType(static_cast<int>(pid.value),
+              reinterpret_cast<int*>(uintptr_t {1})) == KERNEL_ERROR_EFAULT &&
+              Libs::KernelGetAppCategoryType(static_cast<int>(pid.value),
+                  reinterpret_cast<int*>(base + RegistryTrapReadOnlyOffset)) == KERNEL_ERROR_EFAULT &&
+              Libs::KernelGetAppCategoryType(static_cast<int>(pid.value),
+                  reinterpret_cast<int*>(edge - 3)) == KERNEL_ERROR_EFAULT,
+          "category copyout rejects inaccessible readonly and guard-crossing destinations");
+    auto* guarded_category = reinterpret_cast<int*>(edge - sizeof(int));
+    Check(Libs::KernelGetAppCategoryType(static_cast<int>(pid.value), guarded_category) == 0 &&
+              *guarded_category == category,
+          "category copyout accepts exactly four bytes ending at a guard page");
+    reset();
+    std::array<uint8_t, 0x58> expected {};
+    std::memcpy(expected.data() + 0x50, &category, sizeof(category));
+    Check(Libs::KernelGetAppInfo(static_cast<int>(pid.value), output) == 0 &&
+              std::memcmp(output, expected.data(), expected.size()) == 0 &&
+              unchanged(output + expected.size(), output_bytes - expected.size()),
+          "HLE app-info retains the bounded legacy category compatibility view");
+    reset();
+    mib[0] = 1;
+    mib[1] = 14;
+    mib[2] = 35;
+    mib[3] = static_cast<uint32_t>(pid.value);
+    *length = expected.size();
+    invoke(mib, 4, output, length, nullptr, 0, 0,
+           "native app-info preserves explicitly supplied category zero and nonzero");
+    Check(*length == expected.size() && std::memcmp(output, expected.data(), expected.size()) == 0 &&
+              unchanged(output + expected.size(), output_bytes - expected.size()),
+          "native and HLE legacy app-info views agree without widening output");
+    std::memset(output, sentinel, output_bytes);
+    *length = 0x52;
+    invoke(mib, 4, output, length, nullptr, 0, Libs::Posix::POSIX_ENOMEM,
+           "native short app-info query retains partial-copy semantics");
+    Check(*length == 0x52 && std::memcmp(output, expected.data(), 0x52) == 0 &&
+              unchanged(output + 0x52, output_bytes - 0x52),
+          "native short app-info writes only the supplied capacity");
+  }
+  load_metadata("category_absent.json", "{}");
+  missing_category();
+  std::printf("RegistryTrapTests: category_getter_availability=pass copyout4=pass "
+              "null_order=pass explicit_zero=pass\n");
+  std::printf("RegistryTrapTests: app_info_missing_category=pass explicit_zero=pass "
+              "legacy_bounds=pass metadata_reset=pass\n");
+
+  Check(Memory::ProtectGuestMemory(pages, 3 * page, Common::VirtualMemory::Mode::ReadWrite) &&
+            Memory::FreeGuestMemory(pages, 3 * page), "release owned native sysctl guarded pages");
+  *hle_errno = saved_errno;
+  std::printf("RegistryTrapTests: native_sysctl_spans=pass count32_size64=pass "
+              "short_copy=pass aliases=pass current_stack_only=pass missing_records_unchanged=1\n");
 }
 
 

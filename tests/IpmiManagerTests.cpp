@@ -132,6 +132,7 @@ bool GetVerifiedOriginalSelfIdentity(AuthInfo::ImageIdentity* identity) {
 }
 }
 namespace Libs::LibKernel::AppMount {
+bool GetAttachedApp(int pid, int32_t* app_id) { (void)pid; (void)app_id; return false; }
 }
 namespace Libs::LibKernel::Budget {
 bool Ptype(int pid, int32_t* ptype) { (void)pid; (void)ptype; return false; }

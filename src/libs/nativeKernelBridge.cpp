@@ -55,6 +55,7 @@
 #endif
 
 namespace Libs {
+int KYTY_SYSV_ABI KernelGetAppInfo(int pid, void* info);
 }
 
 namespace Libs::NativeKernelBridge {
@@ -1445,6 +1446,235 @@ Reply SysctlPageSize(const SyscallRequest& request) {
 			result = Libs::Posix::POSIX_EFAULT;
 		return result == 0 ? Reply {0, 0} : Reply {-1, result};
 	}
+	if (count == 4 && mib[0] == 1 && mib[1] == 14 && mib[2] == 35 && new_len == 0x98) {
+		LibKernel::AppMount::Record kernel_record {};
+		bool                        committed = false;
+		const int                   access =
+		    LibKernel::AppMount::GetAppInfo(mib[3], capacity, &kernel_record, &committed);
+		if (access != 0) {
+			return {-1, access};
+		}
+		// 0x9e930b50 copies the current record out before it copies the new one in.
+		if (output != nullptr && capacity != 0 && !committed) {
+			LOGF("APP_INFO_RECORD_UNKNOWN pid=%d caller=%d set_not_attempted\n", mib[3],
+			     LibKernel::Process::GetPid());
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		if (output != nullptr || length != nullptr) {
+			const Reply result =
+			    PublishSysctlValue(output, length, capacity, kernel_record.data(), capacity);
+			if (result.value != 0) return result;
+		}
+		LibKernel::AppMount::Record record {};
+		if (!ReadSysctlMemory(input, record.data(), record.size())) {
+			return {LibKernel::KERNEL_ERROR_EFAULT, 0};
+		}
+		const int result = LibKernel::AppMount::SetAppInfo(mib[3], record);
+		return result == 0 ? Reply {0, 0} : Reply {-1, result};
+	}
+	if (count == 4 && mib[0] == 1 && mib[1] == 14 && mib[2] == 35) {
+		LibKernel::AppMount::Record kernel_record {};
+		bool                        committed = false;
+		const int                   access =
+		    LibKernel::AppMount::GetAppInfo(mib[3], capacity, &kernel_record, &committed);
+		if (access != 0) {
+			return {-1, access};
+		}
+		if (committed) {
+			return PublishSysctlValue(output, length, capacity, kernel_record.data(), capacity);
+		}
+		if (mib[3] != LibKernel::Process::GetPid()) {
+			LOGF("APP_INFO_RECORD_UNKNOWN pid=%d caller=%d no_record_returned\n", mib[3],
+			     LibKernel::Process::GetPid());
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		if (output != nullptr && capacity > 0x58) {
+			LOGF("APP_INFO_EXTENDED_UNIMPLEMENTED pid=%u requested=%" PRIu64
+			     " no_partial_record_returned\n",
+			     static_cast<uint32_t>(mib[3]), capacity);
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		LibKernel::Process::PeerProcess peer {};
+		if (!LibKernel::Process::FindPeerByPid(static_cast<int>(mib[3]), &peer)) {
+			return {-1, Libs::Posix::POSIX_ESRCH};
+		}
+		if (!peer.has_category) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_APP_INFO_MISSING process"
+			     " has no recovered category metadata\n");
+			return {-1, Libs::Posix::POSIX_ENOENT};
+		}
+		std::array<uint8_t, 0x58> record {};
+		std::memcpy(record.data() + 0x50, &peer.category, sizeof(peer.category));
+		const Reply result =
+		    PublishSysctlValue(output, length, capacity, record.data(), record.size());
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_APP_INFO_FROM_PROCESS"
+			     " pid=%u category=0x%x size=0x%zx\n",
+			     static_cast<uint32_t>(mib[3]), static_cast<unsigned>(peer.category),
+			     record.size());
+		}
+		return result;
+	}
+	if (count == 4 && mib[0] == 1 && mib[1] == 14 && (mib[2] == 0x40 || mib[2] == 65)) {
+		if (input != nullptr) {
+			const auto facts = LibKernel::Process::GetCurrentAuthorizationFacts();
+			if ((facts.known_capability0 & (1ull << 62)) == 0)
+				return {-1, Libs::Posix::POSIX_ENOSYS};
+			if ((facts.capability0 & (1ull << 62)) == 0) return {-1, Libs::Posix::POSIX_EPERM};
+		}
+		const uint64_t size     = mib[2] == 65 ? sizeof(LibKernel::AppMount::Record) : 8;
+		const uint64_t copied   = output != nullptr ? std::min(capacity, size) : 0;
+		const auto     transfer = [&](void* record, uint64_t write_size) {
+			if (copied != 0 && !WriteSysctlMemory(output, record, copied))
+				return Libs::Posix::POSIX_EFAULT;
+			if (output != nullptr && capacity < size) return Libs::Posix::POSIX_ENOMEM;
+			if (new_len == write_size && !ReadSysctlMemory(input, record, write_size))
+				return Libs::Posix::POSIX_EFAULT;
+			return 0;
+		};
+		int                     result   = 0;
+		uint32_t                field_2c = 0;
+		uint32_t                category = 0;
+		std::array<char, 11>    title {};
+		std::array<uint32_t, 2> observed_state {};
+		if (mib[2] == 65) {
+			result = LibKernel::AppMount::AppInfoById(
+			    mib[3], capacity, new_len, [&](LibKernel::AppMount::Record& info) {
+				    std::memcpy(&field_2c, info.data() + 0x2c, sizeof(field_2c));
+				    std::memcpy(&category, info.data() + 0x50, sizeof(category));
+				    std::memcpy(title.data(), info.data() + 0x10, 10);
+				    return transfer(info.data(), info.size());
+			    });
+		} else {
+			result = LibKernel::AppMount::AppState(
+			    mib[3], capacity, new_len, [&](std::array<uint32_t, 2>& state) {
+				    observed_state = state;
+				    return transfer(state.data(), sizeof(uint32_t));
+			    });
+		}
+		if ((result == 0 || result == Libs::Posix::POSIX_ENOMEM) && length != nullptr) {
+			const uint64_t published = output != nullptr ? copied : size;
+			if (!WriteSysctlMemory(length, &published, sizeof(published)))
+				result = Libs::Posix::POSIX_EFAULT;
+		}
+		if (result == 0 && new_len == 0) {
+			if (mib[2] == 65) {
+				LOGF("APP_INFO_BY_ID caller=%d app_id=%d bytes=%" PRIu64
+				     " field_2c=0x%x category=0x%x title=%.10s post_begin_eligible=%u "
+				     "source=app_object_prefix\n",
+				     LibKernel::Process::GetPid(), mib[3], copied, field_2c, category, title.data(),
+				     field_2c != 0 && category < 0x20000 ? 1u : 0u);
+			} else {
+				LOGF("APP_STATE_QUERY caller=%d app_id=%d state=%u secondary=%u\n",
+				     LibKernel::Process::GetPid(), mib[3], observed_state[0], observed_state[1]);
+			}
+		}
+		return result == 0 ? Reply {0, 0} : Reply {-1, result};
+	}
+}
+Reply SysAvNameStackGuard(const SyscallRequest& request) {
+	if (std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP") != nullptr) {
+		static std::atomic<uint32_t> audio_name_trace_count {0};
+		if (audio_name_trace_count.fetch_add(1) < 20) {
+			LOGF("FIRST_FRAME_AUDIT AUDIOD_NATIVE_NAME_ABI"
+			     " addr=0x%016" PRIx64 " len=0x%016" PRIx64 " name_ptr=0x%016" PRIx64 "\n",
+			     request.args[0], request.args[1], request.args[2]);
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	if ((std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP") != nullptr ||
+	     LibKernel::Process::IsExecChild()) &&
+	    request.args[0] >= 0x200000000ull && request.args[1] >= 0x4000 &&
+	    (request.args[1] & 0x3fff) == 0 && request.args[2] >= 0x200000000ull &&
+	    request.args[0] <= UINT64_MAX - request.args[1]) {
+		const auto         addr          = request.args[0];
+		const auto         size          = request.args[1];
+		const auto         name_addr     = request.args[2];
+		constexpr uint64_t name_capacity = LibKernel::Memory::KERNEL_MAXIMUM_NAME_LENGTH;
+		LibKernel::Memory::VirtualQueryInfo target {};
+		LibKernel::Memory::VirtualQueryInfo name_region {};
+		if (name_addr > UINT64_MAX - name_capacity ||
+		    LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(addr), 0, &target,
+		                                          sizeof(target)) != 0 ||
+		    !target.is_committed || target.start > addr || target.end < addr + size ||
+		    LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(name_addr), 0,
+		                                          &name_region, sizeof(name_region)) != 0 ||
+		    !name_region.is_committed || !(name_region.protection & 1u) ||
+		    name_region.start > name_addr || name_region.end < name_addr + name_capacity) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		const auto* name = reinterpret_cast<const char*>(name_addr);
+		if (std::memchr(name, 0, name_capacity) == nullptr) {
+			return {-1, Libs::Posix::POSIX_ENAMETOOLONG};
+		}
+		const int rc = LibKernel::Memory::KernelSetVirtualRangeName(
+		    reinterpret_cast<const void*>(addr), size, name);
+		if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+		LOGF("FIRST_FRAME_AUDIT AUDIOD_NATIVE_FLEX_MAPPING_NAMED"
+		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " guest_name=%s committed_guest_range\n",
+		     addr, size, name);
+		return {0, 0};
+	}
+}
+Reply SysAvNameScaninBuffer(const SyscallRequest& request) {
+	constexpr char name[] = "SceSysAvControlScanInBuf";
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
+	    request.args[1] != 0x6000000 || request.args[2] != 0x4c3c97 ||
+	    request.args[0] < 0x200000000ull || request.args[0] > 0x300000000ull) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	LibKernel::Memory::VirtualQueryInfo target {};
+	LibKernel::Memory::VirtualQueryInfo original_name {};
+	const uint64_t                      end = request.args[0] + request.args[1];
+	if (end < request.args[0] ||
+	    LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(request.args[0]), 0,
+	                                          &target, sizeof(target)) != 0 ||
+	    LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(request.args[2]), 0,
+	                                          &original_name, sizeof(original_name)) != 0 ||
+	    !target.is_committed || target.start > request.args[0] || target.end < end ||
+	    (target.protection & 1u) == 0 || !original_name.is_committed ||
+	    original_name.start > request.args[2] ||
+	    original_name.end < request.args[2] + sizeof(name) ||
+	    (original_name.protection & 1u) == 0 ||
+	    std::memcmp(reinterpret_cast<const void*>(request.args[2]), name, sizeof(name)) != 0) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	const int rc = LibKernel::Memory::KernelSetVirtualRangeName(
+	    reinterpret_cast<const void*>(request.args[0]), request.args[1], name);
+	if (rc != 0) {
+		return {-1, LibKernel::KernelToPosix(rc)};
+	}
+	LOGF("FIRST_FRAME_AUDIT SYSAV_SCANIN_BUFFER_NAMED"
+	     " mapped_guest_address=0x%016" PRIx64 " length=0x%016" PRIx64 " guest_name=%s\n",
+	     request.args[0], request.args[1], name);
+	return {0, 0};
+}
+Reply SysAvControlShmClose(const SyscallRequest& request) {
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
+	    request.args[0] < 3 || request.args[0] > INT32_MAX) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	const int fd = static_cast<int>(request.args[0]);
+	if (LibKernel::FileSystem::IsNativeAvDescriptor(fd) ||
+	    LibKernel::FileSystem::IsIccnvs4SnapshotDescriptor(fd) ||
+	    LibKernel::FileSystem::PinNativeMbusReceiveQueue(fd) != nullptr) {
+		const int rc = LibKernel::FileSystem::KernelClose(fd);
+		return rc == 0 ? Reply {0, 0} : Reply {-1, LibKernel::KernelToPosix(rc)};
+	}
+	size_t size = 0;
+	if (!LibKernel::FileSystem::GetSharedMemorySize(fd, &size) || size != 0x2000) {
+		return {-1, Libs::Posix::POSIX_EBADF};
+	}
+	const int rc = LibKernel::FileSystem::KernelClose(fd);
+	if (rc != 0) {
+		return {-1, LibKernel::KernelToPosix(rc)};
+	}
+	LOGF("FIRST_FRAME_AUDIT SYSAV_SHM_CLOSE"
+	     " guest_fd=%d descriptor_released_through_FileSystem\n",
+	     fd);
+	return {0, 0};
 }
 struct SysAvIpmiServer {
 	std::string service_name;
@@ -2190,6 +2420,26 @@ bool RunSelfTests() {
 	    {0xca,
 		 {reinterpret_cast<uint64_t>(app_mib), 4, reinterpret_cast<uint64_t>(extended_info.data()),
 		  reinterpret_cast<uint64_t>(&extended_size), 0, 0}});
+	const bool extended_app_passed = extended_query.value == -1 &&
+	                                 extended_query.posix_errno == Libs::Posix::POSIX_ENOSYS &&
+	                                 extended_size == extended_info.size() &&
+	                                 std::all_of(extended_info.begin(), extended_info.end(),
+	                                             [](uint8_t value) { return value == 0xa5; });
+	const bool app_buffer_passed =
+	    Libs::KernelGetAppInfo(LibKernel::Process::GetPid(), nullptr) ==
+	        LibKernel::KERNEL_ERROR_EFAULT &&
+	    Libs::KernelGetAppInfo(LibKernel::Process::GetPid(), reinterpret_cast<void*>(1)) ==
+	        LibKernel::KERNEL_ERROR_EFAULT;
+	LOGF("APP_INFO_EXTENDED_NEGATIVE_SELFTEST %s no_partial_record_returned=1\n",
+	     extended_app_passed ? "PASS" : "FAIL");
+	LOGF("APP_INFO_BUFFER_NEGATIVE_SELFTEST %s invalid_guest_outputs_rejected=1\n",
+	     app_buffer_passed ? "PASS" : "FAIL");
+	const Reply null_readlink            = DispatchSyscall({0x3a, {}});
+	const Reply null_access              = DispatchSyscall({0x21, {}});
+	const Reply null_mini_open           = MiniSyscoreOpen({0x05, {}});
+	const Reply invalid_mini_open        = MiniSyscoreOpen({0x05, {UINT64_MAX}});
+	const Reply null_socketpair          = MiniSyscoreSocketpair({0x87, {1, 1, 0, 0}});
+	bool        sema_passed              = false;
 	bool        named_mutex_passed       = false;
 	bool        event_flag_passed        = false;
 	bool        proc_event_passed        = false;
@@ -2253,6 +2503,93 @@ bool RunSelfTests() {
 		    {0x22e, {static_cast<uint64_t>(registered_cond.value), 0x101}});
 		const Reply deleted_cond = NativeNamedObjectOperation(
 		    {0x22e, {static_cast<uint64_t>(registered_cond.value), 0x102}});
+		named_mutex_passed =
+		    opaque_mutex.value > 0 && removed_opaque.value == 0 && registered_mutex.value > 0 &&
+		    registered_mutex.value <= 0xfffe && deleted_mutex.value == 0 &&
+		    stale_mutex.value == -1 && stale_mutex.posix_errno == Libs::Posix::POSIX_ESRCH &&
+		    registered_cond.value > 0 && wrong_cond_type.value == -1 &&
+		    wrong_cond_type.posix_errno == Libs::Posix::POSIX_ESRCH && deleted_cond.value == 0;
+		std::memcpy(sema_name, "NativeMiniSemaFixture", sizeof("NativeMiniSemaFixture"));
+		const auto  name_address = reinterpret_cast<uint64_t>(sema_name);
+		const Reply absent_sema  = MiniSyscoreSemaphore({0x227, {name_address}});
+		const Reply created_sema = MiniSyscoreSemaphore({0x225, {name_address, 0x101, 0, 1}});
+		const Reply opened_sema  = MiniSyscoreSemaphore({0x227, {name_address}});
+		sema_passed              = absent_sema.value == -1 &&
+		                           absent_sema.posix_errno == Libs::Posix::POSIX_ESRCH &&
+		                           created_sema.value > 0 && opened_sema.value > 0 &&
+		                           created_sema.value != opened_sema.value;
+		if (created_sema.value > 0 && opened_sema.value > 0) {
+			auto* timeout = reinterpret_cast<LibKernel::KernelUseconds*>(
+			    static_cast<char*>(socket_output) + 64);
+			*timeout                    = 0;
+			const uint64_t creator      = static_cast<uint64_t>(created_sema.value);
+			const uint64_t alias        = static_cast<uint64_t>(opened_sema.value);
+			const uint64_t time_address = reinterpret_cast<uint64_t>(timeout);
+			const Reply    bad_need     = MiniSyscoreSemaphore({0x229, {UINT64_MAX, 0, 0}});
+			const Reply    bad_timeout  = MiniSyscoreSemaphore({0x229, {UINT64_MAX, 1, 1}});
+			*timeout                    = 17;
+			const Reply bad_handle = MiniSyscoreSemaphore({0x229, {UINT64_MAX, 1, time_address}});
+			sema_passed =
+			    bad_need.value == -1 && bad_need.posix_errno == Libs::Posix::POSIX_EINVAL &&
+			    bad_timeout.value == -1 && bad_timeout.posix_errno == Libs::Posix::POSIX_EFAULT &&
+			    bad_handle.value == -1 && bad_handle.posix_errno == Libs::Posix::POSIX_ESRCH &&
+			    *timeout == 17 && sema_passed;
+			*timeout          = 0;
+			const Reply empty = MiniSyscoreSemaphore({0x229, {alias, 1, time_address}});
+			sema_passed = empty.value == -1 && empty.posix_errno == Libs::Posix::POSIX_ETIMEDOUT &&
+			              sema_passed;
+			const int owner = LibKernel::Process::GetPid();
+			*timeout        = 250000;
+			Reply       waited;
+			std::thread waiter([&] {
+				LibKernel::Process::ScopedGuestProcessPid scope(owner);
+				waited = MiniSyscoreSemaphore({0x229, {alias, 1, time_address}});
+			});
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+			const Reply signalled = MiniSyscoreSemaphore({0x22b, {creator, 1}});
+			waiter.join();
+			sema_passed               = signalled.value == 0 && waited.value == 0 && sema_passed;
+			const Reply queued_one    = MiniSyscoreSemaphore({0x22b, {creator, 1}});
+			const Reply overflow      = MiniSyscoreSemaphore({0x22b, {creator, INT32_MAX}});
+			*timeout                  = 0;
+			const Reply retained_one  = MiniSyscoreSemaphore({0x229, {alias, 1, time_address}});
+			sema_passed               = queued_one.value == 0 && overflow.value == -1 &&
+			                            overflow.posix_errno == Libs::Posix::POSIX_EINVAL &&
+			                            retained_one.value == 0 && sema_passed;
+			const auto common_creator = reinterpret_cast<LibKernel::Semaphore::KernelSema>(creator);
+			const int  imported_signal = LibKernel::Semaphore::KernelSignalSema(common_creator, 1);
+			const Reply imported_count = MiniSyscoreSemaphore({0x229, {alias, 1, time_address}});
+			sema_passed = imported_signal == 0 && imported_count.value == 0 && sema_passed;
+			{
+				LibKernel::Process::ScopedGuestProcessPid other(owner + 0x100000);
+				const Reply rejected = MiniSyscoreSemaphore({0x22b, {creator, 1}});
+				sema_passed = rejected.value == -1 &&
+				              rejected.posix_errno == Libs::Posix::POSIX_ESRCH && sema_passed;
+			}
+			const Reply closed_alias    = MiniSyscoreSemaphore({0x228, {alias}});
+			const Reply closed_creator  = MiniSyscoreSemaphore({0x228, {creator}});
+			const Reply deleted_creator = MiniSyscoreSemaphore({0x226, {creator}});
+			const Reply stale           = MiniSyscoreSemaphore({0x22b, {alias, 1}});
+			sema_passed = closed_alias.value == 0 && closed_creator.value == -1 &&
+			              closed_creator.posix_errno == Libs::Posix::POSIX_EPERM &&
+			              deleted_creator.value == 0 && stale.value == -1 &&
+			              stale.posix_errno == Libs::Posix::POSIX_ESRCH && sema_passed;
+			LibKernel::Semaphore::KernelSema imported = nullptr;
+			const int imported_create                 = LibKernel::Semaphore::KernelCreateSema(
+			    &imported, "NativeMiniImportedSemFixture", 1, 1, 1, nullptr);
+			if (imported_create == 0) {
+				const auto  imported_handle = reinterpret_cast<uint64_t>(imported);
+				const Reply native_wait =
+				    MiniSyscoreSemaphore({0x229, {imported_handle, 1, time_address}});
+				const Reply native_delete = MiniSyscoreSemaphore({0x226, {imported_handle}});
+				sema_passed               = native_wait.value == 0 && native_delete.value == 0 &&
+				                            LibKernel::Semaphore::KernelSignalSema(imported, 1) ==
+				                                LibKernel::KERNEL_ERROR_ESRCH &&
+				                            sema_passed;
+			} else {
+				sema_passed = false;
+			}
+		}
 		const int queue_fd = LibKernel::FileSystem::CreateNativeKqueueDescriptor();
 		if (queue_fd >= 3) {
 			constexpr int fixture_pid = 0x60000400;

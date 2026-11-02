@@ -30,6 +30,26 @@ static int64_t KYTY_SYSV_ABI Unsupported(uint64_t a0, uint64_t a1, uint64_t a2, 
 	*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
 	return -1;
 }
+// libkernel_sys 0x46c30 and 0x46aa0: raw 609/571, then 0x80020000|errno on failure; get
+// sign-extends the 32-bit id into *out only on success.
+int KYTY_SYSV_ABI KernelGetBudget(int64_t* out) {
+	const auto reply = NativeKernelBridge::DispatchSyscall({0x261, {}});
+	if (reply.value < 0) {
+		*Posix::GetErrorAddr() = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+		return static_cast<int>(reply.value);
+	}
+	*out = static_cast<int32_t>(reply.value);
+	return 0;
+}
+int KYTY_SYSV_ABI KernelSetBudget(int id) {
+	const auto reply = NativeKernelBridge::DispatchSyscall(
+	    {0x23b, {static_cast<uint64_t>(static_cast<int64_t>(id))}});
+	if (reply.value < 0) {
+		*Posix::GetErrorAddr() = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+		return static_cast<int>(reply.value);
+	}
+	return 0;
+}
 static int64_t KYTY_SYSV_ABI OriginalSyscoreKevent(uint64_t fd, uint64_t changelist,
                                                    uint64_t nchanges, uint64_t eventlist,
                                                    uint64_t nevents, uint64_t timeout) {

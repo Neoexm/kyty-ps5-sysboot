@@ -7,11 +7,13 @@
 #include <functional>
 
 namespace Libs::LibKernel::AppMount {
+
 // Raw syscall 0x2c2 block as libkernel HRDq-RDIGmI marshals it; +0xb0 points at the wrapper-local
 // id.
 using Request = std::array<uint8_t, 0x178>;
 // The proc+0x460 record behind {1,14,35,pid}.
 using Record = std::array<uint8_t, 0x98>;
+
 // return 0 or a POSIX errno
 // copyin fills the block, copyout writes the id to +0xb0, read fetches param.json behind +0xa0
 int Begin(const std::function<int(Request&)>&                  copyin,
@@ -19,6 +21,15 @@ int Begin(const std::function<int(Request&)>&                  copyin,
           const std::function<int(uint64_t, void*, uint64_t)>& read);
 // Raw syscall 0x2c3; copyin reads the int the argument points at.
 int         End(const std::function<int(int32_t*)>& copyin);
+int         SetAppInfo(int pid, const Record& record);
+int         GetAppInfo(int pid, uint64_t size, Record* record, bool* committed);
+int         AppInfoById(int32_t app_id, uint64_t old_size, uint64_t new_size,
+                        const std::function<int(Record&)>& transfer);
+int         AppState(int32_t app_id, uint64_t old_size, uint64_t new_size,
+                     const std::function<int(std::array<uint32_t, 2>&)>& transfer);
 bool        GetAttachedApp(int pid, int32_t* app_id);
+const char* DiagnosticProcessState(int query);
+
 } // namespace Libs::LibKernel::AppMount
+
 #endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_APP_MOUNT_H_ */

@@ -2581,6 +2581,11 @@ int KYTY_SYSV_ABI rmdir(const char* path) {
 
 	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
 }
+int KYTY_SYSV_ABI unlink(const char* path) {
+	PRINT_NAME();
+
+	return POSIX_CALL(LibKernel::FileSystem::KernelUnlink(path));
+}
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
@@ -3463,6 +3468,47 @@ int chmod(const char* path, int mode) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelGetSpecialModelFlag(uint16_t* flag) {
+	PRINT_NAME();
+
+	if (flag == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	*flag = 0;
+	return OK;
+}
+int KYTY_SYSV_ABI KernelIsEcoChargeAvailable() {
+	PRINT_NAME();
+
+	return 0;
+}
+int KYTY_SYSV_ABI KernelIsAuthenticTrinity() {
+	PRINT_NAME();
+
+	return 0;
+}
+int KYTY_SYSV_ABI KernelGetCurrentFanDuty(uint16_t* duty, uint64_t* chassis_info) {
+	PRINT_NAME();
+
+	if (duty == nullptr || chassis_info == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	*duty         = 0;
+	*chassis_info = 0;
+	return OK;
+}
+int KYTY_SYSV_ABI KernelGetSocPowerConsumption(void* info) {
+	PRINT_NAME();
+
+	if (info == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	std::memset(info, 0, 0x70);
+	return OK;
+}
 // diagnostic: selected peers get the 0x4800000000000015 SceAvCapture authority
 static bool DiagnosticCompositorClientAuthorityMatches(uint64_t authority_id) {
 	const char* value = std::getenv("KYTY_DIAGNOSTIC_AUTHINFO_COMPOSITOR_CLIENT");
@@ -3578,6 +3624,126 @@ int KYTY_SYSV_ABI KernelGetAuthinfo(int pid, void* info) {
 	LOGF("\t pid = %d, authority id = 0x%016" PRIx64 "\n", pid, process.auth_id);
 	return OK;
 }
+int KYTY_SYSV_ABI KernelGetAppInfo2(int pid, void* info, size_t size) {
+	PRINT_NAME();
+	LibKernel::AppMount::Record record {};
+	bool                        committed = false;
+	const int result = LibKernel::AppMount::GetAppInfo(pid, size, &record, &committed);
+	if (result != 0) {
+		*Posix::GetErrorAddr() = result;
+		return LibKernel::KERNEL_ERROR_UNKNOWN + result;
+	}
+	if (!committed) {
+		LOGF("APP_INFO2_UNAVAILABLE pid=%d info=%p size=%" PRIu64
+		     " no_committed_record output_unchanged=1\n",
+		     pid, info, static_cast<uint64_t>(size));
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
+		return LibKernel::KERNEL_ERROR_ENOSYS;
+	}
+	if (size != 0 && !LibKernel::Memory::CopyToGuest(info, record.data(), size))
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	int32_t app_id = 0;
+	std::memcpy(&app_id, record.data(), sizeof(app_id));
+	LOGF("APP_INFO2 pid=%d size=%" PRIu64 " app_id=%d title=%.10s\n", pid,
+	     static_cast<uint64_t>(size), app_id, reinterpret_cast<const char*>(record.data() + 0x10));
+	return OK;
+}
+// Without this export the unresolved-import stub returns 0, which SysCore addShellCoreApp takes as
+// a mounted appid 0.
+static uint32_t AppMountRead32(const std::array<uint8_t, 0x18b0>& info, size_t offset) {
+	uint32_t value = 0;
+	std::memcpy(&value, info.data() + offset, sizeof(value));
+	return value;
+}
+// The kind byte the wrapper stores at +0x1a of the syscall block; -1 is its EINVAL.
+static int AppMountKind(uint32_t category, uint32_t mode) {
+	switch (category) {
+		case 0:
+		case 0xf000:
+		case 0xf100:
+		case 0x10000:
+		case 0x10100:
+		case 0x10200:
+		case 0x10300:
+		case 0x1f000:
+		case 0x1f300:
+		case 0x20000:
+		case 0x20100:
+		case 0x2f000: return 0;
+		case 0x1f100:
+		case 0x1f200:
+		case 0x1f400:
+		case 0x1f500:
+		case 0x2f100: return 1;
+		case 0x20200:
+		case 0x02000000:
+		case 0x02000100:
+		case 0x0200f000:
+		case 0x0200f100:
+		case 0x0200f200: return 2;
+		case 0x05000000: return 3;
+		case 0x03000000: return mode == 1 ? 6 : (mode == 2 ? 7 : 4);
+		case 0x01000000: return 5;
+		default: return -1;
+	}
+}
+int KYTY_SYSV_ABI KernelSetAppState(int32_t app_id, uint32_t state) {
+	PRINT_NAME();
+	const int32_t mib[4] {1, 14, 0x40, app_id};
+	const auto    reply =
+	    NativeKernelBridge::DispatchSyscall({0xca,
+		                                     {reinterpret_cast<uint64_t>(mib), 4, 0, 0,
+		                                      reinterpret_cast<uint64_t>(&state), sizeof(state)}});
+	int error = reply.posix_errno;
+	if (error == 0 && reply.value != 0)
+		error = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+	if (error != 0) *Posix::GetErrorAddr() = error;
+	const int result = error == 0 ? 0 : LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	LOGF("APP_STATE_EXPORT app_id=%d state=%u result=0x%x nid=QU57kCwF81U\n", app_id, state,
+	     result);
+	return result;
+}
+// libkernel_sys +0x42f10: an 8-byte read of the same oid; the outputs are only written once the
+// sysctl succeeds.
+int KYTY_SYSV_ABI KernelGetAppState(int32_t app_id, int32_t* state, int32_t* secondary) {
+	PRINT_NAME();
+	const int32_t mib[4] {1, 14, 0x40, app_id};
+	int32_t       buf[2] {};
+	uint64_t      len   = sizeof(buf);
+	const auto    reply = NativeKernelBridge::DispatchSyscall(
+	    {0xca,
+		 {reinterpret_cast<uint64_t>(mib), 4, reinterpret_cast<uint64_t>(buf),
+		  reinterpret_cast<uint64_t>(&len), 0, 0}});
+	int error = reply.posix_errno;
+	if (error == 0 && reply.value != 0)
+		error = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+	LOGF("APP_STATE_GET_EXPORT app_id=%d errno=%d state=%d secondary=%d nid=WYCNbP+Q9kc\n", app_id,
+	     error, buf[0], buf[1]);
+	if (error != 0) {
+		*Posix::GetErrorAddr() = error;
+		return LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	}
+	if (state != nullptr) *state = buf[0];
+	if (secondary != nullptr) *secondary = buf[1];
+	return OK;
+}
+// libkernel_sys +0x43040 passes the caller's buffer straight through as oldp with oldlen 0x98.
+int KYTY_SYSV_ABI KernelGetAppInfoByAppId(int32_t app_id, void* info) {
+	PRINT_NAME();
+	const int32_t mib[4] {1, 14, 65, app_id};
+	uint64_t      len   = sizeof(LibKernel::AppMount::Record);
+	const auto    reply = NativeKernelBridge::DispatchSyscall(
+	    {0xca,
+		 {reinterpret_cast<uint64_t>(mib), 4, reinterpret_cast<uint64_t>(info),
+		  reinterpret_cast<uint64_t>(&len), 0, 0}});
+	int error = reply.posix_errno;
+	if (error == 0 && reply.value != 0)
+		error = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+	if (error != 0) *Posix::GetErrorAddr() = error;
+	const int result = error == 0 ? 0 : LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	LOGF("APP_INFO_BY_ID_EXPORT app_id=%d result=0x%x nid=zsMzX135ofU\n", app_id, result);
+	return result;
+}
 // processSpawn gate: Prospero SDK word from PT_OS_PROCPARAM, taken from the decrypted overlay
 static int SdkVersionByPath(const char* path, uint64_t shift, uint32_t* out, const char* tag) {
 	if (path == nullptr || out == nullptr) {
@@ -3627,6 +3793,202 @@ static int BudgetErrno(const NativeKernelBridge::Reply& reply) {
 	}
 	return reply.posix_errno;
 }
+// libkernel_sys +0x42820 hands the caller's own 0x178-byte block to raw 0x2c2, so the id goes
+// wherever its +0xb0 points
+int KYTY_SYSV_ABI KernelBeginAppMount(void* request) {
+	PRINT_NAME();
+	const auto reply =
+	    NativeKernelBridge::DispatchSyscall({0x2c2, {reinterpret_cast<uint64_t>(request)}});
+	int error = reply.posix_errno;
+	if (error == 0 && reply.value != 0)
+		error = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+	if (error != 0) *Posix::GetErrorAddr() = error;
+	const int result = error == 0 ? 0 : LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	LOGF("APP_MOUNT_EXPORT result=0x%x nid=H69MYqpNjCc\n", result);
+	return result;
+}
+int KYTY_SYSV_ABI KernelEndAppMount2(int32_t app_id) {
+	PRINT_NAME();
+	const auto reply =
+	    NativeKernelBridge::DispatchSyscall({0x2c3, {reinterpret_cast<uint64_t>(&app_id)}});
+	int error = reply.posix_errno;
+	if (error == 0 && reply.value != 0)
+		error = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+	if (error != 0) *Posix::GetErrorAddr() = error;
+	const int result = error == 0 ? 0 : LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	LOGF("APP_MOUNT_END_EXPORT app_id=%d result=0x%x nid=CYIzY6OXyAs\n", app_id, result);
+	return result;
+}
+int KYTY_SYSV_ABI KernelBeginAppMount2(void* info, uint64_t arg1, uint64_t arg2) {
+	PRINT_NAME();
+	if (info == nullptr) return LibKernel::KERNEL_ERROR_EINVAL;
+
+	std::array<uint8_t, 0x18b0> public_info {};
+	if (!LibKernel::Memory::CopyFromGuest(public_info.data(), info, public_info.size())) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	const uint32_t category   = AppMountRead32(public_info, 0);
+	const uint8_t  hw_mode    = public_info[0x49];
+	const uint8_t  sub_mode   = public_info[0x4b];
+	const uint32_t settings   = AppMountRead32(public_info, 0x10a0);
+	const bool     low_energy = (AppMountRead32(public_info, 0x18a8) & 1) != 0 ||
+	                            (AppMountRead32(public_info, 0x18ac) & 1) != 0;
+	const int      kind       = AppMountKind(category, AppMountRead32(public_info, 0x1870));
+	if (kind < 0 || !((hw_mode <= 3) || hw_mode == 0xff) ||
+	    !((sub_mode <= 1) || sub_mode == 0xff) ||
+	    (sub_mode == 1 && (hw_mode != 0 || !low_energy)) || settings > 16) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	LibKernel::AppMount::Request request {};
+	auto                         put = [&](size_t to, size_t from, size_t size) {
+		std::memcpy(request.data() + to, public_info.data() + from, size);
+	};
+	const uint64_t header = 8;
+	std::memcpy(request.data(), &header, sizeof(header));
+	put(0x08, 0x24, 4);
+	put(0x0c, 0x2c, 4);
+	// strlcpy(+0x10, info+4, 10)
+	for (size_t i = 0; i < 9 && public_info[4 + i] != 0; i++) {
+		request[0x10 + i] = public_info[4 + i];
+	}
+	request[0x1a] = static_cast<uint8_t>(kind);
+	request[0x1b] = public_info[0x888];
+	request[0x1c] = public_info[0x68];
+	request[0x1d] = 0xff;
+	request[0x1f] = public_info[0x48];
+	put(0x20, 0x38, 8);
+	put(0x28, 0x28, 4);
+	put(0x2c, 0x30, 4);
+	put(0x30, 0x50, 16);
+	put(0x40, 0x60, 8);
+	request[0x48] = hw_mode;
+	request[0x49] = 0xff;
+	request[0x4a] = public_info[0x4a];
+	request[0x4b] = sub_mode;
+	put(0x4c, 0x1874, 4);
+	put(0x50, 0, 4);
+	put(0x54, 0x18a8, 4);
+	put(0x58, 0x1880, 32);
+	put(0x78, 0x18a0, 8);
+	put(0x94, 0x18ac, 4);
+	put(0x98, 0x40, 8);
+	std::memcpy(request.data() + 0xa0, &arg1, sizeof(arg1));
+	std::memcpy(request.data() + 0xa8, &arg2, sizeof(arg2));
+	int32_t    app_id         = -1;
+	const auto app_id_address = reinterpret_cast<uint64_t>(&app_id);
+	std::memcpy(request.data() + 0xb0, &app_id_address, sizeof(app_id_address));
+	put(0xb8, 0x1878, 8);
+	put(0xc0, 0x1090, 16);
+	put(0xd0, 0x10a0, 4);
+	for (uint32_t i = 0; i < settings; i++) {
+		put(0xd4 + 2 * i, 0x10a4 + 4 * i, 2);
+		const uint64_t entry = reinterpret_cast<uint64_t>(info) + 0x10e4 + 0x25 * i;
+		std::memcpy(request.data() + 0xf8 + 8 * i, &entry, sizeof(entry));
+	}
+
+	// libkernel_sys +0x42850 only picks the kind byte from the category; every accepted category
+	// takes the same marshalling to raw 0x2c2.
+	const int result = LibKernel::AppMount::Begin(
+	    [&](LibKernel::AppMount::Request& block) {
+		    block = request;
+		    return 0;
+	    },
+	    [&](uint64_t, int32_t id) {
+		    app_id = id;
+		    return 0;
+	    },
+	    [](uint64_t address, void* buffer, uint64_t size) {
+		    return LibKernel::Memory::CopyFromGuest(buffer, reinterpret_cast<const void*>(address),
+			                                        size)
+		               ? 0
+					   : Posix::POSIX_EFAULT;
+	    });
+	if (result != 0) {
+		LOGF("APP_MOUNT2_FAILED info=%p category=0x%x errno=%d no_app_returned=1\n", info, category,
+		     result);
+		*Posix::GetErrorAddr() = result;
+		return LibKernel::KERNEL_ERROR_UNKNOWN + result;
+	}
+	return app_id;
+}
+static int KYTY_SYSV_ABI KernelGetAppInfoBit(const void* record, size_t size, uint32_t bit,
+                                             int* output) {
+	PRINT_NAME();
+	if (record == nullptr || output == nullptr) return LibKernel::KERNEL_ERROR_EFAULT;
+	if (size >= 0x29 || bit > 127) return LibKernel::KERNEL_ERROR_EINVAL;
+	const auto address = reinterpret_cast<uint64_t>(record);
+	const auto offset  = 8 + 8 * (bit >> 6);
+	if (address > UINT64_MAX - offset) return LibKernel::KERNEL_ERROR_EFAULT;
+	uint64_t word = 0;
+	if (!LibKernel::Memory::CopyFromGuest(&word, reinterpret_cast<void*>(address + offset),
+	                                      sizeof(word))) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	const int value = static_cast<int>((word >> (bit & 63)) & 1);
+	return LibKernel::Memory::CopyToGuest(output, &value, sizeof(value))
+	           ? OK
+			   : LibKernel::KERNEL_ERROR_EFAULT;
+}
+static int KYTY_SYSV_ABI KernelQueryAppClassification(int* output) {
+	PRINT_NAME();
+	if (output == nullptr) return LibKernel::KERNEL_ERROR_EINVAL;
+	auto*       rt         = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto* proc_param = reinterpret_cast<const uint64_t*>(rt->GetProcParam());
+	if (proc_param == nullptr || proc_param[0] <= 0x17) {
+		LOGF("APP_CLASSIFICATION_UNAVAILABLE mib=1,14,68,self no_process_param "
+		     "output_unchanged=1\n");
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+		return LibKernel::KERNEL_ERROR_ENOENT;
+	}
+	const uint32_t classification = static_cast<uint32_t>(proc_param[2] >> 32);
+	if (!LibKernel::Memory::CopyToGuest(output, &classification, sizeof(classification))) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	LOGF("APP_CLASSIFICATION_FROM_PROCPARAM value=0x%08x mib=1,14,68,self\n", classification);
+	return OK;
+}
+int KYTY_SYSV_ABI KernelGetAppInfo(int pid, void* info) {
+	PRINT_NAME();
+	// A record set through {1,14,35} is the kernel's own; the SFO category below only covers
+	// processes that never set one.
+	LibKernel::AppMount::Record committed_record {};
+	bool                        committed = false;
+	const int access = LibKernel::AppMount::GetAppInfo(pid, 0x58, &committed_record, &committed);
+	if (access != 0) {
+		*Posix::GetErrorAddr() = access;
+		return LibKernel::KERNEL_ERROR_UNKNOWN + access;
+	}
+	if (!LibKernel::Memory::CanWriteGuest(info, 0x58)) return LibKernel::KERNEL_ERROR_EFAULT;
+	if (committed) {
+		if (!LibKernel::Memory::CopyToGuest(info, committed_record.data(), 0x58))
+			return LibKernel::KERNEL_ERROR_EFAULT;
+		return OK;
+	}
+
+	LibKernel::Process::PeerProcess process;
+	if (!LibKernel::Process::FindPeerByPid(pid, &process)) {
+		// pfind found the pid so not ESRCH, there's just no metadata
+		LOGF("APP_INFO_RECORD_UNKNOWN pid=%d no_peer_metadata\n", pid);
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
+		return LibKernel::KERNEL_ERROR_ENOSYS;
+	}
+
+	if (!process.has_category) {
+		LOGF("APP_INFO_CATEGORY_UNAVAILABLE pid=%d no_record_returned=1\n", pid);
+		return LibKernel::KERNEL_ERROR_ENOENT;
+	}
+
+	// Native callers only show the category at +0x50 of the 0x58-byte record. The rest, including
+	// the id at +0, stays zero.
+	std::array<uint8_t, 0x58> record {};
+	std::memcpy(record.data() + 0x50, &process.category, sizeof(process.category));
+	if (!LibKernel::Memory::CopyToGuest(info, record.data(), record.size()))
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	LOGF("\t pid = %d, category = 0x%x\n", pid, process.category);
+	return OK;
+}
 int KYTY_SYSV_ABI KernelGetProcessName(int pid, char* name) {
 	PRINT_NAME();
 
@@ -3641,6 +4003,84 @@ int KYTY_SYSV_ABI KernelGetProcessName(int pid, char* name) {
 	name[31] = '\0';
 	LOGF("\t pid = %d, name = %s\n", pid, name);
 	return OK;
+}
+int KYTY_SYSV_ABI KernelGetAppCategoryType(int pid, int* category) {
+	PRINT_NAME();
+
+	if (category == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	LibKernel::AppMount::Record record {};
+	bool                        committed = false;
+	const int access = LibKernel::AppMount::GetAppInfo(pid, 0x58, &record, &committed);
+	if (access != 0) {
+		*Posix::GetErrorAddr() = access;
+		return LibKernel::KERNEL_ERROR_UNKNOWN + access;
+	}
+	if (committed) {
+		return LibKernel::Memory::CopyToGuest(category, record.data() + 0x50, sizeof(*category))
+		           ? OK
+				   : LibKernel::KERNEL_ERROR_EFAULT;
+	}
+
+	LibKernel::Process::PeerProcess process;
+	if (!LibKernel::Process::FindPeerByPid(pid, &process)) {
+		// pfind found the pid so not ESRCH, there's just no metadata
+		LOGF("APP_INFO_RECORD_UNKNOWN pid=%d no_peer_metadata\n", pid);
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
+		return LibKernel::KERNEL_ERROR_ENOSYS;
+	}
+
+	if (!process.has_category) {
+		return LibKernel::KERNEL_ERROR_ENOENT;
+	}
+
+	if (!LibKernel::Memory::CopyToGuest(category, &process.category, sizeof(process.category))) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	LOGF("\t pid = %d, category = 0x%x\n", pid, process.category);
+	return OK;
+}
+// fh-Bb3wl0Vs: AgcCompositor reads the app record category by app id rather than by pid.
+int KYTY_SYSV_ABI KernelGetAppCategoryTypeByAppId(int32_t app_id, int* category) {
+	PRINT_NAME();
+	if (category == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	uint32_t  value  = 0;
+	const int access = LibKernel::AppMount::AppInfoById(
+	    app_id, sizeof(LibKernel::AppMount::Record), 0,
+	    [&value](LibKernel::AppMount::Record& record) {
+		    std::memcpy(&value, record.data() + 0x50, sizeof(value));
+		    return 0;
+	    });
+	if (access != 0) {
+		*Posix::GetErrorAddr() = access;
+		return LibKernel::KERNEL_ERROR_UNKNOWN + access;
+	}
+	if (!LibKernel::Memory::CopyToGuest(category, &value, sizeof(value))) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	LOGF("\t app_id = %d, category = 0x%x\n", app_id, value);
+	return OK;
+}
+int KYTY_SYSV_ABI TraceSysCoreGetShellCoreAppId(int32_t* app_id) {
+	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceSysCore.sprx");
+	auto* program     = rt->FindProgramByFileName(module_path);
+	EXIT_IF(program == nullptr);
+	auto* initialized = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x10048);
+	auto* connected   = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x10049);
+	LOGF("SysCore get app id before: initialized=%u connected=%u\n",
+	     static_cast<unsigned>(*initialized), static_cast<unsigned>(*connected));
+	using get_func_t  = KYTY_SYSV_ABI int (*)(int32_t*);
+	const auto result = reinterpret_cast<get_func_t>(program->base_vaddr + 0xaf0)(app_id);
+	LOGF("SysCore get app id after: initialized=%u connected=%u result=0x%08x app_id=0x%08x\n",
+	     static_cast<unsigned>(*initialized), static_cast<unsigned>(*connected),
+	     static_cast<unsigned>(result),
+	     app_id != nullptr ? static_cast<unsigned>(*app_id) : 0xffffffffu);
+	return result;
 }
 int KYTY_SYSV_ABI TraceIpmiCreateClient(void** out_client, void* config, void* arg, void* storage) {
 	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
