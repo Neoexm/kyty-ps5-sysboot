@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -123,8 +124,34 @@ LIB_VERSION("AudioOut", 1, "AudioOut", 1, 1);
 
 namespace AudioOut = Audio::AudioOut;
 
+// 13.60 qLpSK75lXI4 (+0x1010) forwards to OpenEx (+0x430), which needs the native init flag; the
+// PSM port request goes to the SDL AudioOutOpen instead
+static int KYTY_SYSV_ABI DiagnosticPsmAudioOpenEx(int user_id, int type, int index, int modifier,
+                                                  uint32_t len, uint32_t freq, uint32_t param) {
+	LOGF("FIRST_FRAME_AUDIT PSM_AUDIO_OPENEX user=0x%x type=%d index=%d"
+	     " modifier=%d len=%u freq=%u param=0x%08x\n",
+	     user_id, type, index, modifier, len, freq, param);
+	const bool observed_main = type == 0 && param == 0x01010004;
+	// BGM opens a FLOAT_8CH port to warm up and an S16_8CH port for playback; both are SDL ports.
+	const bool observed_bgm = type == 1 && (param == 0x00010005 || param == 0x00010002);
+	if (user_id != 0xff || index != 0 || modifier != 0 || len != 256 || freq != 48000 ||
+	    !(observed_main || observed_bgm)) {
+		return LibKernel::KERNEL_ERROR_ENOSYS;
+	}
+	const int result = AudioOut::AudioOutOpen(user_id, type, index, len, freq, param);
+	LOGF("FIRST_FRAME_AUDIT PSM_AUDIO_OPENEX opened_handle=%d\n", result);
+	return result;
+}
+
 LIB_DEFINE(InitAudio_1_AudioOut) {
-	LIB_FUNC("JfEPXVxhFqA", AudioOut::AudioOutInit);
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_AUDIO_OPENEX") != nullptr) {
+		LIB_FUNC("qLpSK75lXI4", DiagnosticPsmAudioOpenEx);
+	}
+	// sceAudioOutOpenEx checks its init byte at +0x6CF90; with only the HLE init PSM gets
+	// 0x8026000F, so this trial runs the native init export
+	if (std::getenv("KYTY_DIAGNOSTIC_NATIVE_AUDIOOUT_INIT") == nullptr) {
+		LIB_FUNC("JfEPXVxhFqA", AudioOut::AudioOutInit);
+	}
 	LIB_FUNC("ekNvsT22rsY", AudioOut::AudioOutOpen);
 	LIB_FUNC("b+uAV89IlxE", AudioOut::AudioOutSetVolume);
 	LIB_FUNC("w3PdaSTSwGE", AudioOut::AudioOutOutputs);

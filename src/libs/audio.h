@@ -7,6 +7,8 @@ namespace Libs::Audio {
 
 void Initialize();
 void Shutdown();
+// set once host audio has its lifecycle object, not when a device is connected
+bool BackendInitialized() noexcept;
 
 struct Lifecycle {
 	static constexpr const char* name       = "Audio";

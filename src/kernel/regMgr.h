@@ -18,6 +18,8 @@ struct Guest {
 	std::function<bool(uint64_t, const void*, uint64_t)> write;
 };
 
+bool Enabled();
+
 // Raw syscall 0x214 {op, key, &status, value, size}. 0 or a POSIX errno; -1 and *reason when
 // unmodelled.
 int Call(uint32_t op, uint32_t key, uint64_t size, const Guest& guest, int32_t* status,

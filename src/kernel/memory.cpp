@@ -221,6 +221,7 @@ public:
 		VirtualRangeType type           = VirtualRangeType::Reserved;
 		bool             disallow_merge = false;
 		uint64_t              owner_token    = 0;
+		std::shared_ptr<void> lifetime;
 		char             name[KERNEL_MAXIMUM_NAME_LENGTH];
 	};
 
@@ -363,6 +364,30 @@ public:
 	void SetOwner(uint64_t start, uint64_t size, uint64_t token) {
 		Common::LockGuard lock(m_mutex);
 		EditUnlocked(start, size, [token](Range* r) { r->owner_token = token; });
+	}
+
+	bool SetLifetime(uint64_t start, uint64_t size, const std::shared_ptr<void>& lifetime) {
+		Common::LockGuard lock(m_mutex);
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return false;
+		}
+		const auto end     = start + size;
+		auto       current = start;
+		for (const auto& range: m_ranges) {
+			const auto range_end = End(range.start, range.size);
+			if (range_end <= current) {
+				continue;
+			}
+			if (range.start > current) {
+				return false;
+			}
+			current = std::min(end, range_end);
+			if (current == end) {
+				EditUnlocked(start, size, [&lifetime](Range* r) { r->lifetime = lifetime; });
+				return true;
+			}
+		}
+		return false;
 	}
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
@@ -947,6 +972,14 @@ static MemoryOperationMutex g_memory_operation_mutex;
 uint64_t MemoryOperationOwnerThreadId() {
 	return g_memory_operation_mutex.Owner();
 }
+static std::atomic<uint64_t> g_next_anonymous_shared_memory_id {0};
+#if defined(KYTY_SHM_ANON_TESTS)
+static std::atomic<uint64_t> g_test_objects {0};
+static std::atomic<uint64_t> g_test_backings {0};
+static std::atomic<uint64_t> g_test_backing_bytes {0};
+static std::atomic<uint64_t> g_test_mappings {0};
+static std::atomic_bool      g_test_fail_next_anonymous_allocation {false};
+#endif
 class AnonymousSharedMemory {
 public:
 	explicit AnonymousSharedMemory(uint16_t object_mode, uint64_t object_id)
@@ -959,6 +992,19 @@ public:
 	uint16_t              mode            = 0;
 	uint64_t              id              = 0;
 	std::atomic<uint64_t> mappings {0};
+};
+class AnonymousSharedMemoryLease {
+public:
+	explicit AnonymousSharedMemoryLease(std::shared_ptr<AnonymousSharedMemory> value)
+	    : object(std::move(value)) {
+		object->mappings.fetch_add(1, std::memory_order_relaxed);
+#if defined(KYTY_SHM_ANON_TESTS)
+		g_test_mappings.fetch_add(1, std::memory_order_relaxed);
+#endif
+	}
+	~AnonymousSharedMemoryLease();
+
+	std::shared_ptr<AnonymousSharedMemory> object;
 };
 
 // The base address the PS5 kernel hands out for hint-less user mappings. Guest code can
@@ -2689,6 +2735,84 @@ int UnmapOwnedFlexibleMemory(uint64_t address, size_t len, uint64_t token) {
 	return OwnsFlexibleMemory(address, len, token) ? KernelMunmap(address, len)
 	                                               : KERNEL_ERROR_ENOENT;
 }
+void* KYTY_SYSV_ABI KernelMmap(void* addr, size_t len, int prot, int flags, int fd,
+                               int64_t offset) {
+	PRINT_NAME();
+
+	constexpr int MAP_FIXED_GUEST   = 0x0010;
+	constexpr int MAP_SHARED_GUEST  = 0x0001;
+	constexpr int MAP_ANON_GUEST    = 0x1000;
+	constexpr int MAP_PRIVATE_GUEST = 0x0002;
+	// 13.60 ShellUI allocator (+0xC357F0) passes 0x8000 in anonymous mmap
+	constexpr int MAP_GUEST_8000      = 0x8000;
+	constexpr int MAP_ALIGNMENT_MASK  = static_cast<int>(0xff000000u);
+	constexpr int SUPPORTED_MMAP_BITS = MAP_FIXED_GUEST | MAP_SHARED_GUEST | MAP_ANON_GUEST |
+	                                    MAP_PRIVATE_GUEST | MAP_GUEST_8000 | MAP_ALIGNMENT_MASK;
+
+	size_t shared_size = 0;
+	if ((flags & MAP_SHARED_GUEST) != 0 && (flags & MAP_ANON_GUEST) == 0 &&
+	    (flags & MAP_PRIVATE_GUEST) == 0 && offset == 0 &&
+	    FileSystem::GetSharedMemorySize(fd, &shared_size)) {
+		return FileSystem::MapSharedMemory(fd, addr, len, prot, flags);
+	}
+
+	// no writable shared view: a filled copy reads the same, the providers are read-only.
+	// flags with neither MAP_SHARED nor MAP_PRIVATE = old FreeBSD shared default, still used by
+	// PSM's font loader
+	FileSystem::FileStat file_stat {};
+	if (fd >= 0 && (flags & MAP_ANON_GUEST) == 0 && (flags & ~SUPPORTED_MMAP_BITS) == 0 &&
+	    (flags & (MAP_SHARED_GUEST | MAP_PRIVATE_GUEST)) !=
+	        (MAP_SHARED_GUEST | MAP_PRIVATE_GUEST) &&
+	    ((prot & 2) == 0 || (flags & MAP_PRIVATE_GUEST) != 0) && offset >= 0 &&
+	    (offset & 0x3fff) == 0 && len != 0 && FileSystem::KernelFstat(fd, &file_stat) == OK &&
+	    (file_stat.st_mode & 0170000) == 0100000) {
+		const size_t mapped_len = (len + 0x3fff) & ~size_t {0x3fff};
+		void*        mapped     = addr;
+		int          result     = KernelMapNamedFlexibleMemory(
+		    &mapped, mapped_len, 3, flags & (MAP_FIXED_GUEST | MAP_GUEST_8000 | MAP_ALIGNMENT_MASK),
+		    "mmap_file");
+		if (result == OK) {
+			const int64_t available = std::max<int64_t>(file_stat.st_size - offset, 0);
+			const int64_t read      = FileSystem::KernelPread(
+			    fd, mapped, std::min<int64_t>(available, static_cast<int64_t>(len)), offset);
+			result = read < 0 ? static_cast<int>(read)
+			                  : (prot == 3 ? OK : KernelMprotect(mapped, mapped_len, prot));
+			LOGF("FIRST_FRAME_AUDIT MMAP_FILE fd=%d addr=0x%016" PRIx64 " len=0x%" PRIx64
+			     " prot=0x%x flags=0x%x offset=0x%" PRIx64 " file_size=0x%" PRIx64 " read=%" PRId64
+			     " result=0x%08x\n",
+			     fd, reinterpret_cast<uint64_t>(mapped), static_cast<uint64_t>(len), prot, flags,
+			     static_cast<uint64_t>(offset), static_cast<uint64_t>(file_stat.st_size), read,
+			     static_cast<uint32_t>(result));
+			if (result != OK) KernelMunmap(reinterpret_cast<uint64_t>(mapped), mapped_len);
+		}
+		if (result != OK) {
+			*Posix::GetErrorAddr() = KernelToPosix(result);
+			return reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+		}
+		return mapped;
+	}
+
+	if ((flags & ~SUPPORTED_MMAP_BITS) != 0 || (flags & MAP_PRIVATE_GUEST) == 0 ||
+	    (flags & MAP_ANON_GUEST) == 0 || fd != -1 || offset != 0) {
+		LOGF("\t mmap not supported: addr=0x%016" PRIx64 " len=0x%016" PRIx64
+		     " prot=0x%x flags=0x%x fd=%d offset=0x%016" PRIx64 "\n",
+		     reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(len), prot, flags, fd,
+		     static_cast<uint64_t>(offset));
+		// sceKernelMmap returns errno, and 0 for errno 0, so every failure needs one
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOTSUP;
+		return reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+	}
+
+	void*     mapped    = addr;
+	int       map_flags = flags & (MAP_FIXED_GUEST | MAP_GUEST_8000 | MAP_ALIGNMENT_MASK);
+	const int result    = KernelMapNamedFlexibleMemory(&mapped, len, prot, map_flags, "mmap");
+	if (result != OK) {
+		*Posix::GetErrorAddr() = KernelToPosix(result);
+		return reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+	}
+
+	return mapped;
+}
 static ScopeMemory::SharedObject* FindScopeSharedMemory(const char* name) {
 	for (uint32_t i = 0; i < g_scope_memory->shared_count; i++) {
 		auto& shared = g_scope_memory->shared[i];
@@ -2758,6 +2882,57 @@ int UnlinkScopeSharedMemory(const char* name) {
 	}
 	shared->linked = false;
 	return 0;
+}
+void ResizeScopeSharedMemory(int object, uint64_t size) {
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+
+	ScopeMemoryLock lock;
+	auto&           shared   = g_scope_memory->shared[object];
+	const auto      capacity = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	if (shared.capacity == 0 && capacity != 0) {
+		EXIT_IF(g_scope_memory->upper_end + capacity >
+		        PhysicalMemory::TotalSize() + ScopeMemory::UpperSize);
+		shared.offset   = g_scope_memory->upper_end;
+		shared.capacity = capacity;
+		g_scope_memory->upper_end += capacity;
+	}
+	// backing taken once at the first size, so every process maps the same offsets
+	EXIT_NOT_IMPLEMENTED(capacity > shared.capacity);
+	if (size > shared.size) {
+		EXIT_IF(
+		    !g_guest_address_space->ZeroBacking(shared.offset + shared.size, size - shared.size));
+	}
+	shared.size = size;
+}
+void WriteScopeSharedMemory(int object, uint64_t offset, const void* data, uint64_t size) {
+	ScopeMemoryLock lock;
+	const auto&     shared = g_scope_memory->shared[object];
+	EXIT_IF(offset + size > shared.size);
+	std::memcpy(reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase()) +
+	                shared.offset + offset,
+	            data, size);
+}
+int MapScopeSharedMemory(int object, void** addr, size_t len, int prot, int flags) {
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+
+	uint64_t offset   = 0;
+	uint64_t size     = 0;
+	uint64_t capacity = 0;
+	{
+		ScopeMemoryLock lock;
+		const auto&     shared = g_scope_memory->shared[object];
+		offset                 = shared.offset;
+		size                   = shared.size;
+		capacity               = shared.capacity;
+	}
+
+	const auto map_len = (static_cast<uint64_t>(len) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	if (len == 0 || len > SIZE_MAX - (PAGE_SIZE - 1) ||
+	    map_len > ((size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	EXIT_IF(!g_physical_memory->Import(offset, capacity));
+	return KernelMapDirectMemory(addr, map_len, prot, flags, static_cast<int64_t>(offset), 0);
 }
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 	PRINT_NAME();
@@ -3673,6 +3848,22 @@ static int MapDirectMemoryInternal(void** addr, size_t len, int prot, int flags,
 	return OK;
 }
 
+std::shared_ptr<AnonymousSharedMemory> CreateAnonymousSharedMemory(uint16_t mode) {
+	try {
+		auto id = g_next_anonymous_shared_memory_id.fetch_add(1, std::memory_order_relaxed) + 1;
+		EXIT_IF(id == 0);
+		auto object = std::make_shared<AnonymousSharedMemory>(mode, id);
+#if defined(KYTY_SHM_ANON_TESTS)
+		g_test_objects.fetch_add(1, std::memory_order_relaxed);
+#endif
+		return object;
+	} catch (const std::bad_alloc&) {
+		return {};
+	}
+}
+uint64_t GetAnonymousSharedMemoryId(const std::shared_ptr<AnonymousSharedMemory>& object) {
+	return object ? object->id : 0;
+}
 uint64_t GetAnonymousSharedMemorySize(const std::shared_ptr<AnonymousSharedMemory>& object) {
 	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
 	return object ? object->size : 0;
@@ -3680,6 +3871,53 @@ uint64_t GetAnonymousSharedMemorySize(const std::shared_ptr<AnonymousSharedMemor
 uint16_t GetAnonymousSharedMemoryMode(const std::shared_ptr<AnonymousSharedMemory>& object) {
 	return object ? object->mode : 0;
 }
+int MapAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& object, void** addr,
+                             size_t len, int prot, int flags) {
+	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+	constexpr uint32_t                    MAP_SHARED_GUEST = 0x1;
+	constexpr uint32_t                    MAP_FIXED_GUEST  = 0x10;
+	constexpr uint32_t                    ALLOWED_FLAGS    = MAP_SHARED_GUEST | MAP_FIXED_GUEST;
+	const auto                            flags_u          = static_cast<uint32_t>(flags);
+	if (!object || addr == nullptr || len == 0 || len > SIZE_MAX - 0x3fffu ||
+	    (flags_u & MAP_SHARED_GUEST) == 0 || (flags_u & ~ALLOWED_FLAGS) != 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	const auto map_len = (len + 0x3fffu) & ~size_t {0x3fff};
+	if (map_len > ((object->size + 0x3fffu) & ~0x3fffull) || map_len > object->capacity) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	std::shared_ptr<AnonymousSharedMemoryLease> lease;
+	try {
+		lease = std::make_shared<AnonymousSharedMemoryLease>(object);
+	} catch (const std::bad_alloc&) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+	void*      mapped = *addr;
+	const auto result =
+	    MapDirectMemoryInternal(&mapped, map_len, prot, static_cast<int>(flags_u & MAP_FIXED_GUEST),
+		                        static_cast<int64_t>(object->physical_offset), 0, true);
+	if (result != OK) {
+		return result;
+	}
+	if (!g_virtual_ranges->SetLifetime(reinterpret_cast<uint64_t>(mapped), map_len, lease)) {
+		EXIT_IF(KernelMunmap(reinterpret_cast<uint64_t>(mapped), map_len) != OK);
+		return KERNEL_ERROR_EBUSY;
+	}
+	*addr = mapped;
+	return OK;
+}
+#if defined(KYTY_SHM_ANON_TESTS)
+AnonymousSharedMemoryTestStats TestGetAnonymousSharedMemoryStats() {
+	return {g_test_objects.load(std::memory_order_relaxed),
+	        g_test_backings.load(std::memory_order_relaxed),
+	        g_test_backing_bytes.load(std::memory_order_relaxed),
+	        g_test_mappings.load(std::memory_order_relaxed)};
+}
+
+void TestFailNextAnonymousSharedMemoryAllocation() {
+	g_test_fail_next_anonymous_allocation.store(true, std::memory_order_release);
+}
+#endif
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();

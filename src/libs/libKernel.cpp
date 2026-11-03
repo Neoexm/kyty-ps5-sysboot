@@ -2204,6 +2204,61 @@ static int KYTY_SYSV_ABI KernelIpmiManagerCall(uint32_t command, int32_t client_
 		     client_id, args_size, readable, static_cast<void*>(result), descriptor[0],
 		     descriptor[1], descriptor[2], descriptor[3]);
 	}
+	const bool register_imported_server =
+	    command == 0 && std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_REGISTRY") != nullptr;
+	if (command == 0 && (register_imported_server ||
+	                     std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_AUDIT") != nullptr)) {
+		auto readable = [](uint64_t address, size_t bytes) {
+			Memory::VirtualQueryInfo region {};
+			return address != 0 && bytes <= UINT64_MAX - address &&
+			       Memory::KernelVirtualQuery(reinterpret_cast<const void*>(address), 0, &region,
+			                                  sizeof(region)) == 0 &&
+			       region.is_committed && region.start <= address &&
+			       region.end >= address + bytes && (region.protection & 1u) != 0;
+		};
+		if (args_size == sizeof(uint64_t) * 3 &&
+		    readable(reinterpret_cast<uint64_t>(args), args_size)) {
+			uint64_t descriptor[3] {};
+			std::memcpy(descriptor, args, sizeof(descriptor));
+			std::string original_name;
+			bool        terminated = false;
+			for (size_t i = 0; i < 128; ++i) {
+				if (!readable(descriptor[1] + i, 1)) break;
+				char value = 0;
+				std::memcpy(&value, reinterpret_cast<const void*>(descriptor[1] + i), 1);
+				if (value == '\0') {
+					terminated = true;
+					break;
+				}
+				if (value < 0x21 || value > 0x7e) break;
+				original_name.push_back(value);
+			}
+			LOGF("FIRST_FRAME_AUDIT AUDIO_IPMI_SERVER_REGISTRATION_ABI"
+			     " command=%u requested_client=%d output=0x%016" PRIx64 " descriptor=%016" PRIx64
+			     ",%016" PRIx64 ",%016" PRIx64 " name=%s terminated=%u owner_pid=%d\n",
+			     command, client_id, reinterpret_cast<uint64_t>(result), descriptor[0],
+			     descriptor[1], descriptor[2], original_name.c_str(),
+			     static_cast<unsigned>(terminated), Process::GetPid());
+			if (register_imported_server) {
+				if (!terminated || original_name.empty() ||
+				    !readable(descriptor[0], sizeof(uint64_t)) ||
+				    !readable(descriptor[2], sizeof(uint64_t))) {
+					return -22;
+				}
+				uint32_t  id = 0;
+				const int rc = NativeKernelBridge::RegisterImportedGuestIpmiServer(
+				    original_name.c_str(), descriptor[0], descriptor[2],
+				    static_cast<uint32_t>(Process::GetPid()), &id);
+				if (rc != 0) {
+					return rc;
+				}
+				*result = static_cast<int32_t>(id);
+				return 0;
+			}
+		}
+		if (register_imported_server) return -22;
+	}
+
 	if (command == 0x10 && std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_IPMI_AUDIT") != nullptr) {
 		Memory::VirtualQueryInfo region {};
 		const auto               address = reinterpret_cast<uint64_t>(args);

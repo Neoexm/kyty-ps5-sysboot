@@ -1,3 +1,14 @@
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
@@ -11,11 +22,44 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/stringUtils.h"
+#include "emulator.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"
+#include "kernel/eventFlag.h"
+#include "kernel/envelopeConsoleProvider.h"
+#include "kernel/envelopeConsoleProviderProtocol.h"
+#include "kernel/envelopeSecureProcessor.h"
+#include "kernel/envelopeLocalBackend.h"
+#include "kernel/execProcess.h"
 #include "kernel/fileSystem.h"
+#include "kernel/capturedRootMetadata.h"
+#include "kernel/capturedDirectory.h"
+#include "kernel/ipmiManager.h"
+#include "kernel/ipmiScope.h"
+#include "kernel/memory.h"
+#include "kernel/pthread.h"
+#include "kernel/process.h"
+#include "kernel/regMgr.h"
+#include "kernel/semaphore.h"
+#include "kernel/socketPolicy.h"
+#include "kernel/sectorBacking.h"
+#include "kernel/exfatMount.h"
+#include "kernel/directoryPassthrough.h"
+#include "kernel/nullfsMount.h"
+#include "ExfatTestFixture.h"
+#include <fstream>
+#include "kernel/tmpfs.h"
 #include "libs/errno.h"
+#include "libs/audio.h"
+#include "libs/nativeKernelBridge.h"
 #include "libs/network.h"
+#include "kernel/authInfo.h"
+#include "loader/decryptedModuleOverlay.h"
+#include "loader/elf.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
@@ -30,13 +74,23 @@
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <iomanip>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <nlohmann/json.hpp>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <bcrypt.h>
+#include <psapi.h>
+#endif
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
@@ -354,6 +408,76 @@ void CheckUnmappedPaths(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
+void CheckNativeIpmiTraceHooks() {
+#if defined(_WIN32)
+  namespace Kernel = Libs::LibKernel;
+  const char* configured = std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS");
+  const std::string saved = configured ? configured : "";
+  void* guest_buffer = nullptr;
+  Check(Kernel::Memory::KernelMapNamedFlexibleMemory(&guest_buffer, 0x4000, 3, 0, "ipmi_trace_fixture") == OK,
+        "allocate native IPMI trace fixture");
+  auto* bytes = static_cast<uint8_t*>(guest_buffer);
+  auto* result_word = reinterpret_cast<uint32_t*>(bytes);
+  std::memset(bytes + 0x40, 0xA5, 0x40);
+  _putenv_s("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS", "1");
+  for (uint64_t suboperation = 0x1f00; suboperation <= 0x1f05; ++suboperation) {
+    *result_word = 0xFFFFFFFFu;
+    const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+        {0x26e, {0x10, suboperation, reinterpret_cast<uint64_t>(result_word),
+                 reinterpret_cast<uint64_t>(bytes + 0x40), 0x40, 0}});
+    Check(reply.value == 0 && reply.posix_errno == 0 && *result_word == 0,
+          "native IPMI trace hook completes without blocking");
+  }
+  *result_word = 0xA5A5A5A5u;
+  const auto bad_record = Libs::NativeKernelBridge::DispatchSyscall(
+      {0x26e, {0x10, 0x1f02, reinterpret_cast<uint64_t>(result_word), 1, 0x40, 0}});
+  const auto receive = Libs::NativeKernelBridge::DispatchSyscall(
+      {0x26e, {0x201, 1, reinterpret_cast<uint64_t>(result_word),
+               reinterpret_cast<uint64_t>(bytes + 0x40), 0x20, 0}});
+  Check(bad_record.value == -1 && bad_record.posix_errno == Libs::Posix::POSIX_EFAULT &&
+            *result_word == 0xA5A5A5A5u && receive.value == -1 && receive.posix_errno == Libs::Posix::POSIX_ENOSYS,
+        "trace validation does not add receive support");
+  const uint64_t name_pointer = reinterpret_cast<uint64_t>(bytes + 0x100);
+  std::memcpy(bytes + 0x40, &name_pointer, sizeof(name_pointer));
+  *result_word = 0xffffffffu;
+  const auto failed_name = Libs::NativeKernelBridge::DispatchSyscall(
+      {0x26e, {0x46a, 0x8002004e, reinterpret_cast<uint64_t>(result_word),
+               reinterpret_cast<uint64_t>(bytes + 0x40), 8, 0}});
+  Check(failed_name.value == -1 && failed_name.posix_errno == Libs::Posix::POSIX_EBADF &&
+        *result_word == 0xffffffffu && bytes[0x100] == 0,
+        "native IPMI failed-server name query leaves outputs untouched");
+  // SysAv trap and HLE entry share the IPMI manager
+  const uint64_t user_data_pointer = reinterpret_cast<uint64_t>(bytes + 0x100);
+  std::memcpy(bytes + 0x40, &user_data_pointer, sizeof(user_data_pointer));
+  std::memset(bytes + 0x100, 0x5a, 8);
+  *result_word = 0xA5A5A5A5u;
+  const Libs::NativeKernelBridge::SyscallRequest user_data_call {
+      0x26e, {0x468, 0x30000fff, reinterpret_cast<uint64_t>(result_word), reinterpret_cast<uint64_t>(bytes + 0x40), 8, 0}};
+  const auto legacy_user_data = Libs::NativeKernelBridge::DispatchSyscall(user_data_call);
+  const char* original_ipmi = std::getenv("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI");
+  const std::string saved_original_ipmi = original_ipmi ? original_ipmi : "";
+  _putenv_s("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI", "1");
+  const auto trapped = Libs::NativeKernelBridge::DispatchSyscall(user_data_call);
+  auto* direct_result = reinterpret_cast<int32_t*>(bytes + 0x200);
+  *direct_result = static_cast<int32_t>(0xA5A5A5A5u);
+  int direct_status = 0;
+  *Libs::Posix::GetErrorAddr() = 0;
+  const bool direct = Kernel::IpmiManager::TryCall(0x468, 0x30000fff, direct_result, bytes + 0x40, 8, 0, &direct_status) &&
+                      direct_status == -1 && *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOENT;
+  const auto trapped_fault = Libs::NativeKernelBridge::DispatchSyscall(
+      {0x26e, {0x468, 0x30000fff, reinterpret_cast<uint64_t>(result_word), 1, 8, 0}});
+  _putenv_s("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI", saved_original_ipmi.c_str());
+  Check(legacy_user_data.value == -1 && legacy_user_data.posix_errno == Libs::Posix::POSIX_ENOSYS &&
+            trapped.value == -1 && trapped.posix_errno == Libs::Posix::POSIX_ENOENT && direct &&
+            *direct_result == static_cast<int32_t>(0xA5A5A5A5u) && trapped_fault.value == -1 &&
+            trapped_fault.posix_errno == Libs::Posix::POSIX_EFAULT && *result_word == 0xA5A5A5A5u &&
+            bytes[0x100] == 0x5a && bytes[0x107] == 0x5a,
+        "SysAv 0x468 trap and the HLE manager answer the same and leave outputs untouched");
+  _putenv_s("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS", saved.c_str());
+  Check(Kernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(guest_buffer), 0x4000) == OK,
+        "release native IPMI trace fixture");
+#endif
+}
 void CheckArchiveMount(const std::filesystem::path &root) {
   const auto archive = root / u8"game-日本語.zar";
   std::vector<uint8_t> payload(2 * 64 * 1024 + 33);

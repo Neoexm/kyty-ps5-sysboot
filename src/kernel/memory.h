@@ -18,6 +18,7 @@ class AnonymousSharedMemory;
 void Initialize();
 void Shutdown();
 
+int  MapOwnedFlexibleMemory(void** address, size_t len, const char* name, uint64_t* token);
 int  UnmapOwnedFlexibleMemory(uint64_t address, size_t len, uint64_t token);
 struct Lifecycle {
 	static constexpr const char* name       = "Memory";
@@ -150,6 +151,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
                                                  int64_t* phys_addr_out);
 int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len);
 int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len);
+int KYTY_SYSV_ABI    KernelProtectDirectMemory(int64_t start, size_t len, int prot);
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment);
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
@@ -203,8 +205,23 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 // error.
 int  OpenScopeSharedMemory(const char* name, int flags, int* object, uint64_t* size);
 int  UnlinkScopeSharedMemory(const char* name);
+void ResizeScopeSharedMemory(int object, uint64_t size);
+void WriteScopeSharedMemory(int object, uint64_t offset, const void* data, uint64_t size);
+int  MapScopeSharedMemory(int object, void** addr, size_t len, int prot, int flags);
+std::shared_ptr<AnonymousSharedMemory> CreateAnonymousSharedMemory(uint16_t mode);
+uint64_t GetAnonymousSharedMemoryId(const std::shared_ptr<AnonymousSharedMemory>& object);
 uint64_t GetAnonymousSharedMemorySize(const std::shared_ptr<AnonymousSharedMemory>& object);
 uint16_t GetAnonymousSharedMemoryMode(const std::shared_ptr<AnonymousSharedMemory>& object);
+int      MapAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& object, void** addr,
+                                  size_t len, int prot, int flags);
+#if defined(KYTY_SHM_ANON_TESTS)
+struct AnonymousSharedMemoryTestStats {
+	uint64_t objects;
+	uint64_t backings;
+	uint64_t backing_bytes;
+	uint64_t mappings;
+};
+#endif
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();

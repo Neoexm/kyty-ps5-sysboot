@@ -165,6 +165,10 @@ private:
 
 static Audio* g_audio = nullptr;
 
+bool BackendInitialized() noexcept {
+	return g_audio != nullptr;
+}
+
 namespace AudioInternal {
 
 int AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {

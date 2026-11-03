@@ -344,6 +344,9 @@ static thread_local uint64_t g_sysav_native_fsbase     = 0;
 static thread_local uint64_t g_mini_native_fsbase      = 0;
 static thread_local uint64_t g_exec_native_fsbase      = 0;
 
+void SetSysAvNativeThreadFsBase(uint64_t guest_tls_base) {
+	g_sysav_native_fsbase = guest_tls_base;
+}
 
 void SetMiniSyscoreNativeThreadFsBase(uint64_t guest_tls_base) {
 	g_mini_native_fsbase = guest_tls_base;
@@ -3303,6 +3306,370 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				original_ud2 = std::find(g_sysav_original_ud2.begin(), g_sysav_original_ud2.end(),
 				                         info->exception_address) != g_sysav_original_ud2.end();
 			}
+			if (!installed_guard ||
+			    (installed_number != UINT32_MAX && installed_number != info->rax)) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_UNHANDLED_GUEST_ILLEGAL"
+				     " guest_pc=0x%016" PRIx64 " installed_guard=%u"
+				     " immutable_opcode16=%s runtime_opcode16=0x0b0f"
+				     " classification=%s register_rax=0x%016" PRIx64 " NO_SYSCALL_DISPATCH\n",
+				     info->exception_address, installed_guard ? 1u : 0u,
+				     installed_guard ? "0x050f"
+				     : original_ud2  ? "0x0b0f"
+				                     : "unavailable",
+				     installed_guard ? "guard_number_mismatch"
+				     : original_ud2  ? "original_ud2"
+				                     : "unknown",
+				     info->rax);
+				TerminateMappedExecChildOnUnhandledUd2(*info);
+				Log::Flush();
+				return false;
+			}
+			LOGF("FIRST_FRAME_AUDIT SYSAV_RAW_SYSCALL_TRAP site=0x%016" PRIx64
+			     " number=0x%016" PRIx64 " args=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+			     ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+			     " GUARD_ACTIVE installed_guard=1 immutable_opcode16=0x050f "
+			     "runtime_opcode16=0x0b0f\n",
+			     info->exception_address, info->rax, info->rdi, info->rsi, info->rdx, info->r10,
+			     info->r8, info->r9);
+			const bool native_event_call =
+			    (info->rax == 0x16b && info->exception_address == 0x46f04a) ||
+			    (info->rax == 0x21a && info->exception_address == 0x478c0a) ||
+			    (info->rax == 0x21e && info->exception_address == 0x478c2a) ||
+			    (info->rax == 0x21f && info->exception_address == 0x478c4a) ||
+			    (info->rax == 0x220 && info->exception_address == 0x478c6a) ||
+			    (info->rax == 0x221 && info->exception_address == 0x478c8a) ||
+			    (info->rax == 0x21c && info->exception_address == 0x478caa) ||
+			    (info->rax == 0x21d && info->exception_address == 0x478cca) ||
+			    (info->rax == 0x5d && info->exception_address == 0x471e2a) ||
+			    (info->rax == 0x1d && info->exception_address == 0x471e0a) ||
+			    (info->rax == 0x85 && info->exception_address == 0x471e4a);
+			if (Libs::LibKernel::Process::IsExecChild() && native_event_call) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if (reply.value >= 0 || (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			const bool original_mbus_av_path =
+			    IsReadableRange(info->rdi, sizeof("/dev/mbus_av")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/mbus_av",
+				            sizeof("/dev/mbus_av")) == 0;
+			const bool original_dmem_path =
+			    IsReadableRange(info->rdi, sizeof("/dev/dmem0")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/dmem", 9) == 0 &&
+			    reinterpret_cast<const char*>(info->rdi)[9] >= '0' &&
+			    reinterpret_cast<const char*>(info->rdi)[9] <= '2' &&
+			    reinterpret_cast<const char*>(info->rdi)[10] == '\0';
+			if (info->rax == 0x05 && info->rdi == 0x4d16b6 && info->rsi == 0x10002 &&
+			    info->rdx == 0 && IsReadableRange(info->rdi, sizeof("/dev/iccnvs4")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/iccnvs4",
+			                sizeof("/dev/iccnvs4")) == 0) {
+				const int rc = Libs::LibKernel::FileSystem::KernelOpen(
+				    "/dev/iccnvs4", static_cast<int>(info->rsi), 0);
+				auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+				context->Rax  = rc >= 0 ? static_cast<uint64_t>(rc)
+				                        : static_cast<uint64_t>(Libs::LibKernel::KernelToPosix(rc));
+				context->EFlags = (context->EFlags & ~uint32_t {1}) | (rc >= 0 ? 0u : 1u);
+				context->Rip += 2;
+				LOGF("SYSAV_ICCNVS_OPEN_RESULT descriptor_or_errno=%" PRIu64
+				     " carry=%u backed_by_filesystem=1 open_flags=0x10002\n",
+				     context->Rax, static_cast<unsigned>(context->EFlags & 1));
+				if (rc == Libs::LibKernel::KERNEL_ERROR_ENOENT) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_ICCNVS_DEVICE_MISSING"
+					     " open_flags=0x10002 ENOENT\n");
+				}
+				return true;
+			}
+			// 0x46f12a also opens /dev/notification4 (O_WRONLY|O_NONBLOCK) for
+			// sceKernelSendNotificationRequest; no node, plain ENOENT
+			if (info->rax == 0x05 && info->rdi == 0x4be9c2 && info->rsi == 0x05 && info->rdx == 0 &&
+			    IsReadableRange(info->rdi, sizeof("/dev/notification4")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/notification4",
+			                sizeof("/dev/notification4")) == 0) {
+				const int rc = Libs::LibKernel::FileSystem::KernelOpen(
+				    "/dev/notification4", static_cast<int>(info->rsi), 0);
+				auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+				context->Rax  = rc >= 0 ? static_cast<uint64_t>(rc)
+				                        : static_cast<uint64_t>(Libs::LibKernel::KernelToPosix(rc));
+				context->EFlags = (context->EFlags & ~uint32_t {1}) | (rc >= 0 ? 0u : 1u);
+				context->Rip += 2;
+				LOGF("SYSAV_NOTIFICATION_OPEN_RESULT descriptor_or_errno=%" PRIu64
+				     " carry=%u open_flags=0x5\n",
+				     context->Rax, static_cast<unsigned>(context->EFlags & 1));
+				if (rc == Libs::LibKernel::KERNEL_ERROR_ENOENT) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NOTIFICATION_DEVICE_MISSING"
+					     " open_flags=0x5 ENOENT\n");
+				}
+				return true;
+			}
+			if (info->rax == 0x1e2 && info->rsi == 0xa02 && info->rdx == 0x1a4 &&
+			    IsReadableRange(info->rdi, sizeof("/SceAvControl")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/SceAvControl",
+			                sizeof("/SceAvControl")) == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value >= 3 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			// libSceAudioSystem shm_opens /SceAo2TVCorP (0x1E2) here after the audio IPMI connect.
+			// Scope-shared object mapped by both SysAv and Audiod, so it goes to the shm bridge.
+			if (info->rax == 0x1e2 && IsReadableRange(info->rdi, sizeof("/SceAo2TVCorP")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/SceAo2TVCorP",
+			                sizeof("/SceAo2TVCorP")) == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value >= 3 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			// ftruncate (0x1E0) and MAP_SHARED mmap (0x1DD) on the /SceAo2TVCorP fd go to the shm
+			// bridge. Matched by name so a reused fd stays out; fstat (0xBD) is handled by the
+			// shared branch below
+			if (info->rax == 0x1e0 && info->rdi >= 3 && info->rdi <= INT32_MAX &&
+			    Libs::LibKernel::FileSystem::IsSharedMemoryNamed(static_cast<int>(info->rdi),
+			                                                     "/SceAo2TVCorP")) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x1dd && info->r8 >= 3 && info->r8 <= INT32_MAX &&
+			    Libs::LibKernel::FileSystem::IsSharedMemoryNamed(static_cast<int>(info->r8),
+			                                                     "/SceAo2TVCorP")) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value != -1 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x1e0 && info->rdi >= 3 && info->rdi <= INT32_MAX &&
+			    info->rsi == 0x2000) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0xbd && info->rdi >= 3 && info->rdi <= INT32_MAX &&
+			    IsWritableRange(info->rsi, sizeof(Libs::LibKernel::FileSystem::FileStat))) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x06 && info->rdi >= 3 && info->rdi <= INT32_MAX) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x1db && info->rdi >= 3 && info->rdi <= INT32_MAX &&
+			    Libs::LibKernel::FileSystem::IsIccnvs4SnapshotDescriptor(
+			        static_cast<int>(info->rdi))) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				auto* context   = reinterpret_cast<CONTEXT*>(info->native_context);
+				context->Rax    = reply.value < 0 ? static_cast<uint64_t>(reply.posix_errno)
+				                                  : static_cast<uint64_t>(reply.value);
+				context->EFlags = (context->EFlags & ~uint32_t {1}) | (reply.value < 0 ? 1u : 0u);
+				context->Rip += 2;
+				LOGF("SYSAV_ICCNVS_PREAD_RESULT fd=%" PRIu64 " offset=0x%" PRIx64 " bytes=%" PRIu64
+				     " result=%" PRId64 " errno=%d\n",
+				     info->rdi, info->r10, info->rdx, reply.value, reply.posix_errno);
+				return true;
+			}
+			if (info->rax == 0x03 && info->rdi >= 3 && info->rdi <= INT32_MAX && info->rdx > 0 &&
+			    info->rdx <= 0x1000 &&
+			    (Libs::LibKernel::FileSystem::IsNativeAvDescriptor(static_cast<int>(info->rdi)) ||
+			     Libs::LibKernel::FileSystem::PinNativeMbusReceiveQueue(
+			         static_cast<int>(info->rdi)) != nullptr) &&
+			    IsWritableRange(info->rsi, static_cast<size_t>(info->rdx))) {
+				const int64_t rc = Libs::LibKernel::FileSystem::KernelRead(
+				    static_cast<int>(info->rdi), reinterpret_cast<void*>(info->rsi),
+				    static_cast<size_t>(info->rdx));
+				auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+				context->Rax  = rc >= 0 ? static_cast<uint64_t>(rc)
+				                        : static_cast<uint64_t>(Libs::LibKernel::KernelToPosix(rc));
+				context->EFlags = (context->EFlags & ~uint32_t {1}) | (rc >= 0 ? 0u : 1u);
+				context->Rip += 2;
+				return true;
+			}
+			// /dev/av_control open failed with ENOENT.
+			if (info->rax == 0x36 && info->rdi >= 3 && info->rdi <= INT32_MAX &&
+			    info->rsi == 0xc0088803 &&
+			    Libs::LibKernel::FileSystem::IsNativeDipswDescriptor(static_cast<int>(info->rdi)) &&
+			    IsWritableRange(info->rdx, sizeof(uint64_t))) {
+				const int rc = Libs::LibKernel::FileSystem::KernelIoctl(
+				    static_cast<int>(info->rdi), info->rsi, reinterpret_cast<void*>(info->rdx));
+				auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+				context->Rax =
+				    rc == 0 ? 0 : static_cast<uint64_t>(Libs::LibKernel::KernelToPosix(rc));
+				context->EFlags = (context->EFlags & ~uint32_t {1}) | (rc == 0 ? 0u : 1u);
+				context->Rip += 2;
+				LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_DIPSW_IOCTL"
+				     " request=0xc0088803 existing_Kyty_DIPSW_model"
+				     " rc=%d\n",
+				     rc);
+				return true;
+			}
+			if (info->rax == 0x36 && info->rdi >= 3 && info->rdi <= INT32_MAX &&
+			    Libs::LibKernel::FileSystem::IsNativeAvDescriptor(static_cast<int>(info->rdi))) {
+				const uint64_t bytes = (info->rsi >> 16) & 0x1fff;
+				const bool     readable =
+				    (info->rsi & 0x80000000u) == 0 || IsReadableRange(info->rdx, bytes);
+				const bool writable =
+				    (info->rsi & 0x40000000u) == 0 || IsWritableRange(info->rdx, bytes);
+				{
+					const int rc      = !readable || !writable
+					                        ? Libs::LibKernel::KERNEL_ERROR_EFAULT
+					                        : Libs::LibKernel::FileSystem::KernelIoctl(
+					                              static_cast<int>(info->rdi), info->rsi,
+					                              reinterpret_cast<void*>(info->rdx));
+					auto*     context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax =
+					    rc == 0 ? 0 : static_cast<uint64_t>(Libs::LibKernel::KernelToPosix(rc));
+					context->EFlags = (context->EFlags & ~uint32_t {1}) | (rc == 0 ? 0u : 1u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0xca && info->rsi == 4 &&
+			    IsReadableRange(info->rdi, 4 * sizeof(uint32_t)) &&
+			    IsReadableRange(info->r10, sizeof(size_t))) {
+				const auto*  mib = reinterpret_cast<const uint32_t*>(info->rdi);
+				const size_t len = *reinterpret_cast<const size_t*>(info->r10);
+				LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_SYSCTL4_MIB"
+				     " values=%u,%u,%u,%u out_size=%zu\n",
+				     mib[0], mib[1], mib[2], mib[3], len);
+				if (mib[0] == 1 && mib[1] == 14 && mib[2] == 55 && mib[3] == UINT32_MAX &&
+				    len == sizeof(uint32_t) && info->r8 == 0 && info->r9 == 0 &&
+				    IsReadableRange(info->rdx, sizeof(uint32_t))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == -1 && reply.posix_errno == Libs::Posix::POSIX_ENOENT) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax  = static_cast<uint64_t>(reply.posix_errno);
+						context->EFlags |= uint32_t {1};
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_PS4_MODE"
+						     " unsupported_guest_query ENOENT\n");
+						return true;
+					}
+				}
+				if (mib[0] == 1 && mib[1] == 14 && mib[2] == 36 &&
+				    mib[3] == static_cast<uint32_t>(Libs::LibKernel::Process::GetPid()) &&
+				    len >= sizeof(uint32_t) && len <= sizeof(uint64_t) && info->r8 == 0 &&
+				    info->r9 == 0 && IsReadableRange(info->rdx, sizeof(uint32_t))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == 0 && reply.posix_errno == 0) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax  = 0;
+						context->EFlags &= ~uint32_t {1};
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_COMPILED_SDK"
+						     " from_procp_param\n");
+						return true;
+					}
+				}
+				if (mib[0] == 1 && mib[1] == 14 && mib[2] == 68 &&
+				    mib[3] == static_cast<uint32_t>(Libs::LibKernel::Process::GetPid()) &&
+				    len == sizeof(uint64_t) && info->r8 == 0 && info->r9 == 0 &&
+				    IsReadableRange(info->rdx, sizeof(uint64_t))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == 0 || (reply.value == -1 && reply.posix_errno > 0)) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax =
+						    reply.value == 0 ? 0 : static_cast<uint64_t>(reply.posix_errno);
+						context->EFlags =
+						    (context->EFlags & ~uint32_t {1}) | (reply.value == 0 ? 0u : 1u);
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_SDK_VERSION"
+						     " result=%" PRId64 " errno=%d\n",
+						     reply.value, reply.posix_errno);
+						return true;
+					}
+				}
+				if (mib[0] == 1 && mib[1] == 14 && mib[2] == 35 && info->r8 == 0 && info->r9 == 0 &&
+				    len == 0x58 && IsReadableRange(info->rdx, len)) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == 0 || (reply.value == -1 && reply.posix_errno > 0)) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax =
+						    reply.value == 0 ? 0 : static_cast<uint64_t>(reply.posix_errno);
+						context->EFlags =
+						    (context->EFlags & ~uint32_t {1}) | (reply.value == 0 ? 0u : 1u);
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_SYSCTL_APP_INFO"
+						     " result=%" PRId64 " errno=%d"
+						     " native_CF=%u\n",
+						     reply.value, reply.posix_errno,
+						     static_cast<unsigned>(context->EFlags & 1));
+						return true;
+					}
+				}
+			}
 			if (info->rax == 0xca && info->rsi == 2 &&
 			    IsReadableRange(info->rdi, 2 * sizeof(uint32_t))) {
 				const auto* mib = reinterpret_cast<const uint32_t*>(info->rdi);
@@ -3325,6 +3692,158 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 						    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
 						context->Rip += 2;
 						return true;
+					}
+				}
+				if (mib[0] == 1 && mib[1] == 0x7ffffebb &&
+				    ((info->rdx != 0 && info->r10 != 0 && info->r8 == 0 && info->r9 == 0 &&
+				      IsWritableRange(info->rdx, sizeof(int32_t)) &&
+				      IsWritableRange(info->r10, sizeof(size_t))) ||
+				     (info->rdx == 0 && info->r10 == 0 && info->r9 == sizeof(int32_t) &&
+				      IsReadableRange(info->r8, sizeof(int32_t))))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if ((reply.value == 0 && reply.posix_errno == 0) ||
+					    (reply.value == -1 && reply.posix_errno > 0)) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax =
+						    reply.value == 0 ? 0 : static_cast<uint64_t>(reply.posix_errno);
+						context->EFlags =
+						    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+						context->Rip += 2;
+						return true;
+					}
+				}
+				const bool tsc_name =
+				    mib[0] == 0 && mib[1] == 3 && info->r9 == 16 && IsReadableRange(info->r8, 16) &&
+				    std::memcmp(reinterpret_cast<const void*>(info->r8), "machdep.tsc_freq", 16) ==
+				        0;
+				const bool tsc_value =
+				    mib[0] == 7 && mib[1] == 0x100 && info->r8 == 0 && info->r9 == 0;
+				if ((tsc_name || tsc_value) && IsWritableRange(info->r10, sizeof(size_t))) {
+					const size_t capacity = *reinterpret_cast<const size_t*>(info->r10);
+					if (capacity >= 8 && capacity <= 4096 && IsWritableRange(info->rdx, capacity)) {
+						const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+						    {info->rax,
+							 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+						if ((reply.value == 0 && reply.posix_errno == 0) ||
+						    (reply.value == -1 && reply.posix_errno > 0)) {
+							auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+							context->Rax =
+							    reply.value == 0 ? 0 : static_cast<uint64_t>(reply.posix_errno);
+							context->EFlags =
+							    (context->EFlags & ~uint32_t {1}) | (reply.value == 0 ? 0u : 1u);
+							context->Rip += 2;
+							return true;
+						}
+					}
+				}
+				if (mib[0] == 0 && mib[1] == 3 && info->r9 == 14 &&
+				    IsReadableRange(info->r8, info->r9) &&
+				    std::memcmp(reinterpret_cast<const void*>(info->r8), "kern.kern_type", 14) ==
+				        0 &&
+				    IsReadableRange(info->r10, sizeof(size_t))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == -1 && reply.posix_errno == Libs::Posix::POSIX_ENOENT) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax  = static_cast<uint64_t>(reply.posix_errno);
+						context->EFlags |= uint32_t {1};
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_KERNEL_TYPE_FALLBACK"
+						     " kern_type_unavailable ENOENT\n");
+						return true;
+					}
+				}
+				if (mib[0] == 0 && mib[1] == 3 && info->r9 == 13 &&
+				    IsReadableRange(info->r8, info->r9) &&
+				    std::memcmp(reinterpret_cast<const void*>(info->r8), "kern.smp.cpus", 13) ==
+				        0 &&
+				    IsReadableRange(info->r10, sizeof(size_t))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == -1 && reply.posix_errno == Libs::Posix::POSIX_ENOENT) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax  = static_cast<uint64_t>(reply.posix_errno);
+						context->EFlags |= uint32_t {1};
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_CPU_QUERY"
+						     " node_unavailable return=ENOENT\n");
+						return true;
+					}
+				}
+				if (mib[0] == 1 && mib[1] == 37 && info->r8 == 0 && info->r9 == 0 &&
+				    IsReadableRange(info->r10, sizeof(size_t))) {
+					const auto len = *reinterpret_cast<const size_t*>(info->r10);
+					if (len > 0 && len <= 256 && IsReadableRange(info->rdx, len)) {
+						Libs::NativeKernelBridge::SyscallRequest request {
+						    info->rax,
+						    {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}};
+						const auto result = Libs::NativeKernelBridge::DispatchSyscall(request);
+						if (result.value == 0 && result.posix_errno == 0) {
+							auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+							context->Rax  = 0;
+							context->EFlags &= ~1u;
+							context->Rip += 2;
+							LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_SYSCTL_KERN_ARND"
+							     " bytes=%zu status=success\n",
+							     len);
+							return true;
+						}
+					}
+				}
+				if (mib[0] == 1 && mib[1] == 33 && info->r8 == 0 && info->r9 == 0 &&
+				    IsReadableRange(info->r10, sizeof(size_t)) &&
+				    *reinterpret_cast<const size_t*>(info->r10) == sizeof(uint64_t) &&
+				    IsReadableRange(info->rdx, sizeof(uint64_t))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == 0 && reply.posix_errno == 0) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax  = 0;
+						context->EFlags &= ~uint32_t {1};
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_USRSTACK\n");
+						return true;
+					}
+				}
+				if (((mib[0] == 6 && mib[1] == 7) || (mib[0] == 9 && mib[1] == 20)) &&
+				    info->r8 == 0 && info->r9 == 0 && IsReadableRange(info->r10, sizeof(size_t)) &&
+				    *reinterpret_cast<const size_t*>(info->r10) >= sizeof(int32_t) &&
+				    IsReadableRange(info->rdx, sizeof(int32_t))) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value == 0 && reply.posix_errno == 0) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax  = 0;
+						context->EFlags &= ~uint32_t {1};
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_PAGE_SIZE"
+						     " page_size=0x4000\n");
+						return true;
+					}
+				}
+				if (mib[0] == 0 && mib[1] == 3 && info->r9 > 0 && info->r9 <= 64 &&
+				    info->r8 >= 0x4a4000 && info->r8 <= 0x4e0000 - info->r9 &&
+				    IsReadableRange(info->r8, info->r9) &&
+				    IsWritableRange(info->r10, sizeof(size_t))) {
+					const auto* name = reinterpret_cast<const char*>(info->r8);
+					if (std::all_of(name, name + info->r9,
+					                [](char c) { return c >= 0x20 && c <= 0x7e; })) {
+						const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+						    {info->rax,
+							 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+						if (reply.value == -1 && reply.posix_errno == Libs::Posix::POSIX_ENOENT) {
+							auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+							context->Rax  = static_cast<uint64_t>(reply.posix_errno);
+							context->EFlags |= uint32_t {1};
+							context->Rip += 2;
+							return true;
+						}
 					}
 				}
 			}
@@ -3438,6 +3957,43 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 						     " op=0x%" PRIx64 " errno=%d\n",
 						     info->rdi, reply.posix_errno);
 					}
+					return true;
+				}
+			}
+			if (info->rax == 0x14) {
+				Libs::NativeKernelBridge::SyscallRequest request {info->rax, {}};
+				const auto result = Libs::NativeKernelBridge::DispatchSyscall(request);
+				if (result.value > 0 && result.posix_errno == 0) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = static_cast<uint64_t>(result.value);
+					context->EFlags &= ~1u;
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_GETPID"
+					     " pid=%" PRId64 "\n",
+					     result.value);
+					return true;
+				}
+			}
+			const bool original_sysav_remote_authinfo =
+			    std::getenv("KYTY_DIAGNOSTIC_ORIGINAL_SYSCORE_APP_IPMI") != nullptr &&
+			    info->exception_address == 0x47880a && info->rdi > 0 &&
+			    info->rdi <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
+			if (info->rax == 0x24b &&
+			    (info->rdi == static_cast<uint32_t>(Libs::LibKernel::Process::GetPid()) ||
+			     original_sysav_remote_authinfo) &&
+			    IsWritableRange(info->rsi, 0x88)) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, 0, 0, 0, 0}});
+				if (reply.value == 0 || (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == 0 ? 0 : static_cast<uint64_t>(reply.posix_errno);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == 0 ? 0u : 1u);
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_GET_AUTHINFO"
+					     " target_pid=%" PRIu64 " reply=%" PRId64 " errno=%d CF=%u\n",
+					     info->rdi, reply.value, reply.posix_errno,
+					     static_cast<unsigned>(context->EFlags & 1u));
 					return true;
 				}
 			}
@@ -3902,6 +4458,53 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					return true;
 				}
 			}
+			if (info->rax == 0x1dd && info->rsi != 0 && info->rsi <= 0x1000000 &&
+			    (info->rsi & 0x3fff) == 0 && (info->rdi & 0x3fff) == 0 &&
+			    ((info->rdx == 3 &&
+			      (info->r10 == 0x9000 ||
+			       (info->r10 == 0x1002 && info->rdi == 0 && info->rsi == 0x4000))) ||
+			     (info->rdx == 7 && info->r10 == 0x400 && info->rsi == 0xc000 &&
+			      Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x26c000 &&
+			      info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x26c000) ||
+			     (info->rdx == 7 && info->r10 == 0x400 && info->rsi == 0x14000 &&
+			      Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x260000 &&
+			      info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x260000) ||
+			     (info->rdx == 7 && info->r10 == 0x400 && info->rsi == 0x24000 &&
+			      Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x240000 &&
+			      info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x240000) ||
+			     (info->rdx == 7 && info->r10 == 0x400 && info->rsi == 0xc000 &&
+			      Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x21c000 &&
+			      (info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x210000 ||
+			       info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x21c000 ||
+			       (Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x24c000 &&
+			        info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x24c000))) ||
+			     (info->rdx == 0 && info->r10 == 0x110 && info->rsi == 0x4000 &&
+			      Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x21c000 &&
+			      (info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x26c000 ||
+			       info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x260000 ||
+			       info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x210000 ||
+			       info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x21c000 ||
+			       (Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x240000 &&
+			        info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x240000) ||
+			       (Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x24c000 &&
+			        info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x24c000))) ||
+			     (info->rdx == 0 && info->r10 == 0x1100 && info->rsi == 0x4000 &&
+			      Libs::LibKernel::PthreadGetMainGuestStackTop() > 0x204000 &&
+			      info->rdi == Libs::LibKernel::PthreadGetMainGuestStackTop() - 0x204000)) &&
+			    (info->r8 == UINT64_MAX || info->r8 == UINT32_MAX) && info->r9 == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if (reply.value > 0 && reply.posix_errno == 0) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = static_cast<uint64_t>(reply.value);
+					context->EFlags &= ~uint32_t {1};
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_MMAP_RETURN"
+					     " mapped=0x%016" PRIx64 "\n",
+					     static_cast<uint64_t>(reply.value));
+					return true;
+				}
+			}
 			// splash sys_virtual_query (0x23c), after mmap and rename
 			if (info->rax == 0x23c && info->exception_address == 0x47739a &&
 			    info->rdi >= 0x200000000ull && info->rdi < 0x300000000ull && info->rsi == 0 &&
@@ -3975,6 +4578,199 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					return true;
 				}
 			}
+			// 0x21C opens SceBootStatusFlags (created at mini-syscore 0x4022A0, bits zero). Caller
+			// chain tells BootSplash 0x439610 from other clients
+			if (info->rax == 0x21c && info->rdi == 0x4c4142 &&
+			    IsReadableRange(info->rdi, sizeof("SceBootStatusFlags")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "SceBootStatusFlags",
+			                sizeof("SceBootStatusFlags")) == 0) {
+				static std::atomic<uint32_t> original_boot_open_trace_count {0};
+				if (original_boot_open_trace_count.fetch_add(1) < 8) {
+					// Callback queue at 0x4F1820: sub_400820 -> sub_4377F0 -> sub_439470 enqueues
+					// trampoline 0x439600 (jumps to body 0x439610), and worker 0x439450 ->
+					// sub_439530 consumes the two FIFO slots.
+					if (IsReadableRange(0x4f1820, 0x50)) {
+						uint32_t enabled = 0, queued = 0, producer_index = 0;
+						uint64_t slots[4] {};
+						std::memcpy(&enabled, reinterpret_cast<const void*>(0x4f1820), 4);
+						std::memcpy(slots, reinterpret_cast<const void*>(0x4f1840), sizeof(slots));
+						std::memcpy(&producer_index, reinterpret_cast<const void*>(0x4f1860), 4);
+						std::memcpy(&queued, reinterpret_cast<const void*>(0x4f1868), 4);
+						LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_QUEUE_SNAPSHOT"
+						     " queue_va=0x4f1820 guest_enabled=%u"
+						     " guest_queued_count=%u producer_index=%u"
+						     " slot0_callback=0x%016" PRIx64 " slot0_arg=0x%016" PRIx64
+						     " slot1_callback=0x%016" PRIx64 " slot1_arg=0x%016" PRIx64 "\n",
+						     enabled, queued, producer_index, slots[0], slots[1], slots[2],
+						     slots[3]);
+					}
+					uint64_t guest_frame = info->rbp;
+					for (int depth = 0; depth < 8; ++depth) {
+						if (!IsReadableRange(guest_frame, sizeof(uint64_t) * 2)) break;
+						uint64_t words[2] {};
+						std::memcpy(words, reinterpret_cast<const void*>(guest_frame),
+						            sizeof(words));
+						LOGF("FIRST_FRAME_AUDIT SYSAV_BOOT_FLAG_OPEN_FRAME"
+						     " depth=%d rbp=0x%016" PRIx64 " return_pc=0x%016" PRIx64
+						     " next_frame=0x%016" PRIx64 "\n",
+						     depth, guest_frame, words[1], words[0]);
+						if (words[0] <= guest_frame || words[0] - guest_frame > 0x200000) break;
+						guest_frame = words[0];
+					}
+				}
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value >= 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* ctx   = reinterpret_cast<CONTEXT*>(info->native_context);
+					ctx->Rax    = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                : static_cast<uint64_t>(reply.value);
+					ctx->EFlags = (ctx->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					ctx->Rip += 2;
+					return true;
+				}
+			}
+			// BootSplash 0x439610 waits on bit 0x2000, forwarded and blocks
+			if (info->rax == 0x21e &&
+			    std::getenv("KYTY_DIAGNOSTIC_SYSAV_MINI_SYSCORE_BOOT_EVENTS") &&
+			    (info->rdi <= UINT32_MAX || (info->rdi >> 32) == UINT32_MAX) &&
+			    (info->rsi == 0x2000 || info->rsi == 0x10) && info->rdx == 1 && info->r8 == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* ctx   = reinterpret_cast<CONTEXT*>(info->native_context);
+					ctx->Rax    = reply.value == 0 ? 0 : static_cast<uint64_t>(reply.posix_errno);
+					ctx->EFlags = (ctx->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					ctx->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x21f &&
+			    std::getenv("KYTY_DIAGNOSTIC_SYSAV_MINI_SYSCORE_BOOT_EVENTS") &&
+			    (info->rdi <= UINT32_MAX || (info->rdi >> 32) == UINT32_MAX) &&
+			    (info->rsi == 0x2000 || info->rsi == 0x10 || info->rsi == 0x20000) &&
+			    info->rdx == 1) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* ctx   = reinterpret_cast<CONTEXT*>(info->native_context);
+					ctx->Rax    = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					ctx->EFlags = (ctx->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					ctx->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x21a && info->rdi == 0x4d5da0 && info->rsi == 0x121 &&
+			    info->rdx == 0x0000ffff00000000ull &&
+			    IsReadableRange(info->rdi, sizeof("SceAvControlEvf")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "SceAvControlEvf",
+			                sizeof("SceAvControlEvf")) == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value > 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0x24c &&
+			    ((info->rdx == 0x4c22f2 && info->rsi == 0x2400000 &&
+			      IsReadableRange(info->rdx, sizeof("SceAvControlBootSplash")) &&
+			      std::memcmp(reinterpret_cast<const void*>(info->rdx), "SceAvControlBootSplash",
+			                  sizeof("SceAvControlBootSplash")) == 0) ||
+			     (info->rdx == 0x4c3c97 && info->rsi == 0x6000000 &&
+			      IsReadableRange(info->rdx, sizeof("SceSysAvControlScanInBuf")) &&
+			      std::memcmp(reinterpret_cast<const void*>(info->rdx), "SceSysAvControlScanInBuf",
+			                  sizeof("SceSysAvControlScanInBuf")) == 0) ||
+			     (info->rdx == 0x4cfa70 && info->rsi == 0x10000 &&
+			      IsReadableRange(info->rdx,
+			                      Libs::LibKernel::Memory::KERNEL_MAXIMUM_NAME_LENGTH)) ||
+			     (info->rdx == 0x4cd692 && info->rsi == 0x4000 &&
+			      IsReadableRange(info->rdx, sizeof("stack guard")) &&
+			      std::memcmp(reinterpret_cast<const void*>(info->rdx), "stack guard",
+			                  sizeof("stack guard")) == 0) ||
+			     (info->rdx == 0x4c1877 && info->rsi == 0x20000 &&
+			      IsReadableRange(info->rdx,
+			                      Libs::LibKernel::Memory::KERNEL_MAXIMUM_NAME_LENGTH)) ||
+			     (info->rdx == 0x4c8c66 && info->rsi == 0x8000 &&
+			      IsReadableRange(info->rdx,
+			                      Libs::LibKernel::Memory::KERNEL_MAXIMUM_NAME_LENGTH)) ||
+			     (info->rdx == 0x4bec14 && info->rsi == 0x8000 &&
+			      IsReadableRange(info->rdx,
+			                      Libs::LibKernel::Memory::KERNEL_MAXIMUM_NAME_LENGTH)) ||
+			     (info->rdx == 0x4d14bc && info->rsi == 0x8000 &&
+			      IsReadableRange(info->rdx, sizeof("threadForPortControllerA")) &&
+			      std::memcmp(reinterpret_cast<const void*>(info->rdx), "threadForPortControllerA",
+			                  sizeof("threadForPortControllerA")) == 0) ||
+			     (info->rdx == 0x4c0d73 && info->rsi == 0x8000 &&
+			      IsReadableRange(info->rdx, sizeof("threadForPortControllerB")) &&
+			      std::memcmp(reinterpret_cast<const void*>(info->rdx), "threadForPortControllerB",
+			                  sizeof("threadForPortControllerB")) == 0) ||
+			     (info->rsi == 0x2000 && IsReadableRange(info->rdx, sizeof("/SceAvControl")) &&
+			      std::memcmp(reinterpret_cast<const void*>(info->rdx), "/SceAvControl",
+			                  sizeof("/SceAvControl")) == 0) ||
+			     // /SceAo2TVCorP: 0x4000 scoped shm object, also named by this 0x24C
+			     (info->rsi == 0x4000 && IsReadableRange(info->rdx, sizeof("/SceAo2TVCorP")) &&
+			      std::memcmp(reinterpret_cast<const void*>(info->rdx), "/SceAo2TVCorP",
+			                  sizeof("/SceAo2TVCorP")) == 0))) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			// thr_new (0x1c7), opaque 0x68-byte input
+			if (info->rax == 0x1c7 && info->rsi == 0x68 && IsReadableRange(info->rdi, 0x68)) {
+				uint64_t fields[13] {};
+				std::memcpy(fields, reinterpret_cast<const void*>(info->rdi), sizeof(fields));
+				LOGF(
+				    "FIRST_FRAME_AUDIT SYSAV_THR_NEW_PARAM"
+				    " input=0x%016" PRIx64 " size=0x68"
+				    " words=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+				    ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+				    ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 " NO_THREAD_STARTED\n",
+				    info->rdi, fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
+				    fields[6], fields[7], fields[8], fields[9], fields[10], fields[11], fields[12]);
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			if (info->rax == 0xa5 && info->rdi == 0x81 &&
+			    IsReadableRange(info->rsi, sizeof(uint64_t))) {
+				const uint64_t native_base = *reinterpret_cast<const uint64_t*>(info->rsi);
+				if (native_base != 0 && IsReadableRange(native_base, sizeof(uint64_t))) {
+					g_sysav_native_fsbase = native_base;
+					auto* context         = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax          = 0;
+					context->EFlags &= ~uint32_t {1};
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_SYSARCH_SET_FSBASE"
+					     " guest_base=0x%016" PRIx64 " emulated_guest_fsbase_registered\n",
+					     native_base);
+					return true;
+				}
+			}
 		}
 	}
 #endif
@@ -3982,6 +4778,48 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
 		return true;
+	}
+	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
+	    g_sysav_raw_traps_installed.load(std::memory_order_acquire) &&
+	    info->exception_address >= 0x400000 && info->exception_address < 0x4a4000) {
+		static std::atomic<uint32_t> unmatched_guest_illegal_count {0};
+		if (unmatched_guest_illegal_count.fetch_add(1) < 16) {
+			uint16_t actual_opcode = 0;
+			if (IsReadableRange(info->exception_address, sizeof(actual_opcode))) {
+				std::memcpy(&actual_opcode, reinterpret_cast<const void*>(info->exception_address),
+				            sizeof(actual_opcode));
+			}
+			bool installed_guard = false;
+			{
+				std::lock_guard lock(g_native_libkernel_trap_mutex);
+				installed_guard = std::any_of(g_sysav_raw_traps.begin(), g_sysav_raw_traps.end(),
+				                              [&](const NativeLibkernelTrap& entry) {
+					                              return entry.site == info->exception_address;
+				                              });
+			}
+			const bool patched_syscall = installed_guard && actual_opcode == 0x0b0f;
+			LOGF("FIRST_FRAME_AUDIT %s"
+			     " guest_pc=0x%016" PRIx64 " installed_guard=%u"
+			     " immutable_opcode16=%s runtime_opcode16=0x%04x"
+			     " classification=%s %s=0x%016" PRIx64 " guest_rsp=0x%016" PRIx64
+			     " guest_rbp=0x%016" PRIx64 " %s\n",
+			     patched_syscall ? "SYSAV_UNRESUMED_SYSCALL_TRAP" : "SYSAV_UNHANDLED_GUEST_ILLEGAL",
+			     info->exception_address, installed_guard ? 1u : 0u,
+			     installed_guard ? "0x050f" : "unavailable", actual_opcode,
+			     patched_syscall   ? "unresumed_syscall_trap"
+			     : installed_guard ? "modified_guard_bytes"
+			                       : "unknown",
+			     patched_syscall ? "syscall_number" : "register_rax", info->rax, info->rsp,
+			     info->rbp,
+			     patched_syscall ? "UNDISPATCHED_NATIVE_SYSCALL_RIP_NOT_ADVANCED"
+			                     : "UNKNOWN_GUEST_INSTRUCTION_NOT_RESUMED");
+			Log::Flush();
+		}
+		TerminateMappedExecChildOnUnhandledUd2(*info);
+		return false;
+	}
+	if (TerminateMappedExecChildOnUnhandledUd2(*info)) {
+		Log::Flush();
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
@@ -4451,6 +5289,15 @@ static void ForEachRelocation(Program* program, auto&& func) {
 
 static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 	EXIT_IF(g_tls_main_program == nullptr);
+
+	if (g_sysav_native_fsbase != 0 &&
+	    g_tls_main_program->file_name.filename() == "SceSysAvControl.elf") {
+		return reinterpret_cast<uint8_t*>(g_sysav_native_fsbase);
+	}
+	if (g_mini_native_fsbase != 0 &&
+	    g_tls_main_program->file_name.filename() == "mini-syscore.elf") {
+		return reinterpret_cast<uint8_t*>(g_mini_native_fsbase);
+	}
 
 	if (g_tls_cached_main_program == g_tls_main_program && g_tls_cached_main_tcb != nullptr) {
 		return g_tls_cached_main_tcb;
@@ -6915,6 +7762,101 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
+	}
+	if (program->instruction_trampoline_size != 0) {
+		const auto owner = Common::PathToString(program->file_name.filename());
+		const auto token = Common::HostException::RegisterGuestCodeProvenance(
+		    {program->base_vaddr + program->base_size_aligned, program->instruction_trampoline_size,
+			 program->base_vaddr, program->base_size_aligned,
+			 Common::HostException::FaultGuestCodeKind::InstructionTrampoline, owner.c_str(),
+			 "instruction_trampoline"});
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		EXIT_IF(token == 0);
+#endif
+		if (token != 0) program->host_exception_code_tokens.push_back(token);
+	}
+
+	if (static_exec && program->file_name.filename() == "SceSysAvControl.elf" &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr) {
+		// mini-syscore 0x4022A0 creates three named event flags, bits zero, before any standalone
+		// guest
+		if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_MINI_SYSCORE_BOOT_EVENTS") &&
+		    !Libs::NativeKernelBridge::InitializeOriginalMiniSyscoreBootEvents()) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_MINI_SYSCORE_EVENT_INIT_FAILED\n");
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_MODEL_ORBIS_AUDIOD_BOOT_EVENT") &&
+		    !Libs::NativeKernelBridge::InitializeOriginalVirtualAudiodBootEvent()) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_AUDIOD_NOT_READY"
+			     " boot_bit0x10_unset\n");
+		}
+		static constexpr std::array<uint32_t, 68> sites = {
+		    0x6ef5au, 0x6ef8au, 0x6efaau, 0x6efcau, 0x6efeau, 0x6f00au, 0x6f02au, 0x6f04au,
+		    0x6f06au, 0x6f08au, 0x6f0aau, 0x6f0cau, 0x6f0eau, 0x6f10au, 0x6f12au, 0x6fecau,
+		    0x6feeau, 0x7079au, 0x707aau, 0x7092au, 0x7094au, 0x713cau, 0x713eau, 0x7140eu,
+		    0x7143au, 0x7145au, 0x71d6au, 0x71d8au, 0x71daau, 0x71dcau, 0x71deau, 0x71e0au,
+		    0x71e2au, 0x71e4au, 0x71eeau, 0x728aau, 0x72b1au, 0x72b4au, 0x72b7au, 0x731fau,
+		    0x7321au, 0x7555au, 0x7557au, 0x7606au, 0x762fau, 0x765dau, 0x772fau, 0x7731au,
+		    0x7733au, 0x7735au, 0x7737au, 0x7739au, 0x773bau, 0x7838au, 0x7880au, 0x78a2au,
+		    0x78c0au, 0x78c2au, 0x78c4au, 0x78c6au, 0x78c8au, 0x78caau, 0x78ccau, 0x7932au,
+		    0x7934au, 0x7936au, 0x793dau, 0x7b74au,
+		};
+		for (const uint32_t offset: sites) {
+			EXIT_IF(offset + 2 > program->base_size_aligned);
+			const auto* opcode = reinterpret_cast<const uint8_t*>(program->base_vaddr + offset);
+			EXIT_IF(opcode[0] != 0x0f || opcode[1] != 0x05);
+		}
+		{
+			std::lock_guard lock(g_native_libkernel_trap_mutex);
+			for (const uint32_t offset: {0x6b535u, 0x58671u}) {
+				uint16_t original = 0;
+				std::memcpy(&original, reinterpret_cast<const void*>(program->base_vaddr + offset),
+				            2);
+				if (original == 0x0b0f)
+					g_sysav_original_ud2.push_back(program->base_vaddr + offset);
+			}
+		}
+		for (const uint32_t offset: sites) {
+			auto*    opcode = reinterpret_cast<uint8_t*>(program->base_vaddr + offset);
+			uint32_t number = UINT32_MAX;
+			if (offset >= 10 && opcode[-10] == 0x48 && opcode[-9] == 0xc7 && opcode[-8] == 0xc0 &&
+			    opcode[-3] == 0x49 && opcode[-2] == 0x89 && opcode[-1] == 0xca) {
+				uint32_t immediate = 0;
+				std::memcpy(&immediate, opcode - 7, 4);
+				number = immediate;
+			} else if (offset >= 8 && opcode[-8] == 0xb8 && opcode[-3] == 0x49 &&
+			           opcode[-2] == 0x89 && opcode[-1] == 0xca) {
+				uint32_t immediate = 0;
+				std::memcpy(&immediate, opcode - 7, 4);
+				number = immediate;
+			}
+			{
+				std::lock_guard lock(g_native_libkernel_trap_mutex);
+				g_sysav_raw_traps.push_back({program, program->base_vaddr + offset, number});
+			}
+			LOGF("SYSAV_INSTALLED_SYSCALL_GUARD site=0x%016" PRIx64
+			     " immutable_opcode16=0x050f patch_opcode16=0x0b0f expected_number=0x%016" PRIx64
+			     "\n",
+			     program->base_vaddr + offset, static_cast<uint64_t>(number));
+			static constexpr uint8_t sysctl_signature[] = {
+			    0x48, 0xc7, 0xc0, 0xca, 0x00, 0x00, 0x00, 0x49, 0x89, 0xca, 0x0f, 0x05,
+			    0x72, 0x01, 0xc3, 0x48, 0x8d, 0x0d, 0x72, 0xd0, 0xff, 0xff, 0xff, 0xe1};
+			if (offset >= 10 && offset + 14 <= program->base_size_aligned &&
+			    std::memcmp(opcode - 10, sysctl_signature, sizeof(sysctl_signature)) == 0) {
+				std::lock_guard lock(g_native_libkernel_trap_mutex);
+				g_native_libkernel_traps.push_back({program, program->base_vaddr + offset, 0xca});
+				LOGF("SYSAV_NATIVE_SYSCTL_WRAPPER_REGISTERED pc=0x%016" PRIx64
+				     " syscall=0xca signature_match=1 existing_owned_trap_registry=1\n",
+				     program->base_vaddr + offset);
+			}
+			opcode[1] = 0x0b;
+		}
+		EXIT_IF(!Common::VirtualMemory::FlushInstructionCache(program->base_vaddr,
+		                                                      program->base_size_aligned));
+		g_sysav_raw_traps_installed.store(true, std::memory_order_release);
+		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_SYSCALL_GUARD"
+		     " validated_and_trapped=%zu first=0x%016" PRIx64 " last=0x%016" PRIx64
+		     " NO_HOST_SYSCALLS\n",
+		     sites.size(), program->base_vaddr + sites.front(), program->base_vaddr + sites.back());
 	}
 
 	if (!is_shared) {

@@ -189,8 +189,10 @@ struct NativeMbusReceiveQueue {
 };
 std::shared_ptr<NativeMbusReceiveQueue> PinNativeMbusReceiveQueue(int fd);
 bool                                    IsNativeDipswDescriptor(int fd);
+int KYTY_SYSV_ABI                       KernelShmOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelPhyshmOpen(const char* path, int flags, uint16_t mode, int memory_type);
 int KYTY_SYSV_ABI     KernelShmUnlink(const char* path);
+void*                 MapSharedMemory(int d, void* addr, size_t len, int prot, int flags);
 int KYTY_SYSV_ABI     KernelClose(int d);
 int KYTY_SYSV_ABI     KernelPipe(int* fds);
 int                   CreateGuestSocketPair(int* fds);

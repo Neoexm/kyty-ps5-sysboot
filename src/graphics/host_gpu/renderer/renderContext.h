@@ -53,6 +53,7 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               SetCrossProcessMemory(uint64_t vaddr, uint64_t size, bool cross_process);
 	void               PrepareBda();
 	void               RunGarbageCollector();
 

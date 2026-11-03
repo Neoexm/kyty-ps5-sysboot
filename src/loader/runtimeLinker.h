@@ -19,6 +19,9 @@ struct Elf64_Sym;
 struct Elf64_Rela;
 class RuntimeLinker;
 
+// Per-OS-thread guest FS base, set before entering the statically linked pthread bootstrap on a
+// Kyty guest stack.
+void SetSysAvNativeThreadFsBase(uint64_t guest_tls_base);
 
 // fs:[disp] emulation in the exception handler consults this base on exec-child guest threads; 0
 // disables it.

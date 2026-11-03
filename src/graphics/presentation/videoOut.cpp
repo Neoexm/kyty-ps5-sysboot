@@ -196,6 +196,9 @@ struct VideoOutConfig {
 	int                                 flip_rate   = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	bool                                native_signal_active            = false;
+	uint64_t                            native_timing_generation        = 0;
+	bool                                native_scanout_bound            = false;
+	bool                                native_scanout_enabled          = false;
 	std::array<uint64_t, 12>            native_splash_attribute_record {};
 	bool                                native_splash_attributes_programmed = false;
 	float                               gamma       = 1.0f;
@@ -305,6 +308,9 @@ private:
 
 static std::unique_ptr<VideoOutDriver> g_video_out_driver;
 static std::atomic_bool                                g_video_out_ready {false};
+static std::atomic_uint32_t                            g_native_virtual_display_clock {0};
+static Common::Mutex                                   g_native_controller_mutex;
+static std::array<VideoOutNativeControllerSnapshot, 2> g_native_controllers {};
 
 bool VideoOutIsInitialized() noexcept {
 	return g_video_out_ready.load(std::memory_order_acquire);
@@ -1399,10 +1405,211 @@ static int RegisterBuffersWithGeneration(int handle, int set_index, int buffer_i
                                          void* option, uint64_t expected_generation);
 static int SubmitFlipWithGeneration(int handle, int index, int flip_mode, int64_t flip_arg,
                                     uint64_t expected_generation);
+int VideoOutNativeProgramDisplayClock(uint32_t requested_rate, uint32_t* applied_rate) {
+	// 120000 = SysAvControl PLL_SET_DISPCLK (0x45A110)
+	if (!VideoOutIsInitialized() || applied_rate == nullptr || requested_rate != 120000u) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	Common::LockGuard lock(g_native_controller_mutex);
+	g_native_virtual_display_clock.store(requested_rate, std::memory_order_release);
+	*applied_rate = requested_rate;
+	LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KYTY_VIRTUAL_DISPLAY_CLOCK_PROGRAMMED"
+	     " display_clock_10khz=%u\n",
+	     requested_rate);
+	return OK;
+}
 uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle) {
 	if (!VideoOutIsInitialized()) return 0;
 	uint64_t generation = 0;
 	return DriverState().Get(native_display_handle, generation) != nullptr ? generation : 0;
+}
+int VideoOutNativeProgramMasterUpdateLock(uint32_t original_port, uint32_t enabled) {
+	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() || enabled > 1) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	Common::LockGuard lock(g_native_controller_mutex);
+	auto&             controller = g_native_controllers[original_port];
+	if (!controller.pending) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	controller.master_locked = enabled != 0;
+	LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_MASTER_UPDATE_LOCK"
+	     " port=%u enabled=%u transaction=%" PRIu64 "\n",
+	     original_port, enabled, controller.transaction_id);
+	return OK;
+}
+int VideoOutNativeProgramPixelClock(uint32_t original_port, uint32_t raw_rate_100hz) {
+	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
+	    raw_rate_100hz < 200000u || raw_rate_100hz > 12000000u) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	Common::LockGuard lock(g_native_controller_mutex);
+	auto&             controller = g_native_controllers[original_port];
+	if (!controller.pending || !controller.master_locked ||
+	    g_native_virtual_display_clock.load(std::memory_order_acquire) != 120000u) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	const auto&    timing = controller.pending_timing;
+	const uint32_t expected_rate =
+	    original_port == 0 && timing.width == 720 && timing.height == 480     ? 270000u
+		: original_port == 0 && timing.width == 3840 && timing.height == 2160 ? 5934066u
+		: original_port == 1 && timing.width == 1920 && timing.height == 1080 ? 1483516u
+		                                                                      : 0u;
+	if (raw_rate_100hz != expected_rate) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	controller.pending_timing.ppll_rate_100hz   = raw_rate_100hz;
+	controller.pending_timing.ppll_programmed   = true;
+	controller.pending_timing.timing_programmed = false;
+	LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_PIXEL_PLL_PROGRAMMED"
+	     " ioctl=0xC0089A0D port=%u raw_rate_100hz=%u"
+	     " transaction=%" PRIu64 " pending_only\n",
+	     original_port, raw_rate_100hz, controller.transaction_id);
+	return OK;
+}
+int VideoOutNativeProgramOtgTiming(uint32_t original_port, const uint32_t* original_registers,
+                                   size_t register_count) {
+	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
+	    original_registers == nullptr || register_count != 16) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	Common::LockGuard lock(g_native_controller_mutex);
+	auto&             controller = g_native_controllers[original_port];
+	auto&             timing     = controller.pending_timing;
+	const bool        hdmi       = original_port == 0;
+	const bool        hdmi_480   = hdmi && timing.width == 720 && timing.height == 480;
+	if (!controller.pending || !controller.master_locked || !timing.ppll_programmed ||
+	    timing.ppll_rate_100hz != (hdmi_480 ? 270000u
+	                               : hdmi   ? 5934066u
+	                                        : 1483516u) ||
+	    original_registers[0] != timing.pixel_clock_10khz ||
+	    original_registers[1] != timing.h_total - 1 ||
+	    original_registers[2] != (hdmi_480 ? 842u
+	                              : hdmi   ? 4224u
+	                                       : 2112u) ||
+	    original_registers[3] != (hdmi_480 ? 122u
+	                              : hdmi   ? 384u
+	                                       : 192u) ||
+	    original_registers[4] != 0 ||
+	    original_registers[5] != (hdmi_480 ? 62u
+	                              : hdmi   ? 88u
+	                                       : 44u) ||
+	    original_registers[6] != timing.v_total - 1 ||
+	    original_registers[7] != (hdmi_480 ? 516u
+	                              : hdmi   ? 2242u
+	                                       : 1121u) ||
+	    original_registers[8] != (hdmi_480 ? 36u
+	                              : hdmi   ? 82u
+	                                       : 41u) ||
+	    original_registers[9] != 0 ||
+	    original_registers[10] != (hdmi_480 ? 6u
+	                               : hdmi   ? 10u
+	                                        : 5u) ||
+	    original_registers[11] != 0x426fc28fu || original_registers[12] != 0 ||
+	    original_registers[13] != 0 || original_registers[14] != 0 || original_registers[15] != 0) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	std::copy_n(original_registers, timing.otg_timing.size(), timing.otg_timing.begin());
+	timing.timing_programmed = true;
+	LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KYTY_OTG_TIMING_PROGRAMMED"
+	     " port=%u transaction=%" PRIu64 " pending_only\n",
+	     original_port, controller.transaction_id);
+	return OK;
+}
+int VideoOutNativeProgramOtgControl(uint32_t original_request, uint32_t original_port,
+                                    uint32_t original_value) {
+	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
+	    original_value > 1 ||
+	    (original_request != 0xc0089a01u && original_request != 0xc0089a04u)) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	auto update = [&](VideoOutConfig* ctx) {
+		Common::LockGuard lock(g_native_controller_mutex);
+		auto&             controller = g_native_controllers[original_port];
+		auto&             timing     = controller.pending_timing;
+		if (original_request == 0xc0089a01u && original_value == 0) {
+			if (controller.pending) {
+				timing.otg_enabled           = false;
+				timing.double_buffer_enabled = false;
+			}
+			if (controller.scanout_enabled) {
+				controller.scanout_enabled = false;
+				if (++controller.timing_generation == 0) {
+					EXIT("native display timing generation wrapped\n");
+				}
+				if (ctx != nullptr && ctx->opened && !ctx->closing &&
+				    controller.bound_handle == 1 &&
+				    controller.bound_generation == ctx->generation) {
+					ctx->native_scanout_enabled   = false;
+					ctx->native_timing_generation = controller.timing_generation;
+				}
+			}
+		} else if (original_request == 0xc0089a01u && !controller.pending) {
+			if (!controller.committed || ctx == nullptr || !ctx->opened || ctx->closing ||
+			    !ctx->native_signal_active || !ctx->native_scanout_bound ||
+			    controller.bound_handle != 1 || controller.bound_generation != ctx->generation) {
+				return VIDEO_OUT_ERROR_INVALID_VALUE;
+			}
+			if (!controller.scanout_enabled) {
+				controller.scanout_enabled = true;
+				if (++controller.timing_generation == 0) {
+					EXIT("native display timing generation wrapped\n");
+				}
+				ctx->native_scanout_enabled   = true;
+				ctx->native_timing_generation = controller.timing_generation;
+			}
+		} else {
+			if (!controller.pending) return VIDEO_OUT_ERROR_INVALID_VALUE;
+			if (original_request == 0xc0089a04u) {
+				timing.double_buffer_enabled = original_value != 0;
+			} else {
+				if (!controller.master_locked || !timing.timing_programmed ||
+				    !timing.double_buffer_enabled) {
+					return VIDEO_OUT_ERROR_INVALID_VALUE;
+				}
+				timing.otg_enabled = true;
+			}
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KYTY_OTG_CONTROL_PROGRAMMED"
+		     " ioctl=0x%08x port=%u value=%u"
+		     " transaction=%" PRIu64 " scanout_enabled=%u\n",
+		     original_request, original_port, original_value, controller.transaction_id,
+		     controller.scanout_enabled ? 1u : 0u);
+		return OK;
+	};
+	if (original_port == 0 && original_request == 0xc0089a01u) {
+		if (auto* ctx = DriverState().Get(1); ctx != nullptr) {
+			Common::LockGuard lock(ctx->mutex);
+			return update(ctx);
+		}
+	}
+	return update(nullptr);
+}
+int VideoOutNativeProgramFormatControl(uint32_t original_request, uint32_t original_port,
+                                       uint32_t original_value) {
+	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
+	    original_value != 0 ||
+	    (original_request != 0xc0089a13u && original_request != 0xc0089a14u)) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	Common::LockGuard lock(g_native_controller_mutex);
+	auto&             controller = g_native_controllers[original_port];
+	auto&             timing     = controller.pending_timing;
+	if (!controller.pending || controller.master_locked || !timing.timing_programmed ||
+	    !timing.otg_enabled) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	if (original_request == 0xc0089a13u) {
+		timing.pixel_encoding            = original_value;
+		timing.pixel_encoding_programmed = true;
+	} else {
+		timing.subsampling            = original_value;
+		timing.subsampling_programmed = true;
+	}
+	LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KYTY_FORMAT_PROGRAMMED"
+	     " ioctl=0x%08x port=%u value=%u transaction=%" PRIu64 "\n",
+	     original_request, original_port, original_value, controller.transaction_id);
+	return OK;
 }
 int VideoOutNativeConfigureSplashAttributes(const uint64_t* original_words,
                                             size_t original_word_count, int handle,

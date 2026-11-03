@@ -815,6 +815,49 @@ struct NativeDceScope {
 		ReleaseMutex(view->mutex);
 		return valid ? view : nullptr;
 	}
+	int Acquire(int pid, uint32_t port, uint32_t bus, NativeDceLeaseIdentity* identity) {
+		if (pid <= 0 || port != 1 || bus != 0 || identity == nullptr) return KERNEL_ERROR_EINVAL;
+		uint64_t created = 0;
+		if (!CreatedAt(GetCurrentProcess(), &created) || !Lock()) return KERNEL_ERROR_EIO;
+		int result = KERNEL_ERROR_EIO;
+		if (Valid()) {
+			auto& owner = state->ports[port];
+			if (owner.generation != 0 && !ProvenDead(owner)) {
+				result = KERNEL_ERROR_EBUSY;
+			} else if (state->next_generation == UINT64_MAX ||
+			           state->next_cookie_sequence == UINT64_MAX) {
+				result = KERNEL_ERROR_EAGAIN;
+			} else {
+				const auto previous = owner;
+				// cookies wrap at 31 bits, so teardown compares the whole lease
+				*identity = {state->next_generation++,
+				             created,
+				             GetCurrentProcessId(),
+				             pid,
+				             static_cast<uint32_t>(state->next_cookie_sequence++ & 0x7fffffffu) ^
+				                 0x2babcdcdu,
+				             port,
+				             bus,
+				             0};
+				owner     = *identity;
+				result    = Flush() ? OK : KERNEL_ERROR_EIO;
+				if (result != OK) {
+					owner = previous;
+					static_cast<void>(Flush());
+					*identity = {};
+				} else if (previous.generation != 0) {
+					LOGF("NATIVE_DCE_SCOPE_DEAD_OWNER_RECLAIMED previous_host_pid=%u "
+					     "previous_host_created=%" PRIu64
+					     " previous_guest_pid=%d previous_generation=%" PRIu64
+					     " new_generation=%" PRIu64 "\n",
+					     previous.host_pid, previous.host_created, previous.guest_pid,
+					     previous.generation, identity->generation);
+				}
+			}
+		}
+		ReleaseMutex(mutex);
+		return result;
+	}
 	int Validate(const NativeDceLeaseIdentity& identity) const {
 		if (identity.generation == 0 || identity.port >= 7 || !Lock()) return KERNEL_ERROR_EIO;
 		const int result = !Valid()                                  ? KERNEL_ERROR_EIO
@@ -1103,6 +1146,7 @@ struct NativeDceClient {
 };
 
 static std::mutex g_native_dce_client_mutex;
+static std::unordered_map<std::string, std::shared_ptr<NativeDceScope>> g_native_dce_scopes;
 static uint64_t g_native_dce_client_sequence = 1;
 
 int RegisterNativeDceFlipEvent(int64_t queue, uint64_t ident) {
@@ -1188,6 +1232,7 @@ struct File {
 	bool                                           native_dce_display_id_set                = false;
 	bool                                           native_dce_original_videoout_client_open = false;
 	uint64_t                                       native_dce_original_videoout_resource    = 0;
+	std::vector<std::shared_ptr<NativeDceClient>>  native_dce_clients;
 	uint64_t                                       native_dce_buffers[4] {};
 	uint64_t                                       native_scanin_buffers[72] {};
 	uint64_t                                       native_scanin_base       = 0;
@@ -5583,6 +5628,144 @@ static bool IsReservedPhyshmBackendName(const char* path) {
 	       (path[sizeof(Root) - 1] == '\0' || path[sizeof(Root) - 1] == '/');
 }
 
+int KYTY_SYSV_ABI KernelShmOpen(const char* path, int flags, uint16_t mode) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
+		return -1;
+	}
+
+	constexpr uintptr_t SHM_ANON_GUEST = 1;
+	if (reinterpret_cast<uintptr_t>(path) == SHM_ANON_GUEST) {
+		constexpr uint32_t O_ACCMODE_GUEST = 0x3;
+		constexpr uint32_t O_RDWR_GUEST    = 0x2;
+		constexpr uint32_t O_CREAT_GUEST   = 0x200;
+		constexpr uint32_t O_TRUNC_GUEST   = 0x400;
+		constexpr uint32_t O_EXCL_GUEST    = 0x800;
+		constexpr uint32_t O_CLOEXEC_GUEST = 0x100000;
+		constexpr uint32_t ALLOWED_FLAGS =
+		    O_ACCMODE_GUEST | O_CREAT_GUEST | O_TRUNC_GUEST | O_EXCL_GUEST | O_CLOEXEC_GUEST;
+		const auto flags_u = static_cast<uint32_t>(flags);
+		if ((flags_u & O_ACCMODE_GUEST) != O_RDWR_GUEST || (flags_u & ~ALLOWED_FLAGS) != 0) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+			return -1;
+		}
+		const auto object_mode = static_cast<uint16_t>((mode & ~GetUmask()) & 0777u);
+		auto       object      = Memory::CreateAnonymousSharedMemory(object_mode);
+		if (!object) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+			return -1;
+		}
+		const int descriptor = g_files->CreateDescriptor();
+		auto*     file       = g_files->GetFile(descriptor);
+		EXIT_IF(file == nullptr || file->opened || file->directory);
+		file->readable         = true;
+		file->writable         = true;
+		file->append           = false;
+		file->sync_writes      = false;
+		file->special          = SpecialFile::SharedMemory;
+		file->descriptor_flags = 1;
+		file->special_size     = 0;
+		file->scope_shared     = -1;
+		file->anonymous_shared = std::move(object);
+		file->opened           = true;
+		LOGF("SHM_ANON_OPEN guest_pid=%d object=%" PRIu64
+		     " flags=0x%x mode=0%o size=0 fd=%d cloexec=1\n",
+		     Process::GetPid(), Memory::GetAnonymousSharedMemoryId(file->anonymous_shared), flags_u,
+		     object_mode, descriptor);
+		return descriptor;
+	}
+	if (IsReservedPhyshmBackendName(path)) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+		return -1;
+	}
+
+	constexpr uint64_t SCE_AV_CONTROL_SIZE = 0x1db0;
+	const bool         is_av_control       = std::strcmp(path, "/SceAvControl") == 0;
+	const bool         is_np_tpip          = std::strcmp(path, "/SceNpTpip") == 0;
+	// libSceHmd opens the block the compositor made, so with a scope it's shared like any other
+	// name
+	std::string       scope;
+	const bool        is_hmd = std::strcmp(path, HMD_SHM_PATH) == 0 && !Process::GetScope(&scope);
+	int               scope_shared = -1;
+	uint64_t          scope_size   = 0;
+	Common::LockGuard lock(g_hmd_shm_mutex);
+	if (is_hmd) {
+		if ((flags & ~0xa03) != 0 || (flags & 3) != 2) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOTSUP;
+			return -1;
+		}
+		if (g_hmd_shm_exists) {
+			*Posix::GetErrorAddr() =
+			    (flags & 0xa00) == 0xa00 ? Posix::POSIX_EEXIST : Posix::POSIX_ENOTSUP;
+			return -1;
+		}
+		if ((flags & 0x200) == 0) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
+			return -1;
+		}
+	} else if (!is_av_control && !is_np_tpip) {
+		int error = Memory::OpenScopeSharedMemory(path, flags, &scope_shared, &scope_size);
+		// ShellCore creates this atomic_buffer block (shm_open 0xe02, 0x10000 per side); with no
+		// ShellCore the first miss creates it
+		if (error == Posix::POSIX_ENOENT && std::strcmp(path, "/SceUrlConfigResolverShm") == 0 &&
+		    std::getenv("KYTY_DIAGNOSTIC_SHELLCORE_URL_CONFIG_SHM") != nullptr) {
+			if (Memory::OpenScopeSharedMemory(path, 0xe02, &scope_shared, &scope_size) == 0) {
+				const uint64_t header[3] = {0xa1544cbdffe34255ull, 0, 0x10000};
+				Memory::ResizeScopeSharedMemory(scope_shared, 0x24000);
+				Memory::WriteScopeSharedMemory(scope_shared, 0, header, sizeof(header));
+				LOGF(
+				    "FIRST_FRAME_AUDIT DIAGNOSTIC_SHELLCORE_URL_CONFIG_SHM_CREATE NON_AUTHENTIC\n");
+			}
+			error = Memory::OpenScopeSharedMemory(path, flags, &scope_shared, &scope_size);
+		}
+		// ShellCore also creates this one (shm_open 0x202, ftruncate 0x4000). libSceSystemService
+		// reads it unchecked, IDU state is byte 0x13 values are what ShellCore's initializer writes
+		// when both registry reads fail
+		if (error == Posix::POSIX_ENOENT && std::strcmp(path, "/SceShellCoreUtil") == 0 &&
+		    std::getenv("KYTY_DIAGNOSTIC_SHELLCORE_UTIL_SHM") != nullptr) {
+			if (Memory::OpenScopeSharedMemory(path, 0xa02, &scope_shared, &scope_size) == 0) {
+				const uint64_t magic = 0x6ed81ede6df17259ull;
+				const uint8_t  one   = 1;
+				const uint32_t none  = 0xffffffffu;
+				Memory::ResizeScopeSharedMemory(scope_shared, 0x4000);
+				Memory::WriteScopeSharedMemory(scope_shared, 0, &magic, sizeof(magic));
+				Memory::WriteScopeSharedMemory(scope_shared, 0x11, &one, sizeof(one));
+				Memory::WriteScopeSharedMemory(scope_shared, 0x18, &none, sizeof(none));
+				Memory::WriteScopeSharedMemory(scope_shared, 0x74, &none, sizeof(none));
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_SHELLCORE_UTIL_SHM_CREATE NON_AUTHENTIC\n");
+			}
+			error = Memory::OpenScopeSharedMemory(path, flags, &scope_shared, &scope_size);
+		}
+		if (error != 0) {
+			*Posix::GetErrorAddr() = error;
+			return -1;
+		}
+	}
+
+	int   descriptor = g_files->CreateDescriptor();
+	auto* file       = g_files->GetFile(descriptor);
+	EXIT_IF(file == nullptr || file->opened || file->directory);
+
+	file->name         = path;
+	file->real_name    = path;
+	file->readable     = true;
+	file->writable     = (static_cast<uint32_t>(flags) & 0x3u) != 0;
+	file->append       = false;
+	file->sync_writes  = false;
+	file->special      = SpecialFile::SharedMemory;
+	file->special_size = is_av_control ? SCE_AV_CONTROL_SIZE : scope_size;
+	file->scope_shared = scope_shared;
+	file->opened       = true;
+	if (is_hmd) {
+		g_hmd_shm_exists = true;
+	}
+
+	LOGF("\tShmOpen: %s, size=0x%016" PRIx64 ", fd=%d\n", path, file->special_size, descriptor);
+	(void)mode;
+	return descriptor;
+}
 
 int KYTY_SYSV_ABI KernelShmUnlink(const char* path) {
 	PRINT_NAME();
@@ -5616,6 +5799,55 @@ int KYTY_SYSV_ABI KernelShmUnlink(const char* path) {
 	return 0;
 }
 
+void* MapSharedMemory(int d, void* addr, size_t len, int prot, int flags) {
+	auto fail = [](int error) -> void* {
+		*Posix::GetErrorAddr() = error;
+		return reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+	};
+	auto* file = d >= DESCRIPTOR_MIN ? g_files->GetFile(d) : nullptr;
+	if (file == nullptr || !file->opened || file->special != SpecialFile::SharedMemory) {
+		return fail(Posix::POSIX_EBADF);
+	}
+	Common::LockGuard lock(file->mutex);
+	if (file->anonymous_shared) {
+		void*     mapped = addr;
+		const int result =
+		    Memory::MapAnonymousSharedMemory(file->anonymous_shared, &mapped, len, prot, flags);
+		if (result != OK) {
+			return fail(KernelToPosix(result));
+		}
+		file->shared_mapped = true;
+		LOGF("SHM_ANON_MAP guest_pid=%d object=%" PRIu64 " fd=%d len=0x%016" PRIx64
+		     " prot=0x%x flags=0x%x\n",
+		     Process::GetPid(), Memory::GetAnonymousSharedMemoryId(file->anonymous_shared), d,
+		     static_cast<uint64_t>(len), prot, flags);
+		return mapped;
+	}
+	const bool is_hmd = file->scope_shared < 0 && file->name == HMD_SHM_PATH;
+	if (is_hmd && (flags != 0x801 || addr != nullptr || prot != 3 || file->shared_mapped)) {
+		return fail(Posix::POSIX_ENOTSUP);
+	}
+	constexpr size_t PAGE_SIZE = 0x4000;
+	void*            mapped    = addr;
+	int              result    = OK;
+	if (file->scope_shared >= 0) {
+		result = Memory::MapScopeSharedMemory(file->scope_shared, &mapped, len, prot, flags & 0x10);
+	} else {
+		if (len == 0 || len > file->special_size || len > SIZE_MAX - (PAGE_SIZE - 1)) {
+			return fail(Posix::POSIX_EINVAL);
+		}
+		const auto map_len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+		result             = Memory::KernelMapNamedFlexibleMemory(
+		    &mapped, map_len, prot, flags & static_cast<int>(0xff000010u), "shared_mmap");
+	}
+	if (result != OK) {
+		return fail(KernelToPosix(result));
+	}
+	file->shared_mapped = true;
+	LOGF("\t shared mmap name=%s fd=%d len=0x%016" PRIx64 " mapped=0x%016" PRIx64 "\n",
+	     file->name.c_str(), d, static_cast<uint64_t>(len), reinterpret_cast<uint64_t>(mapped));
+	return mapped;
+}
 
 bool GetSharedMemorySize(int d, size_t* size) {
 	if (size == nullptr || d < DESCRIPTOR_MIN) {
@@ -6599,6 +6831,228 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 		    !NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
 			return KERNEL_ERROR_EFAULT;
 		}
+		// FMT_SET_PIXENC 0xC0089A13 / FMT_SET_SUB_MODE 0xC0089A14: {DWORD port, DWORD setting}
+		if (file->name == "/dev/av_control" && (request == 0xc0089a13u || request == 0xc0089a14u) &&
+		    bytes == 8 && NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
+			uint32_t original[2] {};
+			std::memcpy(original, arg, sizeof(original));
+			if (native_device || std::getenv("KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_FORMAT_REGISTERS")) {
+				if (original[0] > 1 || original[1] != 0) return KERNEL_ERROR_EINVAL;
+				const int rc = VideoOut::VideoOutNativeProgramFormatControl(
+				    static_cast<uint32_t>(request), original[0], original[1]);
+				if (rc != 0) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_FORMAT_BACKEND_REJECTED"
+					     " ioctl=0x%08x port=%u"
+					     " backend_error=0x%08x\n",
+					     static_cast<uint32_t>(request), original[0], static_cast<uint32_t>(rc));
+					return KERNEL_ERROR_EINVAL;
+				}
+				return OK;
+			}
+		}
+		// OTG_ENABLE/OTG_SET_DBUFF (0x459CF2, 0x459F3B): DWORD port, byte bool, bytes 5-7 stack
+		// padding
+		if (file->name == "/dev/av_control" && (request == 0xc0089a01u || request == 0xc0089a04u) &&
+		    bytes == 8 && NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
+			uint32_t original[2] {};
+			std::memcpy(original, arg, sizeof(original));
+			original[1] &= 0xffu;
+			if (native_device ||
+			    std::getenv("KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_OTG_CONTROL") != nullptr) {
+				if (original[0] > 1 || original[1] > 1) return KERNEL_ERROR_EINVAL;
+				const int rc = VideoOut::VideoOutNativeProgramOtgControl(
+				    static_cast<uint32_t>(request), original[0], original[1]);
+				if (rc != 0) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_OTG_CONTROL_BACKEND_REJECTED"
+					     " ioctl=0x%08" PRIx64 " port=%u"
+					     " value=%u backend_error=0x%08x\n",
+					     request, original[0], original[1], static_cast<uint32_t>(rc));
+					return KERNEL_ERROR_EINVAL;
+				}
+				return OK;
+			}
+		}
+		// OTG_SET_TIMING (0x459E20): 32-byte envelope plus a pointer to an opaque timing buffer
+		if (file->name == "/dev/av_control" && request == 0xc0209a07u && bytes == 0x20 &&
+		    NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
+			uint64_t original[4] {};
+			std::memcpy(original, arg, sizeof(original));
+			uint64_t   timing_words[8] {};
+			const bool readable = NativeDceReadable(original[1], sizeof(timing_words));
+			if (readable) {
+				std::memcpy(timing_words, reinterpret_cast<const void*>(original[1]),
+				            sizeof(timing_words));
+			}
+			static std::atomic<uint32_t> seen {0};
+			if (seen.fetch_add(1) < 6) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_OTG_TIMING_PARAMETER"
+				     " source=0x459E20"
+				     " port_and_flags=0x%016" PRIx64 " timing_va=0x%016" PRIx64
+				     " controls=0x%016" PRIx64 ",0x%016" PRIx64 " guest_timing_readable=%u\n",
+				     original[0], original[1], original[2], original[3], readable ? 1u : 0u);
+				if (readable) {
+					for (uint32_t i = 0; i < 8; ++i) {
+						LOGF("FIRST_FRAME_AUDIT SYSAV_OTG_TIMING_WORD"
+						     " source_va=0x%016" PRIx64 " byte_offset=0x%02x word=0x%016" PRIx64
+						     "\n",
+						     original[1], i * 8, timing_words[i]);
+					}
+				}
+			}
+			const uint32_t original_port = static_cast<uint32_t>(original[0]);
+			const bool     sony4k   = original_port == 0 && original[2] == 0x0000000100000001ull;
+			const bool     sony480  = original_port == 0 && original[2] == 1;
+			const bool     sony1080 = original_port == 1 && original[2] == 0x000000010000000eull;
+			if (native_device ||
+			    std::getenv("KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_OTG_TIMING") != nullptr) {
+				if (!readable) return KERNEL_ERROR_EFAULT;
+				if ((!sony4k && !sony480 && !sony1080) || original[3] != 0)
+					return KERNEL_ERROR_EINVAL;
+				uint32_t original_registers[16] {};
+				std::memcpy(original_registers, timing_words, sizeof(original_registers));
+				const int rc = VideoOut::VideoOutNativeProgramOtgTiming(
+				    original_port, original_registers, std::size(original_registers));
+				if (rc != 0) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_OTG_TIMING_REJECTED"
+					     " ioctl=0xC0209A07 videoout_error=0x%08x\n",
+					     static_cast<uint32_t>(rc));
+					return KERNEL_ERROR_EINVAL;
+				}
+				LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_OTG_TIMING_STAGED"
+				     " ioctl=0xC0209A07"
+				     " independent_controller_pending_registers\n");
+				return OK;
+			}
+		}
+		// 0x459FB0..0x45A047 master-update lock: u32 port, bool at byte 4, bytes 5-7 padding
+		if (file->name == "/dev/av_control" && request == 0xc0089a05u && bytes == 8 &&
+		    NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
+			uint32_t source[2] {};
+			std::memcpy(source, arg, sizeof(source));
+			static std::atomic<uint32_t> seen {0};
+			if (seen.fetch_add(1) < 12) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_MASTER_UPDATE_LOCK_ABI"
+				     " wrapper=0x459FB0"
+				     " port=%u config_byte=0x%02x"
+				     " ignored_uninitialized_stack_padding=0x%06x"
+				     "\n",
+				     source[0], source[1] & 0xffu, source[1] >> 8u);
+			}
+			if (native_device || std::getenv("KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_PIXEL_PLL")) {
+				const int rc =
+				    VideoOut::VideoOutNativeProgramMasterUpdateLock(source[0], source[1] & 0xffu);
+				if (rc != 0) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_MASTER_UPDATE_LOCK_BACKEND_REJECTED"
+					     " videoout_error=0x%08x\n",
+					     static_cast<uint32_t>(rc));
+					return KERNEL_ERROR_EINVAL;
+				}
+				LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_MASTER_UPDATE_LOCK_APPLIED"
+				     " ioctl=0xC0089A05 port=%u config_byte=0x%02x"
+				     " software_controller\n",
+				     source[0], source[1] & 0xffu);
+				return OK;
+			}
+		}
+		if (file->name == "/dev/av_control" && request == 0xc0089a0du &&
+		    (native_device || std::getenv("KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_PIXEL_PLL") != nullptr)) {
+			uint32_t source[2] {};
+			std::memcpy(source, arg, sizeof(source));
+			const int rc = VideoOut::VideoOutNativeProgramPixelClock(source[0], source[1]);
+			if (rc != 0) return KERNEL_ERROR_EINVAL;
+			return OK;
+		}
+		// PLL_SET_DISPCLK (0x45A110): u32 rate, DWORD padding, out pointer for the applied rate
+		if (file->name == "/dev/av_control" && request == 0xc0109a0eu && bytes == 0x10 &&
+		    NativeDceReadable(reinterpret_cast<uint64_t>(arg), 0x10)) {
+			struct SonyDispClockRequest {
+				uint32_t requested_rate;
+				uint32_t padding;
+				uint64_t guest_result;
+			};
+			static_assert(sizeof(SonyDispClockRequest) == 0x10);
+			SonyDispClockRequest source {};
+			std::memcpy(&source, arg, sizeof(source));
+			const bool guest_out_writable =
+			    NativeDceReadable(source.guest_result, sizeof(uint32_t), true);
+			static std::atomic<uint32_t> disp_clock_queries {0};
+			const unsigned               nth = disp_clock_queries.fetch_add(1);
+			if (nth < 16) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DISPCLK_ABI"
+				     " wrapper=0x45A110"
+				     " requested_rate_10khz=%u ignored_padding=0x%08x"
+				     " guest_result=0x%016" PRIx64 " result_writable=%u"
+				     "\n",
+				     source.requested_rate, source.padding, source.guest_result,
+				     guest_out_writable ? 1u : 0u);
+			}
+			if (native_device || std::getenv("KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_DISPCLK") != nullptr) {
+				if (!guest_out_writable) return KERNEL_ERROR_EFAULT;
+				if (source.requested_rate != 120000u) return KERNEL_ERROR_EINVAL;
+				uint32_t  applied_rate = 0;
+				const int rc = VideoOut::VideoOutNativeProgramDisplayClock(source.requested_rate,
+				                                                           &applied_rate);
+				if (rc != 0) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_DISPCLK_BACKEND_REJECTED"
+					     " videoout_error=0x%08x\n",
+					     static_cast<uint32_t>(rc));
+					return KERNEL_ERROR_EINVAL;
+				}
+				Memory::InvalidateMemory(source.guest_result, sizeof(applied_rate));
+				std::memcpy(reinterpret_cast<void*>(source.guest_result), &applied_rate,
+				            sizeof(applied_rate));
+				LOGF("FIRST_FRAME_AUDIT SYSAV_VIRTUAL_DISPCLK_COMMITTED"
+				     " ioctl=0xC0109A0E"
+				     " requested=%u applied=%u guest_result_written=4"
+				     " software_clock_only\n",
+				     source.requested_rate, applied_rate);
+				return OK;
+			}
+		}
+		// DP_GET_LINKTRAINING_INFO, SysAv 0x459860..0x459938: u32 port and a pointer to 60 out
+		// bytes, copied at 0x4598B6 on success
+		if (file->name == "/dev/av_control" && request == 0xc0109a2du && bytes == 0x10 &&
+		    NativeDceReadable(reinterpret_cast<uint64_t>(arg), 0x10)) {
+			struct DpLinkRequest {
+				uint32_t port;
+				uint32_t reserved;
+				uint64_t output;
+			};
+			static_assert(sizeof(DpLinkRequest) == 0x10);
+			DpLinkRequest original {};
+			std::memcpy(&original, arg, sizeof(original));
+			const bool real_out_writable = NativeDceReadable(original.output, 0x3c, true);
+			static std::atomic<uint32_t> dp_link_queries {0};
+			const uint32_t               nth = dp_link_queries.fetch_add(1);
+			uint32_t                     preexisting_out[15] {};
+			if (real_out_writable) {
+				std::memcpy(preexisting_out, reinterpret_cast<const void*>(original.output), 0x3c);
+			}
+			uint32_t nonzero = 0;
+			for (const auto value: preexisting_out)
+				nonzero += value != 0;
+			if (nth < 12) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DP_LINKTRAINING_ABI"
+				     " source=0x459860"
+				     " port=%u reserved=0x%08x guest_out=0x%016" PRIx64
+				     " output_bytes=60 writable=%u input_out_nonzero_dwords=%u"
+				     " copies_60_bytes_on_success"
+				     "\n",
+				     original.port, original.reserved, original.output, real_out_writable ? 1u : 0u,
+				     nonzero);
+			}
+			// no USB-C DP sink. EINVAL, not ENOTTY: 0x4598D2..0x4598E4 maps errno 22 to no-link
+			// 0x802A0016
+			if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_DP_NO_LINK_FALLBACK") && original.port == 1 &&
+			    original.reserved == 0 && real_out_writable && nonzero == 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DP_VIRTUAL_PORT_NO_LINK"
+				     " port=%u result=EINVAL guest_errno=22"
+				     " handled_as_no_link_0x802A0016"
+				     "\n",
+				     original.port);
+				return KERNEL_ERROR_EINVAL;
+			}
+		}
 		if (file->name == "/dev/scanin" && request == 0x84b89e04u && bytes == 0x4b8 &&
 		    NativeDceReadable(reinterpret_cast<uint64_t>(arg), bytes)) {
 			uint64_t original_words[0x4b8 / sizeof(uint64_t)] {};
@@ -6685,6 +7139,237 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 		     " request=0x%08" PRIx64 " arg=0x%016" PRIx64 " result=ENOTTY NON_AUTHENTIC\n",
 		     file->name.c_str(), d, request, reinterpret_cast<uint64_t>(arg));
 		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::NativeDmem) {
+		if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr) {
+			return KERNEL_ERROR_ENOTTY;
+		}
+		if (request == 0x80108002u) {
+			if (!NativeDceReadable(reinterpret_cast<uint64_t>(arg), 16) ||
+			    !NativeDceGuestFrameMapped(reinterpret_cast<uint64_t>(arg), 16)) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			uint64_t words[2] {};
+			std::memcpy(words, arg, sizeof(words));
+			if (words[0] > INT64_MAX || words[1] == 0 || ((words[0] | words[1]) & 0x3fffull) != 0 ||
+			    words[1] > SIZE_MAX) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			const int rc = Memory::KernelCheckedReleaseDirectMemory(static_cast<int64_t>(words[0]),
+			                                                        static_cast<size_t>(words[1]));
+			LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_DMEM_CHECKED_RELEASE"
+			     " physical_start=0x%016" PRIx64 " length=0x%016" PRIx64 " result=0x%08x\n",
+			     words[0], words[1], static_cast<uint32_t>(rc));
+			return rc;
+		}
+		if (request == 0xc018800fu) {
+			struct ProtectPayload {
+				uint64_t physical_offset;
+				uint64_t length;
+				uint32_t pid;
+				uint32_t protection;
+			};
+			static_assert(sizeof(ProtectPayload) == 0x18);
+			if (!NativeDceReadable(reinterpret_cast<uint64_t>(arg), sizeof(ProtectPayload)) ||
+			    !NativeDceGuestFrameMapped(reinterpret_cast<uint64_t>(arg),
+			                               sizeof(ProtectPayload))) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			ProtectPayload payload {};
+			std::memcpy(&payload, arg, sizeof(payload));
+			if ((payload.physical_offset & 0x1fffffull) != 0 ||
+			    payload.physical_offset > INT64_MAX || payload.length != 0x6000000 ||
+			    payload.pid != 0 || payload.protection != 0x10) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			const int rc = Memory::KernelProtectDirectMemory(
+			    static_cast<int64_t>(payload.physical_offset), static_cast<size_t>(payload.length),
+			    static_cast<int>(payload.protection));
+			LOGF("FIRST_FRAME_AUDIT SYSAV_96M_DIRECT_PROTECTION"
+			     " ioctl=0xc018800f phys=0x%016" PRIx64 " len=0x%016" PRIx64 " prot=0x%08x"
+			     " result=0x%08x\n",
+			     payload.physical_offset, payload.length, payload.protection,
+			     static_cast<uint32_t>(rc));
+			return rc;
+		}
+		if (request == 0x4008800au) {
+			if (!NativeDceReadable(reinterpret_cast<uint64_t>(arg), sizeof(uint64_t), true) ||
+			    !NativeDceGuestFrameMapped(reinterpret_cast<uint64_t>(arg), sizeof(uint64_t))) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			const uint64_t actual_guest_direct_memory_size = Memory::KernelGetDirectMemorySize();
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(uint64_t));
+			std::memcpy(arg, &actual_guest_direct_memory_size, sizeof(uint64_t));
+			return OK;
+		}
+		if (request == 0xc0288001u) {
+			if (!NativeDceReadable(reinterpret_cast<uint64_t>(arg),
+			                       sizeof(NativeDmemAllocatePayload), true) ||
+			    !NativeDceGuestFrameMapped(reinterpret_cast<uint64_t>(arg),
+			                               sizeof(NativeDmemAllocatePayload))) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			NativeDmemAllocatePayload payload {};
+			std::memcpy(&payload, arg, sizeof(payload));
+			if (payload.reserved != 0 || payload.search_start < 0 ||
+			    payload.search_end <= payload.search_start || payload.length == 0 ||
+			    (payload.length & 0x3fff) != 0 || payload.alignment < 0x4000 ||
+			    (payload.alignment & (payload.alignment - 1)) != 0) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			int64_t   actual_physical_address = 0;
+			const int rc                      = Memory::KernelAllocateDirectMemory(
+			    payload.search_start, payload.search_end, payload.length, payload.alignment,
+			    static_cast<int>(payload.memory_type), &actual_physical_address);
+			if (rc != OK) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DMEM_ALLOC_FAILED"
+				     " length=0x%016" PRIx64 " alignment=0x%016" PRIx64 " guest_error=0x%08x\n",
+				     payload.length, payload.alignment, static_cast<uint32_t>(rc));
+				return rc;
+			}
+			Memory::InvalidateMemory(reinterpret_cast<uint64_t>(arg), sizeof(int64_t));
+			std::memcpy(arg, &actual_physical_address, sizeof(int64_t));
+			LOGF("FIRST_FRAME_AUDIT SYSAV_DMEM_ALLOCATED"
+			     " direct_memory phys=0x%016" PRIx64 " length=0x%016" PRIx64
+			     " alignment=0x%016" PRIx64 " type=%u\n",
+			     static_cast<uint64_t>(actual_physical_address), payload.length, payload.alignment,
+			     payload.memory_type);
+			return OK;
+		}
+		return KERNEL_ERROR_ENOTTY;
+	}
+	if (file->special == SpecialFile::NativeDce) {
+		{
+			Common::LockGuard lock(file->mutex);
+			if (file->native_dce_display_handle >= 0 &&
+			    (file->native_dce_display_generation == 0 ||
+			     VideoOut::VideoOutNativeGetHandleGeneration(file->native_dce_display_handle) !=
+			         file->native_dce_display_generation)) {
+				return KERNEL_ERROR_EINVAL;
+			}
+		}
+		if (request == 0x80208218u && !NativeDceReadable(reinterpret_cast<uint64_t>(arg), 0x20)) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		if (request == 0x80208218u && NativeDceReadable(reinterpret_cast<uint64_t>(arg), 0x20)) {
+			uint64_t original_env[4] {};
+			std::memcpy(original_env, arg, sizeof(original_env));
+			if (static_cast<uint32_t>(original_env[0]) == 1) {
+				const uint32_t port = static_cast<uint32_t>(original_env[0] >> 32);
+				const uint32_t bus  = static_cast<uint32_t>(original_env[1]);
+				if ((original_env[1] >> 32) != 8 || original_env[3] != 0 || port > 6) {
+					return KERNEL_ERROR_EINVAL;
+				}
+				if (port != 1 || bus != 0) return KERNEL_ERROR_ENOTTY;
+				if (!NativeDceReadable(original_env[2], sizeof(uint64_t), true) ||
+				    !NativeDceGuestFrameMapped(original_env[2], sizeof(uint64_t))) {
+					return KERNEL_ERROR_EFAULT;
+				}
+				Common::LockGuard lock(file->mutex);
+				std::lock_guard   clients_lock(g_native_dce_client_mutex);
+				std::string       scope_name;
+				const bool        scoped = Process::GetScope(&scope_name);
+				if (!scoped) scope_name.clear();
+				auto& ports = g_native_dce_clients[scope_name];
+				if (!ports[port].expired()) return KERNEL_ERROR_EBUSY;
+				auto      client = std::make_shared<NativeDceClient>();
+				const int rc     = Memory::MapOwnedFlexibleMemory(
+				    &client->shared, 0x4000, "SceVideoOutClient", &client->memory_token);
+				if (rc != OK) return rc;
+				// 13.60 +0xbf085c clears each 0x200-byte shared slot; +0x4dce70 exposes 0x170
+				// bytes.
+				std::memset(client->shared, 0, 0x200);
+				client->pid  = Process::GetPid();
+				client->port = port;
+				client->bus  = bus;
+				if (scoped) {
+					auto& view = g_native_dce_scopes[scope_name];
+					if (view == nullptr) view = NativeDceScope::Open(scope_name);
+					if (view == nullptr) return KERNEL_ERROR_EIO;
+					const int result = view->Acquire(client->pid, port, bus, &client->lease);
+					if (result != OK) return result;
+					client->scope  = view;
+					client->cookie = client->lease.cookie;
+				} else {
+					client->cookie =
+					    static_cast<uint32_t>(g_native_dce_client_sequence++ & 0x7fffffffu) ^
+					    0x2babcdcdu;
+				}
+				const uint64_t cookie = client->cookie;
+				file->native_dce_clients.push_back(client);
+				ports[port] = client;
+				Memory::InvalidateMemory(original_env[2], sizeof(cookie));
+				std::memcpy(reinterpret_cast<void*>(original_env[2]), &cookie, sizeof(cookie));
+				LOGF("NATIVE_DCE_CLIENT_CREATED pid=%d fd=%d port=%u bus=%u cookie=0x%x"
+				     " shared_bytes=0x170 scope_shared_lease=%u owner_host_pid=%u"
+				     " owner_host_created=%" PRIu64 " lease_generation=%" PRIu64 "\n",
+				     client->pid, d, port, bus, client->cookie, scoped ? 1u : 0u,
+				     client->lease.host_pid, client->lease.host_created, client->lease.generation);
+				return OK;
+			}
+		}
+		if (request == 0x80208218u && NativeDceReadable(reinterpret_cast<uint64_t>(arg), 0x20)) {
+			uint64_t env[4] {};
+			std::memcpy(env, arg, sizeof(env));
+			if (env[0] == 10 && (env[1] >> 32u) == 0x54 && NativeDceReadable(env[2], 0x54)) {
+				uint32_t f[21] {};
+				std::memcpy(f, reinterpret_cast<const void*>(env[2]), sizeof(f));
+				if (f[7] == 1920 && f[8] == 1080) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_1080P_DCE_FULL_INPUT"
+					     " fields00to07=%u,%u,%u,%u,%u,%u,%u,%u"
+					     " fields08to15=%u,%u,%u,%u,%u,%u,%u,%u"
+					     " fields16to20=%u,%u,%u,%u,%u"
+					     "\n",
+					     f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11],
+					     f[12], f[13], f[14], f[15], f[16], f[17], f[18], f[19], f[20]);
+				}
+			}
+		}
+		if (request == 0x80208218u && NativeDceReadable(reinterpret_cast<uint64_t>(arg), 0x20)) {
+			static std::atomic<uint32_t> display_queries {0};
+			if (display_queries.fetch_add(1) < 8) {
+				uint64_t guest_words[4] {};
+				std::memcpy(guest_words, arg, sizeof(guest_words));
+				if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_VERBOSE_DCE_PAYLOAD") != nullptr)
+					LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_CONTROL_INPUT"
+					     " request=0x80208218"
+					     " words=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
+					     guest_words[0], guest_words[1], guest_words[2], guest_words[3]);
+				const uint32_t payload_size = static_cast<uint32_t>(guest_words[1] >> 32);
+				if ((guest_words[0] == 10 && payload_size == 0x54) ||
+				    (guest_words[0] == 12 && payload_size == 0x14)) {
+					if (NativeDceReadable(guest_words[2], payload_size)) {
+						uint64_t payload_words[11] {};
+						std::memcpy(payload_words, reinterpret_cast<const void*>(guest_words[2]),
+						            payload_size);
+						if (guest_words[0] == 10 && payload_size == 0x54) {
+							uint32_t fields[21] {};
+							std::memcpy(fields, payload_words, sizeof(fields));
+							float observed_hz = 0.0f;
+							std::memcpy(&observed_hz, &fields[14], sizeof(observed_hz));
+							if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_MODE_TIMING_SUMMARY") != nullptr)
+								LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_MODE_TIMING_CANDIDATE"
+								     " source=DCE_command_10"
+								     " candidate_width=%u candidate_height=%u"
+								     " horizontal_total_minus_1=%u vertical_total_minus_1=%u"
+								     " refresh_millihz_candidate=%u"
+								     " KTY_NATIVE_SPLASH_BUFFER=1920x1080"
+								     "\n",
+								     fields[7], fields[8], fields[5], fields[6],
+								     static_cast<uint32_t>(observed_hz * 1000.0f + 0.5f));
+						}
+						// per-word dump can exhaust the native stack in fmt::buffer::append
+						if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_VERBOSE_DCE_PAYLOAD"))
+							for (uint32_t i = 0; i < (payload_size + 7) / 8; ++i) {
+								LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_DISPLAY_PAYLOAD"
+								     " command=%" PRIu64 " byte_offset=0x%02x"
+								     " word=0x%016" PRIx64 "\n",
+								     guest_words[0], i * 8, payload_words[i]);
+							}
+					}
+				}
+			}
+		}
 	}
 	if (file->special == SpecialFile::GcDiagnostic) {
 		if (request != 0xc0048118u && request != 0xc004812eu) {

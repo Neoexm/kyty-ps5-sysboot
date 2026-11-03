@@ -56,6 +56,8 @@ int  VideoOutNativeRegisterOriginalSplashFlipEvent(LibKernel::EventQueue::Kernel
                                                    uint64_t original_ident, int handle = -1,
                                                    uint64_t expected_generation = 0);
 void VideoOutNativeReleaseClientHandle(int* handle, uint64_t expected_generation);
+// Software display clock; the stored rate gates later DCE mode programming
+int VideoOutNativeProgramDisplayClock(uint32_t requested_rate, uint32_t* applied_rate);
 struct VideoOutNativeTimingSnapshot {
 	uint32_t                 width             = 0;
 	uint32_t                 height            = 0;
@@ -93,6 +95,14 @@ struct VideoOutNativeControllerSnapshot {
 uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle);
 int      VideoOutNativeAcquireSplashHandle(int*      native_display_handle,
                                            uint64_t* native_display_generation);
+int      VideoOutNativeProgramMasterUpdateLock(uint32_t original_port, uint32_t enabled);
+int      VideoOutNativeProgramPixelClock(uint32_t original_port, uint32_t raw_rate_100hz);
+int      VideoOutNativeProgramOtgTiming(uint32_t original_port, const uint32_t* original_registers,
+                                        size_t register_count);
+int      VideoOutNativeProgramOtgControl(uint32_t original_ioctl, uint32_t original_port,
+                                         uint32_t original_value);
+int      VideoOutNativeProgramFormatControl(uint32_t original_ioctl, uint32_t original_port,
+                                            uint32_t original_value);
 // Backend 0, only for the linear 1920x1080 SceSysAvControlSplash buffers.
 int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_index,
                                        uint64_t  original_guest_address,
