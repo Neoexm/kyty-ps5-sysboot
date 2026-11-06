@@ -1241,7 +1241,15 @@ Reply BudgetGetResourceLimit(const SyscallRequest& request) {
 	return BudgetReply(result, 0);
 }
 
+Reply BudgetSet(const SyscallRequest& request) {
+	return BudgetReply(LibKernel::Budget::Set(static_cast<int32_t>(request.args[0])), 0);
+}
 
+Reply BudgetGet(const SyscallRequest&) {
+	int64_t   id     = 0;
+	const int result = LibKernel::Budget::Get(&id);
+	return BudgetReply(result, id);
+}
 
 // 0x2c2 {block}. AppMount::Begin does both the 0x178-byte copyin and the +0xb0 id copyout
 Reply AppMountBegin(const SyscallRequest& request) {
@@ -4898,6 +4906,13 @@ Reply GuestChroot(const SyscallRequest& request) {
 }
 
 
+// sys_budget_get_ptype. XXX: ptype not recoverable from the dump; 2 takes the cmp eax,2 edge to
+// execve unless the budget block marks 0x2000100
+Reply AppBudgetGetPtype(const SyscallRequest& request) {
+	LOGF("SYSCORE_APP_SPAWN budget_get_ptype pid=%d id=0x%" PRIx64 " result=2 provisional=1\n",
+	     LibKernel::Process::GetPid(), request.args[0]);
+	return {2, 0};
+}
 
 struct NativeEventFlag {
 	LibKernel::EventFlag::KernelEventFlag flag;

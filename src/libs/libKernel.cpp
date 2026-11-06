@@ -3839,6 +3839,19 @@ static int SdkVersionByPath(const char* path, uint64_t shift, uint32_t* out, con
 	LOGF("%s path=%s result=0x%x reason=no_procparam\n", tag, path, LibKernel::KERNEL_ERROR_ENOENT);
 	return LibKernel::KERNEL_ERROR_ENOENT;
 }
+// 4P1e01mbenA is sceKernelGetProcessTypeOfBudget (SysCore stub slot 246, called twice from
+// createApp with rdi=[r15+8]). SysCore only takes the NotifyAppStateChanged(1) branch when the
+// result is 0.
+int KYTY_SYSV_ABI KernelGetProcessTypeOfBudget(int32_t pid) {
+	PRINT_NAME();
+	int32_t ptype = 0;
+	if (!LibKernel::Budget::Ptype(pid, &ptype)) {
+		LOGF("PROCESS_TYPE_OF_BUDGET pid=%d result=0x%x\n", pid, LibKernel::KERNEL_ERROR_ESRCH);
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+	LOGF("PROCESS_TYPE_OF_BUDGET pid=%d ptype=%d result=0\n", pid, ptype);
+	return ptype;
+}
 // The budget wrappers below sit on raw 0x238-0x23a, whose handlers put an sce error in the value
 // rather than an errno.
 static int BudgetErrno(const NativeKernelBridge::Reply& reply) {
@@ -3847,6 +3860,78 @@ static int BudgetErrno(const NativeKernelBridge::Reply& reply) {
 		return LibKernel::KernelToPosix(static_cast<int>(reply.value));
 	}
 	return reply.posix_errno;
+}
+int KYTY_SYSV_ABI KernelCreateBudget(int64_t* id, const char* name, uint32_t ptype,
+                                     const void* entries, uint32_t count, void* out_entries) {
+	PRINT_NAME();
+	int error = 0;
+	for (int attempt = 0;; attempt++) {
+		const auto reply = NativeKernelBridge::DispatchSyscall(
+		    {0x238,
+			 {reinterpret_cast<uint64_t>(name), ptype, reinterpret_cast<uint64_t>(entries), count,
+			  reinterpret_cast<uint64_t>(out_entries)}});
+		error = BudgetErrno(reply);
+		if (error == 0) {
+			*id = reply.value;
+			break;
+		}
+		*Posix::GetErrorAddr() = error;
+		if (error != Posix::POSIX_EPERM) break;
+		Common::Thread::SleepMicro(100000);
+		if (attempt == 9) break;
+		LOGF("libkernel: FIXME: Retrying memory space creation.\n");
+	}
+	const int result = error == 0 ? 0 : LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	LOGF("BUDGET_CREATE_EXPORT ptype=%u count=%u result=0x%x id=%" PRId64 " nid=BVafm-M0GNw\n",
+	     ptype, count, result, error == 0 ? *id : -1);
+	return result;
+}
+int KYTY_SYSV_ABI KernelDeleteBudget(int32_t budget) {
+	PRINT_NAME();
+	const int error = BudgetErrno(NativeKernelBridge::DispatchSyscall(
+	    {0x239, {static_cast<uint64_t>(static_cast<int64_t>(budget))}}));
+	if (error != 0) *Posix::GetErrorAddr() = error;
+	const int result = error == 0 ? 0 : LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	LOGF("BUDGET_DELETE_EXPORT id=%d result=0x%x nid=vs+KPSoE7AM\n", budget, result);
+	return result;
+}
+// libkernel_sys +0x46b00: the builtin budget of process type n is id -2-n.
+int KYTY_SYSV_ABI KernelGetResourceLimit(uint32_t ptype, void* entries, int32_t* count) {
+	PRINT_NAME();
+	if (ptype > 4) return LibKernel::KERNEL_ERROR_EINVAL;
+	const int32_t budget = -2 - static_cast<int32_t>(ptype);
+	const int     error  = BudgetErrno(NativeKernelBridge::DispatchSyscall(
+	    {0x23a,
+		 {static_cast<uint64_t>(static_cast<int64_t>(budget)), reinterpret_cast<uint64_t>(entries),
+		  reinterpret_cast<uint64_t>(count)}}));
+	if (error != 0) *Posix::GetErrorAddr() = error;
+	const int result = error == 0 ? 0 : LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	LOGF("BUDGET_RESOURCE_LIMIT_EXPORT ptype=%u result=0x%x nid=S2-4Sh3qnm8\n", ptype, result);
+	return result;
+}
+// libkernel_sys +0x46b40 reads up to 14 entries of the given budget and copies out the first of
+// that kind; none is ENOENT.
+int KYTY_SYSV_ABI KernelGetResourceOne(int32_t budget, uint32_t kind, void* entry) {
+	PRINT_NAME();
+	std::array<uint8_t, 0x18 * 14> entries {};
+	int32_t                        count = 14;
+	const int                      error = BudgetErrno(NativeKernelBridge::DispatchSyscall(
+	    {0x23a,
+		 {static_cast<uint64_t>(static_cast<int64_t>(budget)),
+		  reinterpret_cast<uint64_t>(entries.data()), reinterpret_cast<uint64_t>(&count)}}));
+	if (error != 0) {
+		*Posix::GetErrorAddr() = error;
+		return LibKernel::KERNEL_ERROR_UNKNOWN + error;
+	}
+	for (int32_t i = 0; i < count; i++) {
+		uint32_t found = 0;
+		std::memcpy(&found, entries.data() + 0x18 * i, sizeof(found));
+		if (found == kind) {
+			std::memcpy(entry, entries.data() + 0x18 * i, 0x18);
+			return OK;
+		}
+	}
+	return LibKernel::KERNEL_ERROR_ENOENT;
 }
 // libkernel_sys +0x42820 hands the caller's own 0x178-byte block to raw 0x2c2, so the id goes
 // wherever its +0xb0 points
@@ -4454,6 +4539,19 @@ static int KYTY_SYSV_ABI KernelUnmount(const char* path, int flags) {
 	}
 	return 0;
 }
+// 7NwggrWJ5cA (+0x1a00) is the raw 0x214 wrapper under libSceRegMgr, which reads errno after any
+// nonzero return
+static int KYTY_SYSV_ABI DiagnosticRegMgrCall(uint64_t op, uint64_t reg_id, int32_t* status,
+                                              void* value, size_t size) {
+	const auto reply = NativeKernelBridge::DispatchSyscall(
+	    {0x214,
+		 {op, reg_id, reinterpret_cast<uint64_t>(status), reinterpret_cast<uint64_t>(value),
+		  static_cast<uint64_t>(size)}});
+	if (reply.posix_errno != 0) {
+		*Posix::GetErrorAddr() = reply.posix_errno;
+	}
+	return static_cast<int>(reply.value);
+}
 LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);
@@ -4678,7 +4776,33 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("mqQMh1zPPT8", Posix::fstat);
 
 	LIB_FUNC("z0dtnPxYgtg", chmod);
-	LIB_FUNC("VAzswvTOCzI", FileSystem::KernelUnlink);
+	LIB_FUNC("W8f1adVl+48", chmod);
+	LIB_FUNC("Xj9nET9tctI", KernelGetSpecialModelFlag);
+	LIB_FUNC("a9683+DNj84", KernelIsEcoChargeAvailable);
+	LIB_FUNC("X0HkB92+NRE", KernelIsAuthenticTrinity);
+	LIB_FUNC("7siOfIbbg8I", KernelGetCurrentFanDuty);
+	LIB_FUNC("CA5jcDb2vYI", KernelGetSocPowerConsumption);
+	LIB_FUNC("igMefp4SAv0", KernelGetAuthinfo);
+	LIB_FUNC("G-MYv5erXaU", KernelGetAppInfo);
+	LIB_FUNC("d7xu4QDJw8Q", KernelGetAppInfo2);
+	LIB_FUNC("HRDq-RDIGmI", KernelBeginAppMount2);
+	LIB_FUNC("H69MYqpNjCc", KernelBeginAppMount);
+	LIB_FUNC("CYIzY6OXyAs", KernelEndAppMount2);
+	LIB_FUNC("QU57kCwF81U", KernelSetAppState);
+	LIB_FUNC("WYCNbP+Q9kc", KernelGetAppState);
+	LIB_FUNC("zsMzX135ofU", KernelGetAppInfoByAppId);
+	LIB_FUNC("4P1e01mbenA", KernelGetProcessTypeOfBudget);
+	LIB_FUNC("fh-Bb3wl0Vs", KernelGetAppCategoryTypeByAppId);
+	LIB_FUNC("BVafm-M0GNw", KernelCreateBudget);
+	LIB_FUNC("vs+KPSoE7AM", KernelDeleteBudget);
+	LIB_FUNC("S2-4Sh3qnm8", KernelGetResourceLimit);
+	LIB_FUNC("TQxbrxPdIxU", KernelGetResourceOne);
+	LIB_FUNC("TUZlvaB9rlg", KernelGetAppInfoBit);
+	LIB_FUNC("GGeRJk1XdWc", KernelQueryAppClassification);
+	LIB_FUNC("+xy9ORMbd8U", KernelGetAppCategoryType);
+	LIB_FUNC("fUJRLEbJOuQ", KernelGetProcessName);
+	LIB_FUNC("VAzswvTOCzI", Posix::unlink);
+	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
 	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
 	LIB_FUNC("bY-PO6JhzhQ", FileSystem::KernelClose);

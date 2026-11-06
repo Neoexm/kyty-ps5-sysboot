@@ -22,6 +22,7 @@
 #endif
 
 namespace Libs::LibKernel::Budget {
+
 // Id table K+0x3684bb8, 5 x 15 pools K+0x36844b0, builtin slots K+0x1ae69a0, per-proc
 // p+0x5cc/p+0x5d0/p+0xb4 bit 0x80. One section per guest scope, like appMount.cpp.
 struct ScopeBudgets {
@@ -63,6 +64,7 @@ struct ScopeBudgets {
 	Object   objects[MaxBudgets];
 	Proc     procs[MaxProcs];
 };
+
 struct BudgetContext {
 	ScopeBudgets* table = nullptr;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -75,10 +77,15 @@ struct BudgetContext {
 	}
 #endif
 };
+
 static Common::Mutex                                         g_mutex;
 static ScopeBudgets                                          g_local {};
 static std::map<std::string, std::unique_ptr<BudgetContext>> g_contexts;
+
 namespace {
+
+constexpr uint64_t ShellCoreAuthority = 0x4800000000000010ull;
+
 // K+0x5a8740 init immediates, [ptype][kind]; ptype 2 kind 1 isn't one
 constexpr uint64_t DefaultLimits[5][15] = {
     {0, 0, 0, 0, 0x1fff, 0x102, 0x80, 0x100, 0x100, 0x100, 0x200, 0x100, 0, 0, 0x4e20},
@@ -92,6 +99,10 @@ constexpr uint64_t DefaultLimits[5][15] = {
 bool Counted(uint32_t unit) {
 	return (unit & 5) == 1;
 }
+bool Bitmask(uint32_t unit) {
+	return (~unit & 6) == 0;
+}
+
 bool ParseDecimal(const char* text, uint64_t* value) {
 	if (text == nullptr || *text == '\0' || std::strlen(text) > 20) return false;
 	uint64_t result = 0;
@@ -104,6 +115,7 @@ bool ParseDecimal(const char* text, uint64_t* value) {
 	*value = result;
 	return true;
 }
+
 // K+0x3d0ae0 sets ptype 2 kind 1 from boot-time region bounds; supplied as kind:unit:limit plus a
 // sha256.
 void LoadSystemDmem(ScopeBudgets* table) {
@@ -142,6 +154,16 @@ void LoadSystemDmem(ScopeBudgets* table) {
 	     " evidence_sha256=%s\n",
 	     pool.unit, limit, evidence);
 }
+
+int32_t AllocateId(ScopeBudgets& table) {
+	const uint32_t index = table.next_id;
+	if (index >= ScopeBudgets::MaxIds) return -1;
+	auto& entry   = table.ids[index];
+	table.next_id = entry.state == 0 ? index + 1 : entry.link;
+	entry.state   = 2;
+	return static_cast<int32_t>(((entry.generation << 13) | index) & 0xffff);
+}
+
 void RemoveId(ScopeBudgets& table, int32_t id) {
 	const uint32_t index = static_cast<uint32_t>(id) & 0x1fff;
 	auto&          entry = table.ids[index];
@@ -150,6 +172,7 @@ void RemoveId(ScopeBudgets& table, int32_t id) {
 	table.next_id        = index;
 	++entry.generation;
 }
+
 void Initialize(ScopeBudgets* table) {
 	table->signature = ScopeBudgets::Signature;
 	for (uint32_t ptype = 0; ptype != 5; ++ptype) {
@@ -162,6 +185,7 @@ void Initialize(ScopeBudgets* table) {
 	table->builtin[1] = -1;
 	LoadSystemDmem(table);
 }
+
 BudgetContext* GetContext() {
 	std::string scope;
 	if (!Process::GetScope(&scope)) {
@@ -199,6 +223,7 @@ BudgetContext* GetContext() {
 	return nullptr;
 #endif
 }
+
 class TableLock {
 public:
 	TableLock() {
@@ -233,6 +258,7 @@ public:
 #endif
 	KYTY_CLASS_NO_COPY(TableLock);
 };
+
 // K+0x608f90 tests cred caps0 bit 62; ENOSYS while the bit is unknown
 const char* Gate(const AuthInfo::AuthorizationFacts& facts) {
 	if (!facts.has_authority || (facts.known_capability0 & (1ull << 62)) == 0)
@@ -240,6 +266,11 @@ const char* Gate(const AuthInfo::AuthorizationFacts& facts) {
 	if ((facts.capability0 & (1ull << 62)) == 0) return "capability62_clear";
 	return nullptr;
 }
+
+bool IsShellCore(const AuthInfo::AuthorizationFacts& facts) {
+	return facts.has_authority && facts.authority_id == ShellCoreAuthority;
+}
+
 ScopeBudgets::Object* Lookup(ScopeBudgets& table, int32_t id) {
 	if (id < 0 || id > 0xffff) return nullptr;
 	const uint32_t index = static_cast<uint32_t>(id) & 0x1fff;
@@ -252,12 +283,14 @@ ScopeBudgets::Object* Lookup(ScopeBudgets& table, int32_t id) {
 	}
 	return nullptr;
 }
+
 ScopeBudgets::Proc* FindProc(ScopeBudgets& table, int pid) {
 	for (auto& proc: table.procs) {
 		if (proc.used && proc.pid == pid) return &proc;
 	}
 	return nullptr;
 }
+
 // proc ctor values, p+0x5cc = p+0x5d0 = -1
 ScopeBudgets::Proc* GetProc(ScopeBudgets& table, int pid) {
 	if (auto* proc = FindProc(table, pid)) return proc;
@@ -270,6 +303,7 @@ ScopeBudgets::Proc* GetProc(ScopeBudgets& table, int pid) {
 	LOGF("BUDGET_PROC_TABLE_FULL pid=%d slots=%u\n", pid, ScopeBudgets::MaxProcs);
 	return nullptr;
 }
+
 // K+0x5a7200 / K+0x5a7530. Rejected entries have a negative unit.
 void Release(ScopeBudgets& table, uint32_t ptype, const Entry* entries, uint32_t count) {
 	for (uint32_t i = 0; i != count; ++i) {
@@ -278,11 +312,50 @@ void Release(ScopeBudgets& table, uint32_t ptype, const Entry* entries, uint32_t
 		if (Counted(pool.unit)) pool.used -= entries[i].limit;
 	}
 }
+
 void Free(ScopeBudgets& table, ScopeBudgets::Object& object) {
 	Release(table, object.ptype, object.entries, object.count);
 	RemoveId(table, object.id);
 	object.used = false;
 }
+
+// K+0x5a7080.
+int Reserve(ScopeBudgets& table, uint32_t ptype, const Entry* in, uint32_t count, Entry* out) {
+	uint32_t seen  = 0;
+	int      error = 0;
+	for (uint32_t i = 0; i != count; ++i) {
+		const uint32_t kind = in[i].kind;
+		out[i].kind         = kind;
+		if (kind - 1 >= 14) {
+			out[i].unit = 0x82000000;
+			if (kind != 0) error = 1;
+			continue;
+		}
+		if ((seen & (1u << kind)) != 0) {
+			out[i].unit = 0x82000000;
+			error       = 1;
+			continue;
+		}
+		auto& pool  = table.pools[ptype][kind];
+		out[i].unit = pool.unit;
+		if (Counted(pool.unit)) {
+			if (pool.limit - pool.used < in[i].limit) {
+				out[i].unit = 0x81000000;
+				error       = 1;
+			} else {
+				pool.used += in[i].limit;
+			}
+		} else if (Bitmask(pool.unit) && (in[i].limit & ~pool.limit) != 0) {
+			out[i].unit = 0x81000000;
+			error       = 1;
+		}
+		seen |= 1u << kind;
+		out[i].limit = in[i].limit;
+		out[i].used  = 0;
+	}
+	return error;
+}
+
 // K+0x5a7b50.
 void Detach(ScopeBudgets& table, ScopeBudgets::Proc& proc) {
 	if (proc.budget != -1) {
@@ -292,7 +365,326 @@ void Detach(ScopeBudgets& table, ScopeBudgets::Proc& proc) {
 	}
 	proc.budget = -1;
 }
+
 } // namespace
+
+int Create(bool has_name, uint32_t ptype, uint32_t count, const NameIn& name_in,
+           const EntriesIn& entries_in, const EntriesOut& entries_out, int64_t* retval) {
+	const auto  facts   = Process::GetCurrentAuthorizationFacts();
+	const int   pid     = Process::GetPid();
+	const char* outcome = Gate(facts);
+	int         result  = outcome == nullptr ? 0 : Posix::POSIX_ENOSYS;
+	std::string name;
+	if (outcome == nullptr && (ptype > 4 || count > 14 || !has_name)) {
+		result  = Posix::POSIX_EINVAL;
+		outcome = "invalid_argument";
+	}
+	if (outcome == nullptr && IsShellCore(facts)) {
+		*retval = 0x7fffdead;
+		outcome = "shellcore_authority";
+	}
+	Entry in[14] {};
+	Entry out[14] {};
+	if (outcome == nullptr) {
+		result = name_in(&name);
+		if (result == 0) result = entries_in(in, count);
+		if (result != 0) outcome = "copyin_failed";
+	}
+	if (outcome == nullptr) {
+		TableLock lock;
+		if (lock.table == nullptr) {
+			result  = Posix::POSIX_ENOSYS;
+			outcome = "no_budget_state";
+		} else {
+			auto& table = *lock.table;
+			bool  kind1 = false;
+			for (uint32_t i = 0; i != count; ++i)
+				kind1 = kind1 || in[i].kind == 1;
+			uint32_t used = 0;
+			for (const auto& object: table.objects)
+				used += object.used ? 1 : 0;
+			if (ptype == 2 && kind1 && !table.system_dmem_measured) {
+				result  = Posix::POSIX_ENOSYS;
+				outcome = "system_dmem_unmeasured";
+			} else if (used == ScopeBudgets::MaxBudgets) {
+				// no kernel cap below the id table, this one is ours
+				result  = Posix::POSIX_ENOSYS;
+				outcome = "model_object_capacity";
+			} else if (Reserve(table, ptype, in, count, out) != 0) {
+				Release(table, ptype, out, count);
+				const int copied = entries_out(out, count);
+				result           = copied != 0 ? copied : Posix::POSIX_EPERM;
+				outcome          = "reserve_failed";
+			} else if ((result = entries_out(out, count)) != 0) {
+				Release(table, ptype, out, count);
+				outcome = "copyout_failed";
+			} else {
+				const int32_t id = AllocateId(table);
+				if (id == -1) {
+					Release(table, ptype, out, count);
+					result  = Posix::POSIX_EAGAIN;
+					outcome = "id_table_full";
+				} else {
+					auto* object = table.objects;
+					while (object->used)
+						++object;
+					*object       = {};
+					object->used  = true;
+					object->id    = id;
+					object->ptype = ptype;
+					object->count = count;
+					std::strncpy(object->name, name.c_str(), sizeof(object->name) - 1);
+					std::memcpy(object->entries, out, sizeof(Entry) * count);
+					*retval = id;
+					outcome = "created";
+				}
+			}
+		}
+	}
+	static std::atomic<uint32_t> traces {0};
+	if (traces.fetch_add(1) < 16) {
+		LOGF("BUDGET_CREATE pid=%d name=\"%.31s\" ptype=%u count=%u outcome=%s errno=%d id=%" PRId64
+		     "\n",
+		     pid, name.c_str(), ptype, count, outcome, result, result == 0 ? *retval : -1);
+	}
+	return result;
+}
+
+int Delete(int32_t id, int64_t* retval) {
+	const auto  facts   = Process::GetCurrentAuthorizationFacts();
+	const int   pid     = Process::GetPid();
+	const char* outcome = Gate(facts);
+	int         result  = Posix::POSIX_ENOSYS;
+	if (outcome == nullptr && IsShellCore(facts)) {
+		result  = 0;
+		outcome = "shellcore_authority";
+	} else if (outcome == nullptr) {
+		TableLock lock;
+		auto*     proc = lock.table != nullptr ? FindProc(*lock.table, pid) : nullptr;
+		if (lock.table == nullptr) {
+			outcome = "no_budget_state";
+		} else if (id == 0 && proc != nullptr && proc->zero_set) {
+			// td+0x3a8 bit 4 sends id 0 down K+0x5a7436, whose tail is not decoded.
+			outcome = "zero_set_path_unmodeled";
+		} else if (auto* object = Lookup(*lock.table, id)) {
+			object->deleted = 1;
+			if (object->refcount <= 0) Free(*lock.table, *object);
+			result  = 0;
+			outcome = "deleted";
+		} else {
+			result  = Posix::POSIX_ESRCH;
+			outcome = "no_budget_object";
+		}
+	}
+	if (result == 0) *retval = 0;
+	static std::atomic<uint32_t> traces {0};
+	if (traces.fetch_add(1) < 16) {
+		LOGF("BUDGET_DELETE pid=%d id=%d outcome=%s errno=%d\n", pid, id, outcome, result);
+	}
+	return result;
+}
+
+int GetResourceLimit(int32_t id, const std::function<int(int32_t*)>& count_in,
+                     const EntriesOut& entries_out, const std::function<int(int32_t)>& count_out) {
+	const auto  facts   = Process::GetCurrentAuthorizationFacts();
+	const char* outcome = Gate(facts);
+	int32_t     count   = 0;
+	int         result  = Posix::POSIX_ENOSYS;
+	Entry       entries[14] {};
+	uint32_t    n = 0;
+	if (outcome == nullptr) {
+		result = count_in(&count);
+		if (result != 0) {
+			outcome = "copyin_failed";
+		} else if (count <= 0) {
+			result  = Posix::POSIX_EINVAL;
+			outcome = "invalid_count";
+		}
+	}
+	if (outcome == nullptr) {
+		TableLock lock;
+		if (lock.table == nullptr) {
+			result  = Posix::POSIX_ENOSYS;
+			outcome = "no_budget_state";
+		} else if (const auto* object = Lookup(*lock.table, id)) {
+			n       = std::min(static_cast<uint32_t>(count), object->count);
+			result  = 0;
+			outcome = "object";
+			for (uint32_t i = 0; i != n; ++i) {
+				// Kinds 1..3 report used from K+0x2c5bc0(ptype), which is not decoded.
+				if (object->entries[i].kind - 1 < 3) {
+					result  = Posix::POSIX_ENOSYS;
+					outcome = "object_memory_used_unmodeled";
+				}
+				entries[i] = object->entries[i];
+			}
+		} else if (id >= -6 && id <= -2) {
+			const uint32_t ptype = static_cast<uint32_t>(-2 - id);
+			n                    = std::min(static_cast<uint32_t>(count), 14u);
+			for (uint32_t i = 0; i != n; ++i) {
+				const auto& pool = lock.table->pools[ptype][i + 1];
+				entries[i]       = {pool.kind, pool.unit, pool.limit, 0};
+			}
+			if (ptype == 2 && !lock.table->system_dmem_measured) {
+				result  = Posix::POSIX_ENOSYS;
+				outcome = "system_dmem_unmeasured";
+			} else {
+				result  = 0;
+				outcome = "pool";
+			}
+		} else {
+			result  = Posix::POSIX_ESRCH;
+			outcome = "no_budget_object";
+		}
+	}
+	if (result == 0) {
+		result = entries_out(entries, n);
+		if (result == 0) result = count_out(static_cast<int32_t>(n));
+	}
+	static std::atomic<uint32_t> traces {0};
+	if (traces.fetch_add(1) < 16) {
+		LOGF("BUDGET_GET_RESOURCE_LIMIT pid=%d id=%d count=%d returned=%u outcome=%s errno=%d\n",
+		     Process::GetPid(), id, count, n, outcome, result);
+	}
+	return result;
+}
+
+int Set(int32_t id) {
+	const auto facts = Process::GetCurrentAuthorizationFacts();
+	const int  pid   = Process::GetPid();
+	// K+0x37eff0 refuses multi-threaded processes; only an rfork child is known single-threaded
+	const bool  single_thread = Process::IsRforkChildThread();
+	const char* outcome       = Gate(facts);
+	int         result        = Posix::POSIX_ENOSYS;
+	int32_t     previous      = -1;
+	if (outcome == nullptr) {
+		TableLock lock;
+		auto*     proc = lock.table != nullptr ? GetProc(*lock.table, pid) : nullptr;
+		if (proc == nullptr) {
+			outcome = "no_budget_state";
+		} else if (proc->set_once) {
+			result  = Posix::POSIX_EALREADY;
+			outcome = "already_set";
+		} else if (Lookup(*lock.table, id) != nullptr && !single_thread) {
+			outcome = "thread_count_unmodeled";
+		} else {
+			// set before the lookup, so a failed lookup still uses up the one set
+			proc->set_once = true;
+			proc->zero_set = id == 0;
+			previous       = proc->budget;
+			Detach(*lock.table, *proc);
+			if (auto* object = Lookup(*lock.table, id)) {
+				++object->refcount;
+				proc->budget = id;
+				proc->ptype  = object->ptype == 4 ? 0 : static_cast<int32_t>(object->ptype);
+				result       = 0;
+				outcome      = "attached";
+			} else {
+				result  = Posix::POSIX_ESRCH;
+				outcome = "no_budget_object";
+			}
+		}
+	}
+	static std::atomic<uint32_t> traces {0};
+	if (traces.fetch_add(1) < 16) {
+		LOGF("BUDGET_SET pid=%d authority=0x%016" PRIx64 " id=%d previous=%d outcome=%s errno=%d\n",
+		     pid, facts.authority_id, id, previous, outcome, result);
+	}
+	return result;
+}
+
+int Get(int64_t* retval) {
+	const auto  facts   = Process::GetCurrentAuthorizationFacts();
+	const int   pid     = Process::GetPid();
+	const char* outcome = Gate(facts);
+	int         result  = Posix::POSIX_ENOSYS;
+	if (outcome == nullptr && IsShellCore(facts)) {
+		// K+0x5a7f20, before p+0x5cc is read
+		*retval = 0x7fffdead;
+		result  = 0;
+		outcome = "shellcore_authority";
+	} else if (outcome == nullptr) {
+		TableLock   lock;
+		const auto* proc = lock.table != nullptr ? FindProc(*lock.table, pid) : nullptr;
+		if (lock.table == nullptr) {
+			outcome = "no_budget_state";
+		} else if (proc == nullptr || proc->budget == -1) {
+			result  = Posix::POSIX_ENOENT;
+			outcome = "no_budget_attached";
+		} else {
+			*retval = proc->budget;
+			result  = 0;
+			outcome = "attached";
+		}
+	}
+	static std::atomic<uint32_t> traces {0};
+	if (traces.fetch_add(1) < 16) {
+		LOGF("BUDGET_GET pid=%d authority=0x%016" PRIx64 " outcome=%s errno=%d id=%" PRId64 "\n",
+		     pid, facts.authority_id, outcome, result, result == 0 ? *retval : -1);
+	}
+	return result;
+}
+
+int Builtin(uint32_t index, uint64_t old_len, uint64_t new_len,
+            const std::function<int(int64_t)>& out, const std::function<int(int64_t*)>& in) {
+	const auto  facts   = Process::GetCurrentAuthorizationFacts();
+	const char* outcome = Gate(facts);
+	// K+0x5a9740: EPERM for a clear bit
+	int     result   = outcome == nullptr                                ? 0
+	                   : std::strcmp(outcome, "capability62_clear") == 0 ? Posix::POSIX_EPERM
+	                                                                     : Posix::POSIX_ENOSYS;
+	int64_t value    = -1;
+	int32_t previous = -1;
+	if (outcome == nullptr && index > 1) {
+		result  = Posix::POSIX_EINVAL;
+		outcome = "invalid_index";
+	}
+	if (outcome == nullptr) {
+		TableLock lock;
+		if (lock.table == nullptr) {
+			result  = Posix::POSIX_ENOSYS;
+			outcome = "no_budget_state";
+		} else {
+			auto& table = *lock.table;
+			auto& slot  = table.builtin[index];
+			previous    = slot;
+			outcome     = "read";
+			if (old_len == 8) result = out(slot);
+			if (result == 0 && new_len == 8) {
+				result  = in(&value);
+				outcome = "written";
+			}
+			if (result == 0 && new_len == 8) {
+				// No deleted check on this release, unlike detach.
+				if (slot != -1) {
+					const int32_t old = slot;
+					slot              = -1;
+					if (auto* object = Lookup(table, old)) {
+						if (--object->refcount <= 0) Free(table, *object);
+					}
+				}
+				const auto id = static_cast<int32_t>(value);
+				if (id != -1) {
+					if (auto* object = Lookup(table, id)) {
+						++object->refcount;
+						slot = id;
+					} else {
+						result  = Posix::POSIX_ESRCH;
+						outcome = "no_budget_object";
+					}
+				}
+			}
+		}
+	}
+	static std::atomic<uint32_t> traces {0};
+	if (traces.fetch_add(1) < 16) {
+		LOGF("BUDGET_BUILTIN pid=%d index=%u previous=%d new=%d outcome=%s errno=%d\n",
+		     Process::GetPid(), index, previous,
+		     new_len == 8 ? static_cast<int32_t>(value) : previous, outcome, result);
+	}
+	return result;
+}
+
 // K+0xcb1b80 and K+0x5a6b00: the child inherits the parent's attachment and ptype but not the
 // set-once bit.
 void Fork(int parent_pid, int child_pid) {
@@ -316,6 +708,7 @@ void Fork(int parent_pid, int child_pid) {
 	LOGF("BUDGET_FORK parent=%d child=%d budget=%d ptype=%d\n", parent_pid, child_pid,
 	     child->budget, ptype);
 }
+
 void Exit(int pid) {
 	TableLock lock;
 	if (lock.table == nullptr) return;
@@ -326,6 +719,7 @@ void Exit(int pid) {
 	proc->used = false;
 	if (budget != -1) LOGF("BUDGET_EXIT pid=%d detached=%d\n", pid, budget);
 }
+
 bool Ptype(int pid, int32_t* ptype) {
 	TableLock lock;
 	if (lock.table == nullptr || ptype == nullptr) return false;
@@ -334,4 +728,5 @@ bool Ptype(int pid, int32_t* ptype) {
 	*ptype = proc->ptype;
 	return true;
 }
+
 } // namespace Libs::LibKernel::Budget

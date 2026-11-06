@@ -310,6 +310,115 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id, uint64_t 
                                                    uint64_t original_rdi,
                                                    uint64_t original_guest_return) {
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
+	if (std::getenv("KYTY_DIAGNOSTIC_FATAL_UNRESOLVED_IMPORT") != nullptr) {
+		const auto* record =
+		    record_id < g_stubbed_imports.size() ? &g_stubbed_imports[record_id] : nullptr;
+		LOGF("UNRESOLVED_IMPORT_FATAL record=%" PRIu64 " symbol=%s program=%s\n", record_id,
+		     record != nullptr ? record->name.c_str() : "<bad-record>",
+		     record != nullptr ? record->program.c_str() : "<unknown>");
+		Log::Flush();
+		std::fflush(stdout);
+		std::quick_exit(321);
+	}
+	if (record_id < g_stubbed_imports.size() &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_CALLSITE_AUDIT") != nullptr) {
+		const auto& record = g_stubbed_imports[record_id];
+		if (record.program.find("SceSysCore.elf") != std::string::npos &&
+		    record.name.rfind("UFKprwxNhT8[", 0) == 0) {
+			static std::atomic_uint32_t count {0};
+			if (count.fetch_add(1) < 12) {
+				LOGF("SYSCORE_REPEATED_UNRESOLVED_CALLSITE"
+				     " symbol=%s guest_return=0x%016" PRIx64 " rdi=0x%016" PRIx64
+				     " rsi=0x%016" PRIx64 " rdx=0x%016" PRIx64 " rcx=0x%016" PRIx64
+				     " r8=0x%016" PRIx64 " r9=0x%016" PRIx64 "\n",
+				     record.name.c_str(), original_guest_return, original_rdi, rsi, rdx, rcx, r8,
+				     r9);
+			}
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_CALLSITE_AUDIT") != nullptr &&
+	    record_id < g_stubbed_imports.size()) {
+		const auto& record   = g_stubbed_imports[record_id];
+		const bool  relevant = record.program.find("SceSysCore.elf") != std::string::npos &&
+		                       (record.name.rfind("OX9wtyjVAJY[", 0) == 0 ||
+		                        record.name.rfind("G0KaQ+fpNWY[", 0) == 0 ||
+		                        record.name.rfind("kDfWvHZH3eM[", 0) == 0);
+		if (relevant) {
+			static std::atomic_uint32_t budget_call_count {0};
+			if (budget_call_count.fetch_add(1) < 24) {
+				LOGF("SYSCORE_GUEST_UNRESOLVED_CALLSITE"
+				     " caller=0x%016" PRIx64 " symbol=%s"
+				     " rdi=0x%016" PRIx64 "\n",
+				     original_guest_return, record.name.c_str(), original_rdi);
+			}
+		}
+	}
+	if (record_id < g_stubbed_imports.size() &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_PRINTF_FAULT") != nullptr) {
+		const auto& record = g_stubbed_imports[record_id];
+		if (record.name.rfind("cjt-4ySmYTs[", 0) == 0) {
+			static std::atomic_uint32_t fork_calls {0};
+			const uint32_t              number = fork_calls.fetch_add(1);
+			if (number < 24) {
+				LOGF("SYSCORE_FORK_UNRESOLVED_CALL index=%u guest_return=%p"
+				     " importer=%s\n",
+				     number, __builtin_return_address(0), record.program.c_str());
+			}
+		}
+	}
+	if (record_id < g_stubbed_imports.size() &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr) {
+		const auto& record = g_stubbed_imports[record_id];
+		if (record.program.find("SceSysCore.elf") != std::string::npos &&
+		    record.name.find("[libkernel_devtoollog") == std::string::npos) {
+			if (record.name.find("OX9wtyjVAJY[") == 0) {
+				static std::atomic_uint32_t budget_count {0};
+				if (budget_count.fetch_add(1) < 5) {
+					Libs::LibKernel::Memory::VirtualQueryInfo mem {};
+					uint64_t                                  actual_words[4] {};
+					const bool safe_end = original_rdi <= UINT64_MAX - sizeof(actual_words);
+					const int  rc       = safe_end ? Libs::LibKernel::Memory::KernelVirtualQuery(
+					                                     reinterpret_cast<const void*>(original_rdi), 0,
+					                                     &mem, sizeof(mem))
+					                               : -1;
+					const bool readable = rc == 0 && mem.is_committed &&
+					                      mem.start <= original_rdi &&
+					                      mem.end >= original_rdi + sizeof(actual_words) &&
+					                      (mem.protection & 1u) != 0;
+					if (readable) {
+						std::memcpy(actual_words, reinterpret_cast<const void*>(original_rdi),
+						            sizeof(actual_words));
+					}
+					LOGF("SYSCORE_GET_BUDGET_READ_ONLY caller_guest_out=0x%016" PRIx64
+					     " mapped=%d committed=%d readable=%d"
+					     " words=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 "\n",
+					     original_rdi, rc == 0, rc == 0 && mem.is_committed, readable,
+					     actual_words[0], actual_words[1], actual_words[2], actual_words[3]);
+				}
+			}
+			static std::atomic_uint32_t other_count {0};
+			if (other_count.fetch_add(1) < 96) {
+				LOGF("SYSCORE_UNRESOLVED_IMPORT_ABI total_index=%" PRIu64
+				     " patch_vaddr=0x%016" PRIx64 " symbol=%s"
+				     " rdi=%016" PRIx64 " rsi=%016" PRIx64 " rdx=%016" PRIx64 " rcx=%016" PRIx64
+				     " r8=%016" PRIx64 " r9=%016" PRIx64 "\n",
+				     static_cast<uint64_t>(log_index), record.patch_vaddr, record.name.c_str(),
+				     original_rdi, rsi, rdx, rcx, r8, r9);
+			}
+		}
+	}
+	if (record_id < g_stubbed_imports.size() &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSCORE_DEVTOOLLOG_ABI") != nullptr) {
+		const auto& record = g_stubbed_imports[record_id];
+		if (record.name.find("[libkernel_devtoollog_v1]") != std::string::npos) {
+			static std::atomic_uint32_t abi_count {0};
+			if (abi_count.fetch_add(1) < 24) {
+				LOGF("SYSCORE_DEVTOOLLOG_ABI symbol=%s rdi=%016" PRIx64 " rsi=%016" PRIx64
+				     " rdx=%016" PRIx64 " rcx=%016" PRIx64 " r8=%016" PRIx64 " r9=%016" PRIx64 "\n",
+				     record.name.c_str(), original_rdi, rsi, rdx, rcx, r8, r9);
+			}
+		}
+	}
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
