@@ -37,19 +37,31 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
 #endif
+
+extern "C" KYTY_SYSV_ABI int KytyGuestJumpSaveMask(void* buffer);
+extern "C" KYTY_SYSV_ABI int KytyGuestJumpRestoreMask(void* buffer);
+
 namespace Libs {
 
 namespace LibKernel {
 void KernelDispatchPendingSignalForCurrentThread();
+bool CanAccessCurrentThreadStack(const void* pointer, uint64_t size, bool writable);
 } // namespace LibKernel
 
 namespace Jemspace {
 bool ContainsAllocation(const void* pointer, uint64_t size);
 }
+
+namespace LibcInternalExt {
+void RunThreadAtexitDestructors();
+}
+
 namespace LibC {
 
 LIB_VERSION("libc", 1, "libc", 1, 1);
@@ -59,22 +71,65 @@ static uint32_t g_need_flag = 1;
 using cxa_destructor_func_t = KYTY_SYSV_ABI void (*)(void*);
 using atexit_func_t         = KYTY_SYSV_ABI void (*)();
 
-struct CxaDestructor {
-	cxa_destructor_func_t destructor_func;
-	void*                 destructor_object;
-	void*                 module_id;
+struct ExitCallback {
+	atexit_func_t         exit_func         = nullptr;
+	cxa_destructor_func_t destructor_func   = nullptr;
+	void*                 destructor_object = nullptr;
+	void*                 module_id         = nullptr;
 };
 
 struct CContext {
-	std::list<CxaDestructor> cxa;
-	std::list<atexit_func_t> atexit;
+	std::mutex              exit_mutex;
+	std::list<ExitCallback> exit_callbacks;
 };
+
+static int RegisterExitCallback(const ExitCallback& callback) {
+	auto* cc = Common::Singleton<CContext>::Instance();
+	try {
+		std::lock_guard lock(cc->exit_mutex);
+		cc->exit_callbacks.push_front(callback);
+	} catch (const std::bad_alloc&) {
+		return -1;
+	}
+	return 0;
+}
+
+static void RunExitCallbacks(void* module_id) {
+	auto* cc = Common::Singleton<CContext>::Instance();
+	for (;;) {
+		ExitCallback callback {};
+		{
+			std::lock_guard lock(cc->exit_mutex);
+			auto            next =
+			    std::find_if(cc->exit_callbacks.begin(), cc->exit_callbacks.end(),
+				             [module_id](const ExitCallback& entry) {
+				                 return module_id == nullptr || (entry.destructor_func != nullptr &&
+								                                 entry.module_id == module_id);
+			                 });
+			if (next == cc->exit_callbacks.end()) {
+				return;
+			}
+			callback = *next;
+			cc->exit_callbacks.erase(next);
+		}
+		if (callback.exit_func != nullptr) {
+			LOGF("GUEST_LIBC_EXIT_CALLBACK kind=atexit function=%p module=%p\n",
+			     reinterpret_cast<void*>(callback.exit_func), callback.module_id);
+			callback.exit_func();
+		} else if (callback.destructor_func != nullptr) {
+			LOGF("GUEST_LIBC_EXIT_CALLBACK kind=cxa function=%p module=%p\n",
+			     reinterpret_cast<void*>(callback.destructor_func), callback.module_id);
+			callback.destructor_func(callback.destructor_object);
+		}
+	}
+}
 
 struct InitEnvParams {
 	int         argc;
 	uint32_t    pad;
-	const char* argv[3];
 };
+
+static_assert(sizeof(InitEnvParams) == 8);
 
 static int                g_argc = 0;
 static const char* const* g_argv = nullptr;
@@ -88,10 +143,57 @@ const char** GetArgv() {
 	return const_cast<const char**>(g_argv);
 }
 
+static void dump_exit_context(uint64_t caller, int code) {
+	auto* linker      = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto* program     = linker->FindProgramByAddr(caller);
+	auto  module_name = (program == nullptr ? std::string("<unknown>")
+	                                        : Common::PathToString(program->file_name.filename()));
+	LOGF("GUEST_LIBC_EXIT caller=0x%016" PRIx64 " module=%s base=0x%016" PRIx64
+	     " offset=0x%016" PRIx64 " code=%d\n",
+	     caller, module_name.c_str(), program == nullptr ? 0 : program->base_vaddr,
+	     program == nullptr ? 0 : caller - program->base_vaddr, code);
+	uint64_t rsp = 0;
+	asm volatile("movq %%rsp, %0" : "=r"(rsp));
+	uint64_t readable = 0;
+	Graphics::HostMemoryQueryReadable(rsp, 1024 * 8, readable);
+	int logged = 0;
+	for (int i = 0; static_cast<uint64_t>(i) * 8 + 8 <= readable && logged < 24; i++) {
+		const auto value = *reinterpret_cast<uint64_t*>(rsp + static_cast<uint64_t>(i) * 8);
+		auto*      p     = linker->FindProgramByAddr(value);
+		if (p == nullptr || value == caller) continue;
+		LOGF("  exit frame [rsp%+04x] 0x%016" PRIx64 " -> %s+0x%" PRIx64 "\n", i * 8, value,
+		     Common::PathToString(p->file_name.filename()).c_str(), value - p->base_vaddr);
+		logged++;
+	}
+}
+
 static KYTY_SYSV_ABI void exit(int code) {
 	PRINT_NAME();
-
-	::exit(code);
+	const int guest_pid = LibKernel::Process::GetPid();
+	dump_exit_context(reinterpret_cast<uint64_t>(__builtin_return_address(0)), code);
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LIVE_RFORK_THREAD") != nullptr &&
+	    LibKernel::Process::IsTrackedRforkChild(guest_pid) &&
+	    LibKernel::PthreadSelfOrNull() != nullptr) {
+		LOGF("SYSCORE_GUEST_CHILD_LIBC_EXIT"
+		     " guest_pid=%d exit_code=%d"
+		     " terminating_only_child_thread"
+		     " parent_and_other_guest_threads_preserved\n",
+		     guest_pid, code);
+		LibKernel::PthreadExit(
+		    reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<uint32_t>(code))));
+		EXIT("guest child libc exit unexpectedly returned\n");
+	}
+	LibcInternalExt::RunThreadAtexitDestructors();
+	RunExitCallbacks(nullptr);
+	const auto status = static_cast<uint32_t>(code) & 0xffu;
+	if (LibKernel::Process::IsExecChild()) {
+		LibKernel::Process::RecordExecChildExitStatus(status << 8u);
+		LOGF("GUEST_EXEC_LIBC_EXIT guest_pid=%d guest_exit_status=%u "
+		     "terminating_single_guest_host=1\n",
+		     guest_pid, status);
+	}
+	std::fflush(nullptr);
+	std::quick_exit(static_cast<int>(status));
 }
 
 static void PrintAbortStringCandidate(const char* name, uint64_t addr) {
@@ -287,13 +389,18 @@ static KYTY_SYSV_ABI void init_env(const InitEnvParams* params) {
 		return;
 	}
 
-	constexpr int argv_capacity = static_cast<int>(sizeof(params->argv) / sizeof(params->argv[0]));
-
-	EXIT_NOT_IMPLEMENTED(params->argc < 0 || params->argc >= argv_capacity);
+	EXIT_NOT_IMPLEMENTED(!Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(params),
+	                                                          sizeof(InitEnvParams)));
+	EXIT_NOT_IMPLEMENTED(params->argc < 0);
+	const auto*    argv      = reinterpret_cast<const char* const*>(params + 1);
+	const uint64_t argv_size = (static_cast<uint64_t>(params->argc) + 2u) * sizeof(*argv);
+	EXIT_NOT_IMPLEMENTED(
+	    !Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(argv), argv_size));
+	EXIT_NOT_IMPLEMENTED(argv[params->argc] != nullptr);
 
 	g_argc = params->argc;
-	g_argv = params->argv;
-	g_envp = params->argv + params->argc + 1;
+	g_argv = argv;
+	g_envp = argv + params->argc + 1;
 
 	LOGF("\t argc = %d\n"
 	     "\t argv = 0x%016" PRIx64 "\n"
@@ -309,7 +416,7 @@ static KYTY_SYSV_ABI int atexit(atexit_func_t func) {
 	PRINT_NAME();
 
 	if (func != nullptr) {
-		Common::Singleton<CContext>::Instance()->atexit.push_front(func);
+		return RegisterExitCallback({func, nullptr, nullptr, nullptr});
 	}
 
 	return 0;
@@ -317,6 +424,13 @@ static KYTY_SYSV_ABI int atexit(atexit_func_t func) {
 
 static KYTY_SYSV_ABI int libc_printf(VA_ARGS) {
 	VA_CONTEXT(ctx); // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
+	const auto* format = reinterpret_cast<const char*>(rdi);
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr && format != nullptr &&
+	    std::strstr(format, "[UMD MAIN] launching") != nullptr) {
+		LOGF("SYSCORE_PRINTF_GUEST_CALLER return=%p format_ptr=0x%016" PRIx64
+		     " ret_arg=0x%016" PRIx64 " format=%s\n",
+		     __builtin_return_address(0), rdi, rsi, format);
+	}
 
 	PRINT_NAME();
 
@@ -539,32 +653,13 @@ static KYTY_SYSV_ABI int std_execute_once(int* flag, execute_once_func_t func, v
 static KYTY_SYSV_ABI int cxa_atexit(cxa_destructor_func_t func, void* arg, void* d) {
 	PRINT_NAME();
 
-	auto* cc = Common::Singleton<CContext>::Instance();
-
-	CxaDestructor c {};
-	c.destructor_func   = func;
-	c.destructor_object = arg;
-	c.module_id         = d;
-
-	cc->cxa.push_back(c);
-
-	return 0;
+	return func != nullptr ? RegisterExitCallback({nullptr, func, arg, d}) : 0;
 }
 
 void KYTY_SYSV_ABI cxa_finalize(void* d) {
 	PRINT_NAME();
 
-	auto* cc = Common::Singleton<CContext>::Instance();
-
-	for (auto i = cc->cxa.rbegin(); i != cc->cxa.rend(); ++i) {
-		auto& c = *i;
-		if ((d == nullptr || c.module_id == d) && c.destructor_func != nullptr) {
-			auto* func        = c.destructor_func;
-			auto* object      = c.destructor_object;
-			c.destructor_func = nullptr;
-			func(object);
-		}
-	}
+	RunExitCallbacks(d);
 }
 
 } // namespace LibC
@@ -581,9 +676,31 @@ using thread_atexit_destructor_t = KYTY_SYSV_ABI void (*)(void*);
 struct ThreadAtexitDestructor {
 	thread_atexit_destructor_t destructor;
 	void*                      object;
+	int32_t                    owner;
 };
 
 static thread_local std::vector<ThreadAtexitDestructor> g_thread_atexit_destructors;
+
+static bool HostThreadAtexitCallback(thread_atexit_destructor_t destructor, void* dso) {
+	if (!Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(dso), sizeof(uint32_t)))
+		return false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	MEMORY_BASIC_INFORMATION region {};
+	if (VirtualQuery(reinterpret_cast<const void*>(destructor), &region, sizeof(region)) !=
+	        sizeof(region) ||
+	    region.State != MEM_COMMIT || region.Type != MEM_IMAGE ||
+	    (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+		return false;
+	const auto protection = region.Protect & 0xffu;
+	return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+	       protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+#else
+	Dl_info image {};
+	return Graphics::HostMemoryIsReadable(reinterpret_cast<uint64_t>(destructor)) &&
+	       dladdr(reinterpret_cast<const void*>(destructor), &image) != 0 &&
+	       image.dli_fbase != nullptr;
+#endif
+}
 
 struct Info {
 	uint64_t  size;
@@ -603,10 +720,26 @@ void KYTY_SYSV_ABI LibcHeapGetTraceInfo(Info* info) {
 }
 
 int KYTY_SYSV_ABI LibcInternalExtCxaThreadAtexit(thread_atexit_destructor_t destructor,
-                                                 void* object, void* /*module_id*/) {
+                                                 void* object, void* module_id) {
 	PRINT_NAME();
 
-	g_thread_atexit_destructors.push_back({destructor, object});
+	auto*      linker     = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto dso        = reinterpret_cast<uint64_t>(module_id);
+	bool       mapped_dso = false;
+	const auto owner      = linker->AcquireThreadAtexit(dso, &mapped_dso);
+	if (owner < 0 &&
+	    (mapped_dso ||
+	     linker->FindProgramByAddr(reinterpret_cast<uint64_t>(destructor)) != nullptr ||
+	     !HostThreadAtexitCallback(destructor, module_id))) {
+		return -1;
+	}
+	try {
+		g_thread_atexit_destructors.push_back({destructor, object, owner});
+	} catch (const std::bad_alloc&) {
+		if (owner >= 0) linker->ReleaseThreadAtexit(owner);
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOMEM;
+		return -1;
+	}
 
 	return 0;
 }
@@ -618,6 +751,10 @@ void RunThreadAtexitDestructors() {
 
 		if (destructor.destructor != nullptr) {
 			destructor.destructor(destructor.object);
+		}
+		if (destructor.owner >= 0) {
+			Common::Singleton<Loader::RuntimeLinker>::Instance()->ReleaseThreadAtexit(
+			    destructor.owner);
 		}
 	}
 }
@@ -635,10 +772,283 @@ LIB_VERSION("LibcInternal", 1, "LibcInternal", 1, 1);
 
 static uint32_t g_need_flag = 1;
 
+struct GuestReadStream {
+	explicit GuestReadStream(int descriptor): fd(descriptor) {}
+	int                  fd;
+	std::recursive_mutex mutex;
+	bool                 closed = false;
+	bool                 eof    = false;
+	bool                 error  = false;
+};
+
+static std::mutex                                                  g_read_stream_mutex;
+static std::unordered_map<void*, std::shared_ptr<GuestReadStream>> g_read_streams;
+
+static std::shared_ptr<GuestReadStream> FindReadStream(void* handle) {
+	std::lock_guard lock(g_read_stream_mutex);
+	const auto      found = g_read_streams.find(handle);
+	return found == g_read_streams.end() ? nullptr : found->second;
+}
+
+static int ReadStreamError(int error) {
+	*Posix::GetErrorAddr() = error;
+	return -1;
+}
+
+// native libc FILE* (_Fiopen behind inlined ifstream) reach these too and go back to the native
+// bodies
+static uint64_t g_native_fopen  = 0;
+static uint64_t g_native_fclose = 0;
+static uint64_t g_native_fread  = 0;
+static uint64_t g_native_fseek  = 0;
+static uint64_t g_native_ftell  = 0;
+
+void SetNativeStdioEntries(uint64_t fopen, uint64_t fclose, uint64_t fread, uint64_t fseek,
+                           uint64_t ftell) {
+	g_native_fopen  = fopen;
+	g_native_fclose = fclose;
+	g_native_fread  = fread;
+	g_native_fseek  = fseek;
+	g_native_ftell  = ftell;
+	LOGF("LIBC_NATIVE_STDIO targets fopen=0x%016" PRIx64 " fclose=0x%016" PRIx64
+	     " fread=0x%016" PRIx64 " fseek=0x%016" PRIx64 " ftell=0x%016" PRIx64 "\n",
+	     fopen, fclose, fread, fseek, ftell);
+}
+
+void* KYTY_SYSV_ABI GuestFopen(const char* path, const char* mode) {
+	if (path == nullptr) {
+		ReadStreamError(Posix::POSIX_EFAULT);
+		return nullptr;
+	}
+	if (mode == nullptr || *mode == '\0' || std::strchr("rwa", *mode) == nullptr) {
+		ReadStreamError(Posix::POSIX_EINVAL);
+		return nullptr;
+	}
+	bool binary = false;
+	bool update = false;
+	for (const char* part = mode + 1; *part != '\0'; ++part) {
+		if (*part == 'b' && !binary) {
+			binary = true;
+		} else if (*part == '+' && !update) {
+			update = true;
+		} else {
+			ReadStreamError(Posix::POSIX_EINVAL);
+			return nullptr;
+		}
+	}
+	if (*mode != 'r' || update) {
+		if (g_native_fopen == 0) {
+			ReadStreamError(Posix::POSIX_ENOSYS);
+			return nullptr;
+		}
+		void* native = reinterpret_cast<KYTY_SYSV_ABI void* (*)(const char*, const char*)>(
+		    g_native_fopen)(path, mode);
+		LOGF("GUEST_NATIVE_STDIO_OPEN path=%s mode=%s file=%p errno=%d\n", path, mode, native,
+		     native == nullptr ? *Posix::GetErrorAddr() : 0);
+		return native;
+	}
+	const int descriptor = LibKernel::FileSystem::KernelOpen(path, 0, 0);
+	LOGF("GUEST_READ_STDIO_OPEN path=%s mode=%s fd=%d\n", path, mode, descriptor);
+	if (descriptor < 0) {
+		ReadStreamError(LibKernel::KernelToPosix(descriptor));
+		return nullptr;
+	}
+	try {
+		auto            stream = std::make_shared<GuestReadStream>(descriptor);
+		std::lock_guard lock(g_read_stream_mutex);
+		g_read_streams.emplace(stream.get(), stream);
+		return stream.get();
+	} catch (const std::bad_alloc&) {
+		LibKernel::FileSystem::KernelClose(descriptor);
+		ReadStreamError(Posix::POSIX_ENOMEM);
+		return nullptr;
+	}
+}
+
+int KYTY_SYSV_ABI GuestFclose(void* handle) {
+	auto stream = FindReadStream(handle);
+	if (!stream && g_native_fclose != 0) {
+		return reinterpret_cast<KYTY_SYSV_ABI int (*)(void*)>(g_native_fclose)(handle);
+	}
+	if (!stream) {
+		return ReadStreamError(Posix::POSIX_EBADF);
+	}
+	std::lock_guard stream_lock(stream->mutex);
+	if (stream->closed) {
+		return ReadStreamError(Posix::POSIX_EBADF);
+	}
+	stream->closed = true;
+	{
+		std::lock_guard registry_lock(g_read_stream_mutex);
+		g_read_streams.erase(handle);
+	}
+	const int result = LibKernel::FileSystem::KernelClose(stream->fd);
+	return result < 0 ? ReadStreamError(LibKernel::KernelToPosix(result)) : 0;
+}
+
+size_t KYTY_SYSV_ABI GuestFread(void* destination, size_t size, size_t count, void* handle) {
+	if (FindReadStream(handle) == nullptr && g_native_fread != 0) {
+		using fread_t = KYTY_SYSV_ABI size_t (*)(void*, size_t, size_t, void*);
+		return reinterpret_cast<fread_t>(g_native_fread)(destination, size, count, handle);
+	}
+	if (size == 0 || count == 0) {
+		return 0;
+	}
+	if (count > std::numeric_limits<size_t>::max() / size) {
+		ReadStreamError(Posix::POSIX_EINVAL);
+		return 0;
+	}
+	auto stream = FindReadStream(handle);
+	if (!stream) {
+		ReadStreamError(Posix::POSIX_EBADF);
+		return 0;
+	}
+	std::lock_guard lock(stream->mutex);
+	if (stream->closed) {
+		ReadStreamError(Posix::POSIX_EBADF);
+		return 0;
+	}
+	if (stream->eof) {
+		return 0;
+	}
+	const size_t requested = size * count;
+	if (!LibKernel::Memory::CanWriteGuest(destination, requested) &&
+	    !Jemspace::ContainsAllocation(destination, requested) &&
+	    !LibKernel::CanAccessCurrentThreadStack(destination, requested, true)) {
+		stream->error = true;
+		ReadStreamError(Posix::POSIX_EFAULT);
+		return 0;
+	}
+	size_t consumed = 0;
+	while (consumed < requested) {
+		const size_t chunk =
+		    std::min(requested - consumed, static_cast<size_t>(std::numeric_limits<int>::max()));
+		int           read_error = 0;
+		const int64_t result     = LibKernel::FileSystem::ReadWithStatus(
+		    stream->fd, static_cast<unsigned char*>(destination) + consumed, chunk, &read_error);
+		if (result > 0) consumed += static_cast<size_t>(result);
+		if (read_error != 0 || result < 0) {
+			stream->error = true;
+			ReadStreamError(
+			    LibKernel::KernelToPosix(read_error != 0 ? read_error : static_cast<int>(result)));
+			break;
+		}
+		if (result == 0) {
+			stream->eof = true;
+			break;
+		}
+	}
+	return consumed / size;
+}
+
+int KYTY_SYSV_ABI GuestFseek(void* handle, int64_t offset, int whence) {
+	auto stream = FindReadStream(handle);
+	if (!stream && g_native_fseek != 0) {
+		return reinterpret_cast<KYTY_SYSV_ABI int (*)(void*, int64_t, int)>(g_native_fseek)(
+		    handle, offset, whence);
+	}
+	if (!stream) {
+		return ReadStreamError(Posix::POSIX_EBADF);
+	}
+	std::lock_guard lock(stream->mutex);
+	if (stream->closed) {
+		return ReadStreamError(Posix::POSIX_EBADF);
+	}
+	const int64_t result = LibKernel::FileSystem::KernelLseek(stream->fd, offset, whence);
+	if (result < 0) {
+		return ReadStreamError(LibKernel::KernelToPosix(static_cast<int>(result)));
+	}
+	stream->eof = false;
+	return 0;
+}
+
+int64_t KYTY_SYSV_ABI GuestFtell(void* handle) {
+	auto stream = FindReadStream(handle);
+	if (!stream && g_native_ftell != 0) {
+		return reinterpret_cast<KYTY_SYSV_ABI int64_t (*)(void*)>(g_native_ftell)(handle);
+	}
+	if (!stream) {
+		return ReadStreamError(Posix::POSIX_EBADF);
+	}
+	std::lock_guard lock(stream->mutex);
+	if (stream->closed) {
+		return ReadStreamError(Posix::POSIX_EBADF);
+	}
+	const int64_t result = LibKernel::FileSystem::KernelLseek(stream->fd, 0, 1);
+	return result < 0 ? ReadStreamError(LibKernel::KernelToPosix(static_cast<int>(result)))
+	                  : result;
+}
+
+[[gnu::naked, gnu::returns_twice]] KYTY_SYSV_ABI int GuestSetjmp(void* /*buffer*/) {
+	asm volatile("pushq %rdi\n\t"
+	             "callq KytyGuestJumpSaveMask\n\t"
+	             "popq %rdi\n\t"
+	             "movq (%rsp), %rax\n\t"
+	             "movq %rax, 0(%rdi)\n\t"
+	             "movq %rbx, 8(%rdi)\n\t"
+	             "movq %rsp, 16(%rdi)\n\t"
+	             "movq %rbp, 24(%rdi)\n\t"
+	             "movq %r12, 32(%rdi)\n\t"
+	             "movq %r13, 40(%rdi)\n\t"
+	             "movq %r14, 48(%rdi)\n\t"
+	             "movq %r15, 56(%rdi)\n\t"
+	             "fnstcw 64(%rdi)\n\t"
+	             "stmxcsr 68(%rdi)\n\t"
+	             "xorl %eax, %eax\n\t"
+	             "retq\n");
+}
+
+[[gnu::naked, gnu::noreturn]] KYTY_SYSV_ABI void GuestLongjmp(void* /*buffer*/, int /*value*/) {
+	asm volatile("pushq %rdi\n\t"
+	             "pushq %rsi\n\t"
+	             "subq $8, %rsp\n\t"
+	             "callq KytyGuestJumpRestoreMask\n\t"
+	             "addq $8, %rsp\n\t"
+	             "popq %rsi\n\t"
+	             "popq %rdx\n\t"
+	             "stmxcsr -4(%rsp)\n\t"
+	             "movl 68(%rdx), %eax\n\t"
+	             "andl $0xffffffc0, %eax\n\t"
+	             "movl -4(%rsp), %edi\n\t"
+	             "andl $0x3f, %edi\n\t"
+	             "orl %eax, %edi\n\t"
+	             "movl %edi, -4(%rsp)\n\t"
+	             "ldmxcsr -4(%rsp)\n\t"
+	             "movl %esi, %eax\n\t"
+	             "movq 0(%rdx), %rcx\n\t"
+	             "movq 8(%rdx), %rbx\n\t"
+	             "movq 16(%rdx), %rsp\n\t"
+	             "movq 24(%rdx), %rbp\n\t"
+	             "movq 32(%rdx), %r12\n\t"
+	             "movq 40(%rdx), %r13\n\t"
+	             "movq 48(%rdx), %r14\n\t"
+	             "movq 56(%rdx), %r15\n\t"
+	             "fldcw 64(%rdx)\n\t"
+	             "testl %eax, %eax\n\t"
+	             "jnz 1f\n\t"
+	             "incl %eax\n\t"
+	             "1: movq %rcx, (%rsp)\n\t"
+	             "retq\n");
+}
+
 int KYTY_SYSV_ABI vprintf(const char* str, VaList* c) {
 	PRINT_NAME();
 
-	return GetGuestVprintfFunc()(str, c);
+	if (c == nullptr) {
+		return -1;
+	}
+	VaList    arguments = *c;
+	const int result    = GetGuestVprintfFunc()(str, &arguments);
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_PRINTF_FAULT") != nullptr && str != nullptr &&
+	    std::strstr(str, "SERIAL_PRINT_TIME_TICK") != nullptr) {
+		LOGF("SYSCORE_VPRINTF_VA_LIST_PRESERVED"
+		     " guest_gp_offset=%u formatted_gp_offset=%u"
+		     " guest_fp_offset=%u formatted_fp_offset=%u"
+		     " guest_overflow=%p formatted_overflow=%p\n",
+		     c->gp_offset, arguments.gp_offset, c->fp_offset, arguments.fp_offset,
+		     c->overflow_arg_area, arguments.overflow_arg_area);
+	}
+	return result;
 }
 
 static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
@@ -647,14 +1057,6 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 	PRINT_NAME();
 
 	return GetGuestSnprintfCtxFunc()(&ctx);
-}
-
-int KYTY_SYSV_ABI fflush(FILE* stream) {
-	PRINT_NAME();
-
-	EXIT_NOT_IMPLEMENTED(stream != stdout);
-
-	return ::fflush(stream);
 }
 
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {
@@ -689,6 +1091,30 @@ size_t KYTY_SYSV_ABI strlen(const char* s) {
 
 char* KYTY_SYSV_ABI strcpy(char* dest, const char* src) {
 	return ::strcpy(dest, src);
+}
+
+int KYTY_SYSV_ABI strcpy_s(char* dest, size_t dest_size, const char* src) {
+	if (dest == nullptr || dest_size == 0 || dest_size > 0x2000000000000000ull) {
+		return 22;
+	}
+	if (src == nullptr) {
+		dest[0] = '\0';
+		return 22;
+	}
+	const size_t length = std::strlen(src);
+	if (length >= dest_size) {
+		dest[0] = '\0';
+		return 34;
+	}
+	const auto dest_start = reinterpret_cast<uintptr_t>(dest);
+	const auto src_start  = reinterpret_cast<uintptr_t>(src);
+	if ((dest_start <= src_start && src_start - dest_start <= length) ||
+	    (src_start < dest_start && dest_start - src_start <= length)) {
+		dest[0] = '\0';
+		return 22;
+	}
+	std::memcpy(dest, src, length + 1);
+	return 0;
 }
 
 char* KYTY_SYSV_ABI strncpy(char* dest, const char* src, size_t count) {
@@ -783,20 +1209,26 @@ int KYTY_SYSV_ABI LibcHeapErrorReportForGame(uint64_t msp, uint64_t ptr, uint64_
 
 LIB_DEFINE(InitLibcInternal_1) {
 	LibcInternalExt::InitLibcInternalExt_1(s);
+	LIB_FUNC("xeYO4u7uyJ0", LibcInternal::GuestFopen);
+	LIB_FUNC("uodLYyUip20", LibcInternal::GuestFclose);
+	LIB_FUNC("lbB+UlZqVG0", LibcInternal::GuestFread);
+	LIB_FUNC("rQFVBXp-Cxg", LibcInternal::GuestFseek);
+	LIB_FUNC("Qazy8LmXTvw", LibcInternal::GuestFtell);
+	LIB_FUNC("gNQ1V2vfXDE", LibcInternal::GuestSetjmp);
+	LIB_FUNC("lKEN2IebgJ0", LibcInternal::GuestLongjmp);
 
 	LIB_OBJECT("ZT4ODD2Ts9o", &LibcInternal::g_need_flag);
-	LIB_OBJECT("2sWzhYqFH4E", stdout);
-
 	LIB_FUNC("GMpvxPFW924", LibcInternal::vprintf);
-	LIB_FUNC("MUjC4lbHrK4", LibcInternal::fflush);
 	LIB_FUNC("8zTFvBIAIN8", LibcInternal::memset);
 	LIB_FUNC("Q3VBxCXhUHs", LibcInternal::memcpy);
 	LIB_FUNC("+P6FRGH4LfA", LibcInternal::memmove);
 	LIB_FUNC("DfivPArhucg", LibcInternal::memcmp);
-	LIB_FUNC("aesyjrHVWy4", LibcInternal::strcmp);
-	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strncmp);
+	// aesyjrHVWy4 (+0x148a0) is 3-arg strncmp, Ovb2dSJOAuE (+0x42910) 2-arg strcmp. Swapped, Mono
+	// rejects the BSJB signature.
+	LIB_FUNC("aesyjrHVWy4", LibcInternal::strncmp);
+	LIB_FUNC("Ovb2dSJOAuE", LibcInternal::strcmp);
 	LIB_FUNC("j4ViWNHEgww", LibcInternal::strlen);
-	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy);
+	LIB_FUNC("5Xa2ACNECdo", LibcInternal::strcpy_s);
 	LIB_FUNC("6sJWiWSRuqk", LibcInternal::strncpy);
 	LIB_FUNC("Ls4tzzhimqQ", LibcInternal::strcat);
 	LIB_FUNC("ob5xAW4ln-0", LibcInternal::strchr);

@@ -198,6 +198,7 @@ int KYTY_SYSV_ABI     KernelPipe(int* fds);
 int                   CreateGuestSocketPair(int* fds);
 int KYTY_SYSV_ABI     KernelIoctl(int d, uint64_t request, void* arg);
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
+int64_t               ReadWithStatus(int d, void* buf, size_t nbytes, int* read_error);
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes);
