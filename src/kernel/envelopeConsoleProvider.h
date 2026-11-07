@@ -6,4 +6,13 @@
 #include <memory>
 #include <string>
 
+namespace Libs::LibKernel::EnvelopeSecureProcessor {
+
+ConfigurationStatus CreateConsoleProviderFromEnvironment(std::shared_ptr<EnvelopeBackend>* provider,
+                                                         std::string*                      error);
+ConfigurationStatus CreateConsoleRnpsProviderFromEnvironment(std::shared_ptr<RnpsBackend>* provider,
+                                                             std::string*                  error);
+
+} // namespace Libs::LibKernel::EnvelopeSecureProcessor
+
 #endif

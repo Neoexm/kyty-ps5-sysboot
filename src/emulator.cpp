@@ -225,6 +225,29 @@ void Run(const RunOptions& options) {
 	Common::Subsystems subsystems(true);
 	Libs::LibKernel::Process::MarkExecChildStartupStage(3);
 	Init(options.config, param_json, subsystems);
+	std::string                                        envelope_provider_error;
+	Libs::LibKernel::EnvelopeSecureProcessor::Provider envelope_provider_kind =
+	    Libs::LibKernel::EnvelopeSecureProcessor::Provider::None;
+	const auto envelope_provider =
+	    Libs::LibKernel::EnvelopeSecureProcessor::ConfigureProductionBackendFromEnvironment(
+	        &envelope_provider_error, &envelope_provider_kind);
+	if (envelope_provider ==
+	    Libs::LibKernel::EnvelopeSecureProcessor::ConfigurationStatus::Invalid) {
+		EXIT("Envelope provider configuration rejected: %s\n", envelope_provider_error.c_str());
+	}
+	if (envelope_provider ==
+	    Libs::LibKernel::EnvelopeSecureProcessor::ConfigurationStatus::Configured) {
+		LOGF("SBL_ENVELOPE_PROVIDER_CONFIGURED provider=%s protocol=1 authenticated=1 offline=%d\n",
+		     Libs::LibKernel::EnvelopeSecureProcessor::ProviderName(envelope_provider_kind),
+		     envelope_provider_kind == Libs::LibKernel::EnvelopeSecureProcessor::Provider::Local
+		         ? 1
+				 : 0);
+	}
+	Libs::LibKernel::Process::MarkExecChildStartupStage(5);
+	if (!Libs::LibKernel::Process::IsExecChild()) {
+		Libs::LibKernel::Process::InstallRootOriginalSelf(options);
+		Libs::LibKernel::Process::PublishToScope();
+	}
 
 	if (!Libs::LibKernel::Process::IsExecChild()) {
 		ClearDebugTextureFolder();

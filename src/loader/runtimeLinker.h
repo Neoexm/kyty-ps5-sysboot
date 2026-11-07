@@ -22,10 +22,13 @@ class RuntimeLinker;
 // Per-OS-thread guest FS base, set before entering the statically linked pthread bootstrap on a
 // Kyty guest stack.
 void SetSysAvNativeThreadFsBase(uint64_t guest_tls_base);
+void SetMiniSyscoreNativeThreadFsBase(uint64_t guest_tls_base);
 
 // fs:[disp] emulation in the exception handler consults this base on exec-child guest threads; 0
 // disables it.
 void     SetExecNativeThreadFsBase(uint64_t guest_tcb);
+uint64_t ExecNativeThreadFsBase();
+
 using module_func_t                          = KYTY_SYSV_ABI int (*)(size_t args, const void* argp);
 using application_heap_free_func_t           = KYTY_SYSV_ABI void (*)(void*);
 using application_heap_malloc_func_t         = KYTY_SYSV_ABI void* (*)(uint64_t);
@@ -125,6 +128,7 @@ struct Program {
 		std::string name;
 		Program*    provider = nullptr;
 	};
+
 	int32_t                      unique_id = -1;
 	RuntimeLinker*               rt        = nullptr;
 	uint32_t                     load_count = 0; // Successful sceKernelLoadStartModule calls.
@@ -184,6 +188,7 @@ public:
 
 	void RelocateAll();
 	void LogExecLoadPhases(const char* point);
+	bool EnableOriginalFontProvider(int32_t handle);
 	void RelocateProgram(Program* program);
 
 	void  Execute(const std::filesystem::path& game_patch = {});
@@ -226,8 +231,10 @@ private:
 	static void DeleteProgram(Program* program);
 	static void SetupTlsHandler(Program* program);
 	void        WriteUnresolvedSymbols();
+	void        RefreshNeededModules();
 	bool        IsProgramReferenced(Program* program);
 	bool        IsThreadAtexitReferenced(Program* program);
+	int         ProgramUnloadStatus(Program* program);
 	int         AcquireShellUiNpCommonPool();
 	int         ReleaseShellUiNpCommonPool();
 
@@ -251,7 +258,11 @@ private:
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
+bool TestInitialModuleStageUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();
+bool TestAgcPoolMallocOutcomeDiagnostic();
+bool TestOriginalPadProviderDiagnosticRouting();
+bool TestNativeLibkernelGetdirentriesTrap();
 #endif
 
 } // namespace Loader

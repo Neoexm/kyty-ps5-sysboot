@@ -199,7 +199,72 @@ static void* AgcPoolMallocOutcomeCall(size_t size, uint64_t caller) {
 	return AgcPoolMallocOutcomeCall(size, reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 }
 
+static bool HasExactAgcPoolMallocExport(const Program& provider) {
+	static constexpr char raw_export[] = "gQX+4GDQjpM#C#A";
+	if (provider.dynamic_info == nullptr || provider.dynamic_info->symbol_table == nullptr ||
+	    provider.dynamic_info->str_table == nullptr ||
+	    provider.dynamic_info->symbol_table_entry_size != sizeof(Elf64_Sym)) {
+		return false;
+	}
+	const auto count = provider.dynamic_info->symbol_table_total_size / sizeof(Elf64_Sym);
+	for (uint64_t index = 0; index < count; ++index) {
+		const auto& symbol = provider.dynamic_info->symbol_table[index];
+		if (symbol.st_name >= provider.dynamic_info->str_table_size) continue;
+		const auto  available = provider.dynamic_info->str_table_size - symbol.st_name;
+		const auto* name      = provider.dynamic_info->str_table + symbol.st_name;
+		if (available >= sizeof(raw_export) &&
+		    std::memcmp(name, raw_export, sizeof(raw_export)) == 0 &&
+		    symbol.GetBind() == STB_GLOBAL && symbol.GetType() == STT_FUNC &&
+		    symbol.st_value == 0x4e60u) {
+			return true;
+		}
+	}
+	return false;
+}
 
+static bool InstallAgcPoolMallocOutcome(const std::string&   qualified_name,
+                                        const SymbolResolve& request, Program* importer,
+                                        const Program* provider, const SymbolRecord& record,
+                                        SymbolRecord* output) {
+	static constexpr uint8_t call_signature[] = {0x48, 0x89, 0xfb, 0xbf, 0x40, 0x24, 0x02,
+	                                             0x00, 0xe8, 0x5e, 0x35, 0x12, 0x00};
+	if (std::getenv("KYTY_DIAGNOSTIC_AGC_POOL_MALLOC_OUTCOME") == nullptr ||
+	    qualified_name != "gQX+4GDQjpM#M#N" || request.type != SymbolType::Func ||
+	    importer == nullptr || provider == nullptr || output == nullptr ||
+	    importer->file_name.filename() != "AgcCompositor.elf" ||
+	    provider->file_name.filename() != "libSceLibcInternal.sprx" ||
+	    SymbolDatabase::GetNid(record.name) != "gQX+4GDQjpM" ||
+	    provider->export_symbols == nullptr || provider->export_symbols->Find(request) != &record ||
+	    !HasExactAgcPoolMallocExport(*provider) || provider->base_vaddr == 0 ||
+	    record.vaddr != provider->base_vaddr + 0x4e60u || importer->base_vaddr == 0 ||
+	    importer->mapped_size < 0x58d2u ||
+	    std::memcmp(reinterpret_cast<const void*>(importer->base_vaddr + 0x58c5u), call_signature,
+	                sizeof(call_signature)) != 0) {
+		return false;
+	}
+	const uint64_t expected_return = importer->base_vaddr + 0x58d2u;
+	{
+		std::lock_guard lock(g_agc_pool_malloc_install_mutex);
+		const uint64_t  current_target = g_agc_pool_malloc_target.load(std::memory_order_acquire);
+		if (current_target == 0) {
+			g_agc_pool_malloc_expected_return.store(expected_return, std::memory_order_relaxed);
+			g_agc_pool_malloc_outcome_count.store(0, std::memory_order_relaxed);
+			g_agc_pool_malloc_target.store(record.vaddr, std::memory_order_release);
+		} else if (current_target != record.vaddr ||
+		           g_agc_pool_malloc_expected_return.load(std::memory_order_relaxed) !=
+		               expected_return) {
+			return false;
+		}
+	}
+	*output       = record;
+	output->vaddr = reinterpret_cast<uint64_t>(AgcPoolMallocOutcome);
+	if (g_agc_pool_malloc_install_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("AGC_POOL_MALLOC_OUTCOME installed importer=AgcCompositor.elf"
+		     " import=gQX+4GDQjpM#M#N provider=libSceLibcInternal.sprx+0x4e60"
+		     " expected_return=AgcCompositor.elf+0x58d2\n");
+	}
+	return true;
+}
 
 static bool IsExactMbusSetVolumeDownProvider(const Program& provider, const SymbolRecord& record) {
 	static constexpr uint8_t client_load[]    = {0x48, 0x8b, 0x3d, 0x01, 0x9c, 0x00, 0x00};
@@ -769,6 +834,67 @@ bool TestAgcPoolMallocOutcomeDiagnostic() {
 	const bool library_version_rejected                    = original_binding();
 	importer.dynamic_info->import_libs[0].version          = 1;
 	importer.dynamic_info->import_modules[0].version_minor = 2;
+	const bool module_version_rejected                     = original_binding();
+	importer.dynamic_info->import_modules[0].version_minor = 1;
+	raw_export[0] ^= 1;
+	const bool raw_export_rejected = original_binding();
+	raw_export[0] ^= 1;
+	const auto exact_symbol_info    = symbol.st_info;
+	symbol.st_info                  = static_cast<unsigned char>((STB_WEAK << 4u) | STT_FUNC);
+	const bool export_bind_rejected = original_binding();
+	symbol.st_info                  = static_cast<unsigned char>((STB_GLOBAL << 4u) | STT_OBJECT);
+	const bool export_type_rejected = original_binding();
+	symbol.st_info                  = exact_symbol_info;
+	symbol.st_value                 = 0x4e61u;
+	const bool export_rva_rejected  = original_binding();
+	symbol.st_value                 = 0x4e60u;
+	provider.base_vaddr += 1;
+	const bool record_rva_rejected = original_binding();
+	provider.base_vaddr -= 1;
+	const auto exact_mapped_size    = importer.mapped_size;
+	importer.mapped_size            = 0x58d1u;
+	const bool mapped_size_rejected = original_binding();
+	importer.mapped_size            = exact_mapped_size;
+	importer_image[0x58c5] ^= 1;
+	const bool signature_rejected = original_binding();
+	importer_image[0x58c5] ^= 1;
+	std::vector<uint8_t> other_importer_image(0x6000);
+	std::memcpy(other_importer_image.data() + 0x58c5, call_signature, sizeof(call_signature));
+	Program other_importer;
+	other_importer.file_name   = importer.file_name;
+	other_importer.base_vaddr  = reinterpret_cast<uint64_t>(other_importer_image.data());
+	other_importer.mapped_size = other_importer_image.size();
+	SymbolRecord retarget_rejected {"unchanged", "unchanged", 0x66};
+	const bool   global_retarget_rejected =
+	    !InstallAgcPoolMallocOutcome("gQX+4GDQjpM#M#N", request, &other_importer, &provider,
+		                             *record, &retarget_rejected) &&
+	    retarget_rejected.vaddr == 0x66;
+	Program unrelated_provider;
+	unrelated_provider.file_name                             = provider.file_name;
+	unrelated_provider.base_vaddr                            = provider.base_vaddr;
+	unrelated_provider.dynamic_info                          = std::make_unique<DynamicInfo>();
+	unrelated_provider.dynamic_info->str_table               = raw_export;
+	unrelated_provider.dynamic_info->str_table_size          = sizeof(raw_export);
+	unrelated_provider.dynamic_info->symbol_table            = &symbol;
+	unrelated_provider.dynamic_info->symbol_table_total_size = sizeof(symbol);
+	unrelated_provider.dynamic_info->symbol_table_entry_size = sizeof(symbol);
+	unrelated_provider.export_symbols                        = std::make_unique<SymbolDatabase>();
+	unrelated_provider.export_symbols->Add(request, record->vaddr);
+	SymbolRecord rejected {"unchanged", "unchanged", 0x77};
+	const bool   provider_association_rejected =
+	    !InstallAgcPoolMallocOutcome("gQX+4GDQjpM#M#N", request, &importer, &unrelated_provider,
+		                             *record, &rejected) &&
+	    rejected.vaddr == 0x77;
+	const bool restored = set_environment(present ? saved.c_str() : nullptr);
+	linker.m_programs.clear();
+	return absent_rejected && installed && nonnull_passthrough && exact_trace && reinstall_stable &&
+	       null_passthrough && other_size_passthrough && importer_name_rejected &&
+	       provider_name_rejected && type_rejected && qualified_name_rejected &&
+	       library_version_rejected && module_version_rejected && raw_export_rejected &&
+	       export_bind_rejected && export_type_rejected && export_rva_rejected &&
+	       record_rva_rejected && mapped_size_rejected && signature_rejected &&
+	       global_retarget_rejected && provider_association_rejected &&
+	       g_agc_pool_test_calls.load(std::memory_order_relaxed) == 5 && restored;
 }
 
 static std::atomic<uint32_t> g_test_mbus_set_volume_down_calls {0};
@@ -6132,6 +6258,79 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	}
 }
 
+bool RuntimeLinker::EnableOriginalFontProvider(int32_t handle) {
+	Common::LockGuard lock(m_mutex);
+	auto*             provider = FindProgramById(handle);
+	if (provider == nullptr || provider->dynamic_info == nullptr ||
+	    provider->export_symbols == nullptr ||
+	    provider->module_state != Program::ModuleState::Started ||
+	    !provider->native_init_attempted || provider->module_start_result < 0)
+		return false;
+	const auto        file   = provider->file_name.filename();
+	const std::string family = file == "libSceFont.native.sprx" ? "libSceFont"
+	                           : file == "libSceFontFt.sprx"    ? "libSceFontFt"
+	                                                            : "";
+	if (family.empty() || provider->original_font_provider) return !family.empty();
+	const auto& modules   = provider->dynamic_info->export_modules;
+	const auto& libraries = provider->dynamic_info->export_libs;
+	if (std::none_of(modules.begin(), modules.end(),
+	                 [&](const auto& module) { return module.name == family; }) ||
+	    std::none_of(libraries.begin(), libraries.end(),
+	                 [&](const auto& library) { return library.name == family; })) {
+		return false;
+	}
+	provider->original_font_provider = true;
+	uint32_t rebound                 = 0;
+	for (auto* importer: m_programs) {
+		const auto& info = *importer->dynamic_info;
+		const auto  rela_count =
+		    static_cast<uint32_t>(info.rela_table_total_size / sizeof(Elf64_Rela));
+		ForEachRelocation(importer, [&](Elf64_Rela* relocation, uint32_t index, bool jmprela) {
+			const auto bit_index       = (jmprela ? rela_count : 0) + index;
+			auto&      bits            = importer->rela_bits[bit_index >> 3u];
+			const auto mask            = 1u << (bit_index & 7u);
+			const auto relocation_type = relocation->GetType();
+			if ((bits & mask) == 0 ||
+			    (relocation_type != R_X86_64_64 && relocation_type != R_X86_64_GLOB_DAT &&
+			     relocation_type != R_X86_64_JUMP_SLOT))
+				return;
+			const auto& symbol = info.symbol_table[relocation->GetSymbol()];
+			if (symbol.GetBind() != STB_GLOBAL && symbol.GetBind() != STB_WEAK) return;
+			SymbolType type;
+			switch (symbol.GetType()) {
+				case STT_NOTYPE: type = SymbolType::NoType; break;
+				case STT_FUNC: type = SymbolType::Func; break;
+				case STT_OBJECT: type = SymbolType::Object; break;
+				default: return;
+			}
+			const auto ids = Common::Split(std::string(info.str_table + symbol.st_name), '#');
+			if (ids.size() != 3) return;
+			const auto* library = FindLibrary(*importer, ids[1]);
+			const auto* module  = FindModule(*importer, ids[2]);
+			if (library == nullptr || module == nullptr || library->name != family ||
+			    module->name != family)
+				return;
+			const SymbolResolve request {ids[0],       library->name,         library->version,
+			                             module->name, module->version_major, module->version_minor,
+			                             type};
+			if (m_symbols == nullptr) return;
+			const auto* hle = m_symbols->Find(request);
+			if (hle == nullptr) hle = m_symbols->FindByNid(ids[0], type);
+			if (hle == nullptr) return;
+			const auto value =
+			    *reinterpret_cast<const uint64_t*>(importer->base_vaddr + relocation->r_offset);
+			const auto target = value - (relocation_type == R_X86_64_64 ? relocation->r_addend : 0);
+			if (target == hle->vaddr) {
+				bits &= ~mask;
+				++rebound;
+			}
+		});
+	}
+	RelocateAll();
+	LOGF("NATIVE_FONT_PROVIDER_ACTIVATED family=%s handle=%d rebound_hle_slots=%u initialized=1\n",
+	     family.c_str(), handle, rebound);
+	return true;
+}
 
 static std::vector<std::string> NeededModuleNames(Program* program) {
 	EXIT_IF(program == nullptr || program->elf == nullptr || program->dynamic_info == nullptr);
@@ -6272,6 +6471,23 @@ static NeededModuleSource FindNeededModuleSource(const std::string& name) {
 	return source;
 }
 
+void RuntimeLinker::RefreshNeededModules() {
+	for (auto* importer: m_programs) {
+		for (const auto& name: NeededModuleNames(importer)) {
+			if (FindNeededModule(importer, name) != nullptr) {
+				continue;
+			}
+			const auto path = FindNeededModulePath(name);
+			if (path.empty()) {
+				continue;
+			}
+			auto* provider = FindProgramByFileName(path);
+			if (provider != nullptr) {
+				importer->needed_modules.push_back({name, provider});
+			}
+		}
+	}
+}
 
 bool RuntimeLinker::IsProgramReferenced(Program* program) {
 	std::vector<Program*>        pending;
@@ -6315,6 +6531,33 @@ bool RuntimeLinker::IsThreadAtexitReferenced(Program* program) {
 	return false;
 }
 
+int RuntimeLinker::ProgramUnloadStatus(Program* program) {
+	if (program->active_module_calls != 0 || IsThreadAtexitReferenced(program)) {
+		return Libs::LibKernel::KERNEL_ERROR_EBUSY;
+	}
+	if (program->native_init_attempted && program->module_start_result < 0) {
+		return OK;
+	}
+	if (IsProgramReferenced(program)) {
+		return Libs::LibKernel::KERNEL_ERROR_EBUSY;
+	}
+	for (auto* importer: m_programs) {
+		if (importer != program &&
+		    std::any_of(importer->needed_modules.begin(), importer->needed_modules.end(),
+		                [&](const Program::NeededModule& dependency) {
+			                return dependency.provider == program;
+		                })) {
+			return Libs::LibKernel::KERNEL_ERROR_ENOTSUP;
+		}
+	}
+	for (const auto& dependency: program->needed_modules) {
+		auto* provider = dependency.provider;
+		if (provider != program && !IsProgramReferenced(provider)) {
+			return Libs::LibKernel::KERNEL_ERROR_ENOTSUP;
+		}
+	}
+	return OK;
+}
 
 int RuntimeLinker::AcquireProgram(Program* program) {
 	Common::LockGuard lock(m_mutex);
@@ -6333,6 +6576,35 @@ int RuntimeLinker::AcquireProgram(Program* program) {
 	return OK;
 }
 
+int RuntimeLinker::ReleaseProgram(Program* program, bool* retained) {
+	Common::LockGuard lock(m_mutex);
+	if (retained == nullptr) {
+		return Libs::LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end()) {
+		return Libs::LibKernel::KERNEL_ERROR_ESRCH;
+	}
+	if (program->load_count == 0) {
+		return IsProgramReferenced(program) ? Libs::LibKernel::KERNEL_ERROR_EBUSY
+		                                    : Libs::LibKernel::KERNEL_ERROR_ESRCH;
+	}
+	--program->load_count;
+	if (IsProgramReferenced(program)) {
+		*retained = true;
+		LOGF("MODULE_REFERENCE_RELEASE_RETAINED id=%d acquisitions=%u path=%s\n",
+		     program->unique_id, program->load_count,
+		     Common::PathToString(program->file_name).c_str());
+		return OK;
+	}
+	const int status = ProgramUnloadStatus(program);
+	if (status != OK) {
+		++program->load_count;
+		return status;
+	}
+	*retained                      = false;
+	program->module_unload_pending = true;
+	return OK;
+}
 
 
 
@@ -6343,7 +6615,13 @@ int RuntimeLinker::UnloadProgram(Program* program) {
 	Common::LockGuard lock(m_mutex);
 
 	auto it = std::find(m_programs.begin(), m_programs.end(), program);
-	EXIT_IF(it == m_programs.end());
+	if (it == m_programs.end()) {
+		return Libs::LibKernel::KERNEL_ERROR_ESRCH;
+	}
+	const int status = ProgramUnloadStatus(program);
+	if (status != OK) {
+		return status;
+	}
 	m_programs.erase(it);
 	std::erase(m_needed_modules, program);
 	std::erase(m_module_start_order, program->unique_id);
@@ -6457,6 +6735,9 @@ Program* RuntimeLinker::LoadProgramImpl(const std::filesystem::path& elf_name,
 	++g_exec_load_timing.programs;
 
 	m_programs.push_back(program_owner.release());
+	const auto refresh_start = std::chrono::steady_clock::now();
+	RefreshNeededModules();
+	g_exec_load_timing.refresh_us += MicrosecondsSince(refresh_start);
 
 	if (!program->elf->IsShared()) {
 		program->process_owned               = true;
@@ -6473,6 +6754,61 @@ Program* RuntimeLinker::LoadProgramImpl(const std::filesystem::path& elf_name,
 	return program;
 }
 
+void RuntimeLinker::LoadNeededModules(Program* program) {
+	Common::LockGuard lock(m_mutex);
+	EXIT_IF(program == nullptr || program->elf == nullptr || program->dynamic_info == nullptr);
+
+	program->process_owned = true;
+	m_needed_modules.clear();
+	std::unordered_set<Program*> visited;
+
+	auto visit = [&](auto&& self, Program* current) -> void {
+		if (!visited.insert(current).second || current->elf == nullptr ||
+		    current->dynamic_info == nullptr) {
+			return;
+		}
+
+		for (const auto& module_name: NeededModuleNames(current)) {
+			auto* module = FindNeededModule(current, module_name);
+			if (module == nullptr) {
+				const auto resolve_start = std::chrono::steady_clock::now();
+				auto       source        = FindNeededModuleSource(module_name);
+				g_exec_load_timing.needed_resolve_us += MicrosecondsSince(resolve_start);
+				if (source.result != OK) {
+					LOGF("Missing DT_NEEDED module: %s required by %s result=0x%08x\n",
+					     module_name.c_str(), Common::PathToString(current->file_name).c_str(),
+					     static_cast<unsigned>(source.result));
+					continue;
+				}
+				module = FindProgramByFileName(source.file_name);
+				if (module == nullptr) {
+					module = source.provider_handle != nullptr
+					             ? LoadProgram(source.file_name, std::move(source.image))
+					             : LoadProgram(source.file_name);
+				}
+				const auto bound =
+				    std::find_if(current->needed_modules.begin(), current->needed_modules.end(),
+					             [&](const Program::NeededModule& dependency) {
+					                 return dependency.name == module_name;
+				                 });
+				if (bound != current->needed_modules.end()) {
+					bound->provider = module;
+				} else {
+					current->needed_modules.push_back({module_name, module});
+				}
+			}
+			LOGF("Loaded DT_NEEDED module: %s -> %s\n", module_name.c_str(),
+			     Common::PathToString(module->file_name).c_str());
+			self(self, module);
+		}
+
+		if (current != program && current->elf->IsShared()) {
+			m_needed_modules.push_back(current);
+		}
+	};
+
+	visit(visit, program);
+}
 
 void RuntimeLinker::SaveMainProgram(const std::filesystem::path& elf_name) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -7201,6 +7537,26 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			if (rec != nullptr) {
+				if (std::getenv("KYTY_DIAGNOSTIC_AGC_POOL_MALLOC_OUTCOME") != nullptr &&
+				    name == "gQX+4GDQjpM#M#N" && type == SymbolType::Func &&
+				    program->file_name.filename() == "AgcCompositor.elf") {
+					const Program* provider = nullptr;
+					for (const auto* candidate: m_programs) {
+						if (candidate != nullptr && candidate->export_symbols != nullptr &&
+						    candidate->export_symbols->Find(sr) == rec) {
+							provider = candidate;
+							break;
+						}
+					}
+					if (InstallAgcPoolMallocOutcome(name, sr, program, provider, *rec, out_info)) {
+						return;
+					}
+					if (g_agc_pool_malloc_install_count.fetch_add(1, std::memory_order_relaxed) <
+					    8) {
+						LOGF("AGC_POOL_MALLOC_OUTCOME not_installed reason=identity_mismatch"
+						     "\n");
+					}
+				}
 				*out_info = *rec;
 				if (trace_userevt) {
 					LOGF("USEREVT resolve pick: importer=%s target=%016" PRIx64 " name=%s dbg=%s\n",
@@ -7394,11 +7750,52 @@ void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
 }
 
 void RuntimeLinker::StopAllModules() {
-	Common::LockGuard lock(m_mutex);
-
-	for (auto* p: m_programs) {
-		if (p->elf->IsShared() && p->dynamic_info->fini_vaddr != 0) {
-			StopModule(p, 0, nullptr, nullptr);
+	{
+		Common::LockGuard lock(m_mutex);
+		if (m_stopping_all_modules) {
+			return;
+		}
+		m_stopping_all_modules = true;
+	}
+	std::unordered_set<int32_t> attempted;
+	while (true) {
+		Program* program = nullptr;
+		{
+			Common::LockGuard lock(m_mutex);
+			for (auto it = m_module_start_order.rbegin(); it != m_module_start_order.rend(); ++it) {
+				if (attempted.contains(*it)) {
+					continue;
+				}
+				const auto found = std::find_if(
+				    m_programs.begin(), m_programs.end(),
+				    [&](const Program* candidate) { return candidate->unique_id == *it; });
+				if (found == m_programs.end() ||
+				    ((*found)->module_state != Program::ModuleState::Started &&
+				     (*found)->module_state != Program::ModuleState::StartFailed)) {
+					continue;
+				}
+				program = *found;
+				attempted.insert(program->unique_id);
+				++program->active_module_calls;
+				break;
+			}
+			if (program == nullptr) {
+				m_stopping_all_modules = false;
+				break;
+			}
+		}
+		if (program == m_shellui_npcommon_pool_provider && m_shellui_npcommon_pool_owned) {
+			const int release_result = ReleaseShellUiNpCommonPool();
+			LOGF("NPCOMMON_POOL_OWNER process=SceShellUI release_before_provider_stop"
+			     " result=0x%08x\n",
+			     static_cast<uint32_t>(release_result));
+		}
+		const int         result = StopModule(program, 0, nullptr, nullptr);
+		Common::LockGuard lock(m_mutex);
+		--program->active_module_calls;
+		if (result < 0) {
+			LOGF("MODULE_PROCESS_FINI_FAILED id=%d result=0x%08x path=%s\n", program->unique_id,
+			     static_cast<uint32_t>(result), Common::PathToString(program->file_name).c_str());
 		}
 	}
 }
@@ -8905,6 +9302,10 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
+		for (const auto token: program->host_exception_code_tokens) {
+			Common::HostException::UnregisterGuestCodeProvenance(token);
+		}
+		program->host_exception_code_tokens.clear();
 		if (program->instruction_trampoline_size != 0) {
 			UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(program->base_vaddr));
 		}

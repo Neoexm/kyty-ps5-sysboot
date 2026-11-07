@@ -998,6 +998,11 @@ struct EnvelopeObservation {
 	std::vector<uint8_t> plaintext;
 };
 
+struct SecureEnvelopeBytes {
+	explicit SecureEnvelopeBytes(size_t size): bytes(size) {}
+	~SecureEnvelopeBytes() { EnvelopeSecureProcessor::Wipe(bytes); }
+	std::vector<uint8_t> bytes;
+};
 
 static bool EnvelopeDigestMatches(std::span<const uint8_t> plaintext, const uint8_t* expected) {
 	const auto digest    = AuthInfo::Sha256(plaintext.data(), plaintext.size());
@@ -1007,6 +1012,76 @@ static bool EnvelopeDigestMatches(std::span<const uint8_t> plaintext, const uint
 	return different == 0;
 }
 
+// One record per line: in_size cid mkv console_result in_sha256 key_sha256 salt_sha256
+// plaintext_sha256 plaintext_hex
+static const std::vector<EnvelopeObservation>& EnvelopeObservations() {
+	static const std::vector<EnvelopeObservation> records = [] {
+		std::vector<EnvelopeObservation> loaded;
+		const char*                      path = std::getenv("KYTY_PS5_ENVELOPE_OBSERVATIONS");
+		if (path == nullptr) return loaded;
+		const char*        pin = std::getenv("KYTY_PS5_ENVELOPE_OBSERVATIONS_SHA256");
+		std::ifstream      input(Common::PathFromUtf8(path), std::ios::binary);
+		std::ostringstream content;
+		content << input.rdbuf();
+		const std::string text = content.str();
+		AuthInfo::Digest  expected {};
+		if (pin == nullptr || !input.is_open() || !AuthInfo::ParseDigestHex(pin, &expected) ||
+		    AuthInfo::Sha256(text.data(), text.size()) != expected) {
+			LOGF("SBL_ENVELOPE_OBSERVATIONS_REJECTED reason=file_pin\n");
+			return loaded;
+		}
+		auto nibble = [](char c) {
+			return c >= '0' && c <= '9'   ? c - '0'
+			       : c >= 'a' && c <= 'f' ? c - 'a' + 10
+			       : c >= 'A' && c <= 'F' ? c - 'A' + 10
+			                              : -1;
+		};
+		std::istringstream lines(text);
+		std::string        line;
+		for (int number = 1; std::getline(lines, line); number++) {
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			if (line.empty() || line[0] == '#') continue;
+			std::istringstream fields(line);
+			std::string        tokens[9], extra;
+			for (auto& token: tokens)
+				fields >> token;
+			bool     ok = !tokens[8].empty() && !(fields >> extra) && tokens[8].size() % 2 == 0;
+			uint64_t numbers[4] = {};
+			for (int i = 0; ok && i < 4; i++) {
+				char* end  = nullptr;
+				numbers[i] = std::strtoull(tokens[i].c_str(), &end, 0);
+				ok         = end != tokens[i].c_str() && *end == '\0';
+			}
+			EnvelopeObservation record {};
+			AuthInfo::Digest    plaintext_sha256 {};
+			ok = ok && numbers[1] <= UINT32_MAX && numbers[2] <= UINT32_MAX && numbers[3] == 0 &&
+			     AuthInfo::ParseDigestHex(tokens[4], &record.in_sha256) &&
+			     AuthInfo::ParseDigestHex(tokens[5], &record.key_sha256) &&
+			     AuthInfo::ParseDigestHex(tokens[6], &record.salt_sha256) &&
+			     AuthInfo::ParseDigestHex(tokens[7], &plaintext_sha256);
+			for (size_t i = 0; ok && i < tokens[8].size(); i += 2) {
+				const int high = nibble(tokens[8][i]), low = nibble(tokens[8][i + 1]);
+				ok = high >= 0 && low >= 0;
+				record.plaintext.push_back(static_cast<uint8_t>(high << 4 | low));
+			}
+			ok = ok && numbers[0] >= 0x1d1 && numbers[0] <= 0x40000 &&
+			     record.plaintext.size() == numbers[0] - 0x1d0 &&
+			     AuthInfo::Sha256(record.plaintext.data(), record.plaintext.size()) ==
+			         plaintext_sha256;
+			if (!ok) {
+				LOGF("SBL_ENVELOPE_OBSERVATION_REJECTED line=%d\n", number);
+				continue;
+			}
+			record.in_size = numbers[0];
+			record.cid     = static_cast<uint32_t>(numbers[1]);
+			record.mkv     = static_cast<uint32_t>(numbers[2]);
+			loaded.push_back(std::move(record));
+		}
+		LOGF("SBL_ENVELOPE_OBSERVATIONS_LOADED records=%zu\n", loaded.size());
+		return loaded;
+	}();
+	return records;
+}
 
 #if defined(_WIN32)
 // K+0xc37d60: RSA_public_decrypt(0x180, in+0x50, em, RSA_NO_PADDING), then
