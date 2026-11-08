@@ -6,6 +6,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs {
@@ -259,10 +260,14 @@ static KYTY_SYSV_ABI int UserServicePlatformPrivacyWs1Stub(uint64_t, uint64_t, u
 } // namespace UserService
 
 LIB_DEFINE(InitUserService_1) {
-	LIB_FUNC("j3YMu1MVNNo", UserService::UserServiceInitialize);
-	LIB_FUNC("az-0R6eviZ0", UserService::UserServiceInitialize2);
+	// An HLE-only init leaves native callers with 0x80960002 (NOT_INITIALIZED); the opt-in
+	// diagnostic runs the 13.60 native initializers. No user, session or login is created.
+	if (std::getenv("KYTY_DIAGNOSTIC_NATIVE_USERSERVICE_INIT") == nullptr) {
+		LIB_FUNC("j3YMu1MVNNo", UserService::UserServiceInitialize);
+		LIB_FUNC("az-0R6eviZ0", UserService::UserServiceInitialize2);
+		LIB_FUNC("yH17Q6NWtVg", UserService::UserServiceGetEvent);
+	}
 	LIB_FUNC("CdWp0oHWGr0", UserService::UserServiceGetInitialUser);
-	LIB_FUNC("yH17Q6NWtVg", UserService::UserServiceGetEvent);
 	LIB_FUNC("fPhymKNvK-A", UserService::UserServiceGetLoginUserIdList);
 	LIB_FUNC("1xxcMiGu2fo", UserService::UserServiceGetUserName);
 	LIB_FUNC("bwFjS+bX9mA", UserService::UserServiceGetUserNumber);

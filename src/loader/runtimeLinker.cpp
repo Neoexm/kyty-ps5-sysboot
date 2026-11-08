@@ -87,6 +87,8 @@ namespace Libs::NpCommon {
 void SetDiagnosticNativeEntries(uint64_t create, uint64_t config, uint64_t start);
 }
 namespace Libs::LibcInternal {
+void SetNativeStdioEntries(uint64_t fopen, uint64_t fclose, uint64_t fread, uint64_t fseek,
+                           uint64_t ftell);
 }
 
 namespace Loader {
@@ -6606,8 +6608,35 @@ int RuntimeLinker::ReleaseProgram(Program* program, bool* retained) {
 	return OK;
 }
 
+int32_t RuntimeLinker::AcquireThreadAtexit(uint64_t address, bool* mapped_owner) {
+	Common::LockGuard lock(m_mutex);
+	auto*             owner = FindProgramByAddr(address);
+	if (mapped_owner != nullptr) *mapped_owner = owner != nullptr;
+	if (owner == nullptr || owner->module_unload_pending ||
+	    owner->module_state == Program::ModuleState::Stopping ||
+	    owner->module_state == Program::ModuleState::Stopped ||
+	    owner->pending_thread_atexit == UINT32_MAX) {
+		return -1;
+	}
+	++owner->pending_thread_atexit;
+	return owner->unique_id;
+}
 
+void RuntimeLinker::ReleaseThreadAtexit(int32_t owner) {
+	Common::LockGuard lock(m_mutex);
+	if (auto* program = FindProgramById(owner);
+	    program != nullptr && program->pending_thread_atexit != 0) {
+		--program->pending_thread_atexit;
+	}
+}
 
+void RuntimeLinker::ReleaseThreadAtexitByAddr(uint64_t address) {
+	Common::LockGuard lock(m_mutex);
+	if (auto* program = FindProgramByAddr(address);
+	    program != nullptr && program->pending_thread_atexit != 0) {
+		--program->pending_thread_atexit;
+	}
+}
 
 int RuntimeLinker::UnloadProgram(Program* program) {
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -7019,6 +7048,128 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	auto initialize_modules = [this, libc, shellui_npcommon_owner] {
 		if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 			StartModule(libc, 0, nullptr, nullptr);
+		}
+		std::unordered_set<Program*> started_modules;
+		if (libc != nullptr) {
+			started_modules.insert(libc);
+		}
+		for (const auto* name: {"libkernel.prx", "libSceLibcInternal.prx"}) {
+			for (auto* module: m_needed_modules) {
+				if (std::strcmp(module->dynamic_info->so_name, name) != 0 ||
+				    !started_modules.insert(module).second) {
+					continue;
+				}
+				if (module->dynamic_info->init_vaddr != 0) {
+					const auto result = StartModule(module, 0, nullptr, nullptr);
+					EXIT_NOT_IMPLEMENTED(result != 0);
+				}
+				if (std::strcmp(name, "libSceLibcInternal.prx") == 0) {
+					const auto* native_fopen =
+					    module->export_symbols->FindByNid("xeYO4u7uyJ0", SymbolType::Func);
+					const auto* native_fclose =
+					    module->export_symbols->FindByNid("uodLYyUip20", SymbolType::Func);
+					const auto* native_fread =
+					    module->export_symbols->FindByNid("lbB+UlZqVG0", SymbolType::Func);
+					const auto* native_fseek =
+					    module->export_symbols->FindByNid("rQFVBXp-Cxg", SymbolType::Func);
+					const auto* native_ftell =
+					    module->export_symbols->FindByNid("Qazy8LmXTvw", SymbolType::Func);
+					if (native_fclose != nullptr && native_fread != nullptr &&
+					    native_fseek != nullptr && native_ftell != nullptr) {
+						Libs::LibcInternal::SetNativeStdioEntries(
+						    native_fopen != nullptr ? native_fopen->vaddr : 0, native_fclose->vaddr,
+						    native_fread->vaddr, native_fseek->vaddr, native_ftell->vaddr);
+					}
+					const auto* heap_init =
+					    module->export_symbols->FindByNid("z8GPiQwaAEY", SymbolType::Func);
+					if (heap_init != nullptr) {
+						using heap_init_func_t = KYTY_SYSV_ABI int (*)();
+						const auto result = reinterpret_cast<heap_init_func_t>(heap_init->vaddr)();
+						LOGF("Process libc heap initialization: %d\n", result);
+						EXIT_NOT_IMPLEMENTED(result != 0);
+					}
+					if (std::getenv("KYTY_DIAGNOSTIC_NATIVE_LIBC_ALLOC") != nullptr) {
+						// 13.60 libc malloc (+0x4e60) calls through the pointer at +0x1b5290
+						const uint64_t malloc_slot = module->base_vaddr + 0x1b5290u;
+						if (IsReadableRange(malloc_slot, sizeof(uint64_t))) {
+							const auto target = *reinterpret_cast<const uint64_t*>(malloc_slot);
+							LOGF("NATIVE_LIBC_ALLOC slot=0x%016" PRIx64 " target=0x%016" PRIx64
+							     " native_malloc=0x%016" PRIx64 "\n",
+							     malloc_slot, target, module->base_vaddr + 0x4e60u);
+							const auto inspect_libc_heap = [&]() {
+								const auto heap = module->base_vaddr + 0x1b77b8u;
+								for (const auto offset:
+								     {0x0u, 0x8u, 0x18u, 0x38u, 0x370u, 0x3d0u}) {
+									const auto address = heap + offset;
+									if (IsReadableRange(address, sizeof(uint64_t))) {
+										LOGF("NATIVE_LIBC_ALLOC libc_heap+0x%03" PRIx32
+										     "=0x%016" PRIx64 "\n",
+										     offset, *reinterpret_cast<const uint64_t*>(address));
+									}
+								}
+							};
+							inspect_libc_heap();
+							const auto inspect_map_ready = [&]() {
+								if (g_tls_main_program == nullptr ||
+								    g_tls_main_program->file_name.filename() !=
+								        "NPXS40087_eboot_decrypted.elf") {
+									return;
+								}
+								for (const auto offset: {0x281d988u, 0x2814c80u}) {
+									const auto address = g_tls_main_program->base_vaddr + offset;
+									if (IsReadableRange(address, sizeof(uint64_t))) {
+										LOGF("NATIVE_LIBC_ALLOC arena_global offset=0x%08" PRIx32
+										     " value=0x%016" PRIx64 "\n",
+										     offset, *reinterpret_cast<const uint64_t*>(address));
+									}
+								}
+							};
+							inspect_map_ready();
+							if (g_tls_main_program != nullptr) {
+								const auto tcb = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+								const auto context_slot = tcb - 0x10u;
+								const auto context =
+								    IsReadableRange(context_slot, 8u)
+								        ? *reinterpret_cast<const uint64_t*>(context_slot)
+								        : 0;
+								LOGF("NATIVE_LIBC_ALLOC before tcb=0x%016" PRIx64
+								     " context=0x%016" PRIx64 " main_base=0x%016" PRIx64 "\n",
+								     tcb, context, g_tls_main_program->base_vaddr);
+							}
+							using malloc_func_t = KYTY_SYSV_ABI void* (*)(size_t);
+							using free_func_t   = KYTY_SYSV_ABI void (*)(void*);
+							auto* allocated =
+							    reinterpret_cast<malloc_func_t>(module->base_vaddr + 0x4e60u)(24);
+							LOGF("NATIVE_LIBC_ALLOC probe_size=24 result=0x%016" PRIx64 "\n",
+							     reinterpret_cast<uint64_t>(allocated));
+							inspect_libc_heap();
+							inspect_map_ready();
+							if (g_tls_main_program != nullptr) {
+								const auto tcb = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+								const auto context_slot = tcb - 0x10u;
+								const auto context =
+								    IsReadableRange(context_slot, 8u)
+								        ? *reinterpret_cast<const uint64_t*>(context_slot)
+								        : 0;
+								LOGF("NATIVE_LIBC_ALLOC after tcb=0x%016" PRIx64
+								     " context=0x%016" PRIx64 "\n",
+								     tcb, context);
+							}
+							if (allocated != nullptr) {
+								reinterpret_cast<free_func_t>(module->base_vaddr +
+								                              0x4e70u)(allocated);
+							}
+						}
+					}
+					const auto* pthread_ready =
+					    module->export_symbols->FindByNid("h8jq9ee4h5c", SymbolType::Func);
+					if (pthread_ready != nullptr) {
+						using pthread_ready_func_t = KYTY_SYSV_ABI void (*)();
+						reinterpret_cast<pthread_ready_func_t>(pthread_ready->vaddr)();
+						LOGF("Process libc pthread bootstrap finalized\n");
+					}
+				}
+			}
 		}
 		for (auto* module: m_needed_modules) {
 			const bool hle_npmanager =

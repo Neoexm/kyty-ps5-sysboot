@@ -7,8 +7,12 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "kernel/appMount.h"
+#include "kernel/budget.h"
 #include "kernel/eventFlag.h"
 #include "kernel/eventQueue.h"
+#include "kernel/directoryPassthrough.h"
+#include "kernel/execProcess.h"
 #include "kernel/fileSystem.h"
 #include "kernel/ipmiManager.h"
 #include "kernel/memory.h"
@@ -19,6 +23,9 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/nativeKernelBridge.h"
+#include "libs/nativeSyscallGuards.h"
+#include "loader/decryptedModuleOverlay.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
@@ -73,12 +80,14 @@ static std::filesystem::path ResolveNativeModulePath(const std::string& guest_pa
 	}
 	return host_path;
 }
+
 struct NativeModuleSource {
 	std::filesystem::path                                    file_name;
 	std::shared_ptr<LibKernel::DirectoryPassthrough::Handle> provider_handle;
 	std::vector<uint8_t>                                     image;
 	int result = LibKernel::KERNEL_ERROR_ENOENT;
 };
+
 static void ApplyNativeModuleOverlay(const std::string& guest_path, NativeModuleSource* source) {
 	if (source == nullptr || source->result != OK || source->image.empty()) return;
 
@@ -102,6 +111,7 @@ static void ApplyNativeModuleOverlay(const std::string& guest_path, NativeModule
 		case Loader::DecryptedModuleOverlay::Resolution::NotApplicable: break;
 	}
 }
+
 static int ReadNativeModuleSnapshot(const std::string&           guest_path,
                                     const std::filesystem::path& file_name,
                                     std::vector<uint8_t>*        image) {
@@ -121,6 +131,100 @@ static int ReadNativeModuleSnapshot(const std::string&           guest_path,
 	*image = std::move(bytes);
 	return OK;
 }
+
+static std::string ResolvePsmNativeAotLoaderAlias(const std::string& guest_path) {
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_NATIVE_AOT_LOAD") == nullptr) return guest_path;
+
+	constexpr const char* mono_prefix   = "/common_ex/lib/mono/2.1/";
+	constexpr const char* shared_prefix = "/common_ex/lib/";
+	const bool            mono_path     = guest_path.starts_with(mono_prefix);
+	const bool            shared_path   = !mono_path && guest_path.starts_with(shared_prefix);
+	const char*           prefix = mono_path ? mono_prefix : shared_path ? shared_prefix : nullptr;
+	if (prefix == nullptr) return guest_path;
+
+	const auto name       = guest_path.substr(std::strlen(prefix));
+	const bool aot_module = name.ends_with(".dll.sprx");
+	// JSExecutor loads Folly, Jsi and Hermes via load_prx_by_filename (+0x312d0);
+	// libhermesRemoteInspector only with EnableDebugger, not shipped
+	const bool psm_native_module =
+	    shared_path && (name == "libSceFacebook.Yoga.sprx" || name == "libSceFollyShared.sprx" ||
+		                name == "libSceJsi-0.70.sprx" || name == "libhermes-0.11.sprx");
+	bool safe = name.size() >= 9 && name.size() <= 128 && (aot_module || psm_native_module) &&
+	            name.find("..") == std::string::npos;
+	for (const char ch: name) {
+		if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+		      ch == '_' || ch == '-' || ch == '.')) {
+			safe = false;
+			break;
+		}
+	}
+	return safe ? "/system_ex/common_ex/lib/" + name : guest_path;
+}
+
+// The PSM loader aliases match the sandbox namespace as an empty random word spelled it;
+// "/<word>/x" there was "//x".
+static std::string WithoutPsmSandboxWord(const std::string& guest_path, const char* replacement) {
+	const auto word = LibKernel::Process::GetExecChildSandboxWord();
+	if (word.empty() || !guest_path.starts_with("/" + word + "/common_ex/lib/")) return guest_path;
+	return replacement + guest_path.substr(word.size() + 2);
+}
+
+static NativeModuleSource OpenNativeModuleSource(const std::string& guest_path) {
+	NativeModuleSource source;
+	const auto         psm_path = WithoutPsmSandboxWord(guest_path, "/");
+	const bool mscorlib_alias   = std::getenv("KYTY_DIAGNOSTIC_PSM_MSCORLIB_AOT_LOAD") != nullptr &&
+	                              psm_path == "/common_ex/lib/mono/2.1/mscorlib.dll.sprx";
+	auto       native_aot_guest_path = ResolvePsmNativeAotLoaderAlias(psm_path);
+	if (native_aot_guest_path == psm_path) native_aot_guest_path = guest_path;
+	const bool        native_aot_alias   = native_aot_guest_path != guest_path;
+	const char*       native_alias_label = guest_path.ends_with(".dll.sprx")
+	                                           ? "PSM_NATIVE_AOT_LOADER_ALIAS"
+	                                           : "PSM_NATIVE_MODULE_LOADER_ALIAS";
+	const std::string canonical_guest_path =
+	    mscorlib_alias ? "/system_ex/common_ex/lib/mscorlib.dll.sprx" : native_aot_guest_path;
+	source.file_name = LibKernel::FileSystem::GetRealFilename(canonical_guest_path);
+	if (!source.file_name.empty()) {
+		source.result =
+		    ReadNativeModuleSnapshot(canonical_guest_path, source.file_name, &source.image);
+		ApplyNativeModuleOverlay(canonical_guest_path, &source);
+		if (mscorlib_alias && source.result == OK) {
+			LOGF("FIRST_FRAME_AUDIT PSM_MSCORLIB_NATIVE_ALIAS guest=%s canonical=%s source=%s\n",
+			     Log::EscapeField(guest_path).c_str(), canonical_guest_path.c_str(),
+			     Log::EscapeField(Common::PathToString(source.file_name)).c_str());
+		}
+		if (native_aot_alias && source.result == OK) {
+			LOGF("FIRST_FRAME_AUDIT %s guest=%s canonical=%s source=%s\n", native_alias_label,
+			     Log::EscapeField(guest_path).c_str(), canonical_guest_path.c_str(),
+			     Log::EscapeField(Common::PathToString(source.file_name)).c_str());
+		}
+		return source;
+	}
+	LibKernel::DirectoryPassthrough::FileSnapshot snapshot;
+	source.result =
+	    LibKernel::DirectoryPassthrough::OpenFileSnapshot(canonical_guest_path, &snapshot);
+	if (source.result == OK) {
+		if (snapshot.bytes.empty()) {
+			source.result = LibKernel::KERNEL_ERROR_ENOEXEC;
+			return source;
+		}
+		source.file_name       = std::move(snapshot.host_path);
+		source.provider_handle = std::move(snapshot.handle);
+		source.image           = std::move(snapshot.bytes);
+		ApplyNativeModuleOverlay(canonical_guest_path, &source);
+		if (mscorlib_alias && source.result == OK) {
+			LOGF("FIRST_FRAME_AUDIT PSM_MSCORLIB_NATIVE_ALIAS guest=%s canonical=%s source=%s\n",
+			     Log::EscapeField(guest_path).c_str(), canonical_guest_path.c_str(),
+			     Log::EscapeField(Common::PathToString(source.file_name)).c_str());
+		}
+		if (native_aot_alias && source.result == OK) {
+			LOGF("FIRST_FRAME_AUDIT %s guest=%s canonical=%s source=%s\n", native_alias_label,
+			     Log::EscapeField(guest_path).c_str(), canonical_guest_path.c_str(),
+			     Log::EscapeField(Common::PathToString(source.file_name)).c_str());
+		}
+	}
+	return source;
+}
+
 LIB_VERSION("libkernel", 1, "libkernel", 1, 1);
 
 namespace LibKernelApr {
@@ -441,6 +545,21 @@ static KYTY_SYSV_ABI const char** getargv() {
 	return LibC::GetArgv();
 }
 
+static KYTY_SYSV_ABI const char* KernelGetFsSandboxRandomWord() {
+	static thread_local std::array<char, 0x100> word {};
+	uint64_t                                    length = 0xff;
+	NativeKernelBridge::SyscallRequest          request;
+	request.number    = 0x25a;
+	request.args      = {0, reinterpret_cast<uint64_t>(word.data()),
+	                     reinterpret_cast<uint64_t>(&length)};
+	const auto result = NativeKernelBridge::DispatchSyscall(request);
+	if (result.value == -1) {
+		*Posix::GetErrorAddr() = result.posix_errno;
+		return nullptr;
+	}
+	return length == 0 ? "" : word.data();
+}
+
 static void dump_stack_chk_fail_context(uint64_t caller, uint64_t rsp) {
 	LOGF("stack_chk_fail caller = 0x%016" PRIx64 "\n", caller);
 	LOGF("stack_chk_fail guard  = 0x%016" PRIx64 " @ 0x%016" PRIx64 "\n", g_stack_chk_guard,
@@ -634,6 +753,7 @@ static bool WriteSignalMask(void* destination, const PthreadSignalMask& mask) {
 }
 
 void KernelDispatchPendingSignalForCurrentThread();
+
 int KernelSigprocmask(int how, const void* set, void* oset) {
 	static_assert(sizeof(PthreadSignalMask) == 16);
 	PthreadSignalMask requested {};
@@ -668,15 +788,22 @@ int KernelSigprocmask(int how, const void* set, void* oset) {
 static KYTY_SYSV_ABI int sigprocmask(int how, const void* set, void* oset) {
 	return POSIX_CALL(KernelSigprocmask(how, set, oset));
 }
+
 struct GuestSigaction {
 	uint64_t handler = 0;
 	uint32_t flags   = 0;
 	uint32_t mask[4] {};
 	uint32_t padding = 0;
 };
+static_assert(offsetof(GuestSigaction, handler) == 0);
+static_assert(offsetof(GuestSigaction, flags) == 8);
+static_assert(offsetof(GuestSigaction, mask) == 12);
+static_assert(sizeof(GuestSigaction) == 32);
+
 static std::mutex                      g_guest_sigaction_mutex;
 static std::array<GuestSigaction, 129> g_guest_sigactions;
 static std::atomic_uint32_t            g_guest_sigaction_calls {0};
+
 static bool ReadGuestSigaction(const GuestSigaction* source, GuestSigaction* action) {
 	if (Memory::CopyFromGuest(action, source, sizeof(*action))) {
 		return true;
@@ -687,6 +814,7 @@ static bool ReadGuestSigaction(const GuestSigaction* source, GuestSigaction* act
 	std::memcpy(action, source, sizeof(*action));
 	return true;
 }
+
 static bool WriteGuestSigaction(GuestSigaction* destination, const GuestSigaction& action) {
 	if (Memory::CopyToGuest(destination, &action, sizeof(action))) {
 		return true;
@@ -697,10 +825,12 @@ static bool WriteGuestSigaction(GuestSigaction* destination, const GuestSigactio
 	std::memcpy(destination, &action, sizeof(action));
 	return true;
 }
+
 static int GuestSigactionError(int error) {
 	*Posix::GetErrorAddr() = error;
 	return -1;
 }
+
 static bool IsValidGuestSigaction(int signum, const GuestSigaction& action) {
 	constexpr uint32_t allowed_flags = 0x7f;
 	if (action.handler != 0 && action.handler != 1 && (action.flags & ~allowed_flags) != 0) {
@@ -711,6 +841,7 @@ static bool IsValidGuestSigaction(int signum, const GuestSigaction& action) {
 	}
 	return true;
 }
+
 static int KYTY_SYSV_ABI GuestSigactionCall(int signum, const GuestSigaction* requested,
                                             GuestSigaction* previous) {
 	if (signum < 1 || signum > 128 || signum == 32) {
@@ -746,6 +877,13 @@ static int KYTY_SYSV_ABI GuestSigactionCall(int signum, const GuestSigaction* re
 	}
 	return 0;
 }
+
+void ResetGuestSigactionForTesting() {
+	std::lock_guard lock(g_guest_sigaction_mutex);
+	g_guest_sigactions.fill({});
+	g_guest_sigaction_calls.store(0, std::memory_order_relaxed);
+}
+
 static bool IsAllowedExceptionSignal(int signum) {
 	constexpr int POSIX_SIGHUP  = 1;
 	constexpr int POSIX_SIGILL  = 4;
@@ -1337,6 +1475,12 @@ void KernelDispatchPendingSignalForCurrentThread() {
 		return;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// callers drop host locks first: a guest handler may run here, and a pending
+	// pthread_suspend_user_context_np needs the same
+	PthreadParkForSuspend(current);
+#endif
+
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
 		if (PthreadIsSignalBlocked(current, signum) || !PthreadTakePendingSignal(current, signum)) {
 			continue;
@@ -1387,6 +1531,7 @@ static int KYTY_SYSV_ABI KernelRemoveExceptionHandler(int signum) {
 static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	constexpr int POSIX_SIGUSR1 = 30;
 
+	thread = PthreadHostObjectFor(thread);
 	if (signum != POSIX_SIGUSR1 || thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -1473,6 +1618,161 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	return OK;
 }
 
+// Mono loads one AOT module from several threads and closes the extras. Recursive: module_stop may
+// unload others.
+static std::recursive_mutex  g_module_load_mutex;
+static thread_local uint32_t g_module_lifecycle_callback_depth = 0;
+
+class ModuleLifecycleCallbackScope {
+public:
+	ModuleLifecycleCallbackScope() { ++g_module_lifecycle_callback_depth; }
+	~ModuleLifecycleCallbackScope() { --g_module_lifecycle_callback_depth; }
+
+	KYTY_CLASS_NO_COPY(ModuleLifecycleCallbackScope);
+};
+
+enum class ModuleStartStatus { Starting, Succeeded, Failed };
+
+struct ModuleStartOperation {
+	std::condition_variable_any completed;
+	std::thread::id             owner;
+	ModuleStartStatus           status       = ModuleStartStatus::Starting;
+	int32_t                     handle       = -1;
+	int                         start_result = 0;
+	uint32_t                    waiters      = 0;
+};
+
+static std::unordered_map<Loader::Program*, std::shared_ptr<ModuleStartOperation>>
+    g_module_start_operations;
+
+static KernelModule AcquireLoadedProgram(Loader::RuntimeLinker* rt, Loader::Program* program,
+                                         int* res, std::unique_lock<std::recursive_mutex>& lock) {
+	const auto found = g_module_start_operations.find(program);
+	if (found != g_module_start_operations.end()) {
+		const auto operation = found->second;
+		const auto current   = std::this_thread::get_id();
+		const bool owns_start =
+		    std::any_of(g_module_start_operations.begin(), g_module_start_operations.end(),
+			            [&](const auto& item) {
+			                return item.second->status == ModuleStartStatus::Starting &&
+							       item.second->owner == current;
+		                });
+		if (owns_start || g_module_lifecycle_callback_depth != 0) {
+			if (res != nullptr) *res = KERNEL_ERROR_EBUSY;
+			return KERNEL_ERROR_EBUSY;
+		}
+		if (operation->waiters == std::numeric_limits<uint32_t>::max() - 1u) {
+			if (res != nullptr) *res = KERNEL_ERROR_EOVERFLOW;
+			return KERNEL_ERROR_EOVERFLOW;
+		}
+		++operation->waiters;
+		operation->completed.wait(lock,
+		                          [&] { return operation->status != ModuleStartStatus::Starting; });
+		if (operation->status == ModuleStartStatus::Failed) {
+			if (res != nullptr) *res = operation->start_result;
+			return KERNEL_ERROR_ESTART;
+		}
+		if (res != nullptr) *res = OK;
+		return static_cast<KernelModule>(operation->handle);
+	}
+
+	const int acquired = rt->AcquireProgram(program);
+	if (res != nullptr) *res = acquired;
+	if (acquired != OK) return acquired;
+	return static_cast<KernelModule>(program->unique_id);
+}
+
+static KernelModule KernelLoadStartModuleResolved(const char*        module_file_name,
+                                                  NativeModuleSource source, size_t args,
+                                                  const void* argp, int* res) {
+	auto*       rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto& module_path = source.file_name;
+
+	if (source.result != OK) {
+		// DllImport by bare file name, e.g. libSceComposite from ReactNative.PUI; only an already
+		// loaded system library matches
+		if (std::strpbrk(module_file_name, "/\\") == nullptr) {
+			std::unique_lock lock(g_module_load_mutex);
+			for (const char* base: {"system_ex/priv_ex/lib", "system_ex/common_ex/lib",
+			                        "system/priv/lib", "system/common/lib"}) {
+				const auto path     = fmt::format("/{}/{}", base, module_file_name);
+				const auto resolved = ResolveNativeModulePath(path);
+				auto* loaded = resolved.empty() ? nullptr : rt->FindProgramByFileName(resolved);
+				if (loaded != nullptr) {
+					LOGF("\tmodule already loaded = %s\n", path.c_str());
+					return AcquireLoadedProgram(rt, loaded, res, lock);
+				}
+			}
+		}
+		LOGF("\tmodule real path missing = %s\n", Common::PathToString(module_path).c_str());
+		const int error =
+		    std::strpbrk(module_file_name, "/\\") == nullptr ? KERNEL_ERROR_ENOENT : source.result;
+		if (res != nullptr) *res = error;
+		return error;
+	}
+
+	std::unique_lock lock(g_module_load_mutex);
+
+	auto* program = rt->FindProgramByFileName(module_path);
+	if (program != nullptr) {
+		return AcquireLoadedProgram(rt, program, res, lock);
+	}
+
+	program = rt->LoadProgram(module_path, std::move(source.image));
+
+	auto handle = program->unique_id;
+
+	program->dbg_print_reloc = true;
+
+	rt->RelocateProgram(program);
+
+	const int acquired = rt->AcquireProgram(program);
+	if (acquired != OK) {
+		const int unloaded = rt->UnloadProgram(program);
+		if (res != nullptr) *res = acquired;
+		return unloaded == OK ? acquired : unloaded;
+	}
+	const auto operation = std::make_shared<ModuleStartOperation>();
+	operation->owner     = std::this_thread::get_id();
+	operation->handle    = handle;
+	g_module_start_operations.emplace(program, operation);
+	lock.unlock();
+	int result = rt->StartModule(program, args, argp, nullptr);
+
+	LOGF("\tmodule_start() result = %d\n", result);
+
+	if (res != nullptr) {
+		*res = result;
+	}
+
+	// start entry failed: stop, unload, ESTART. XXX: older-SDK EINVAL / keep-handle cases not
+	// handled
+	if (result < 0) {
+		if (program->dynamic_info->fini_vaddr != 0) {
+			rt->StopModule(program, 0, nullptr, nullptr);
+		}
+		lock.lock();
+		g_module_start_operations.erase(program);
+		const int unloaded = rt->UnloadProgram(program);
+		EXIT_IF(unloaded != OK);
+		operation->start_result = result;
+		operation->status       = ModuleStartStatus::Failed;
+		operation->completed.notify_all();
+		return KERNEL_ERROR_ESTART;
+	}
+
+	lock.lock();
+	for (uint32_t i = 0; i < operation->waiters; ++i) {
+		EXIT_IF(rt->AcquireProgram(program) != OK);
+	}
+	g_module_start_operations.erase(program);
+	operation->start_result = result;
+	operation->status       = ModuleStartStatus::Succeeded;
+	operation->completed.notify_all();
+
+	return static_cast<KernelModule>(handle);
+}
+
 static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_name, size_t args,
                                                         const void* argp, uint32_t flags,
                                                         const KernelLoadModuleOpt* opt, int* res) {
@@ -1485,46 +1785,236 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 	EXIT_NOT_IMPLEMENTED(flags != 0);
 	EXIT_NOT_IMPLEMENTED(opt != nullptr);
 
-	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto source = OpenNativeModuleSource(std::string(module_file_name));
+	return KernelLoadStartModuleResolved(module_file_name, std::move(source), args, argp, res);
+}
 
-	auto module_path = FileSystem::GetRealFilename(std::string(module_file_name));
-	if (!Common::File::IsFileExisting(module_path)) {
-		LOGF("\tmodule real path missing = %s\n", Common::PathToString(module_path).c_str());
+// Mono: Y1nEpkCieOY with the six-argument sceKernelLoadStartModule ABI, then dlsym, for the
+// *.dll.sprx companions
+// TODO: limited to PSM's paths and flags until general loader flags and mounts are modelled
+bool IsPsmNativeAotMscorlibOnlyRequest(const char* module_file_name, size_t args, const void* argp,
+                                       uint32_t flags, const KernelLoadModuleOpt* opt,
+                                       const int* res) {
+	return module_file_name != nullptr &&
+	       std::strcmp(module_file_name, "//common_ex/lib/mono/2.1/mscorlib.dll.sprx") == 0 &&
+	       args == 0 && argp == nullptr && flags == 0x20000 && opt == nullptr && res != nullptr;
+}
+
+static KYTY_SYSV_ABI KernelModule DiagnosticPsmNativeAotLoad(const char* module_file_name,
+                                                             size_t args, const void* argp,
+                                                             uint32_t                   flags,
+                                                             const KernelLoadModuleOpt* opt,
+                                                             int*                       res) {
+	LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD requested=%s args=%" PRIu64
+	     " argp_present=%d flags=0x%08x opt_present=%d res_present=%d\n",
+	     module_file_name != nullptr ? module_file_name : "(null)", static_cast<uint64_t>(args),
+	     argp != nullptr, flags, opt != nullptr, res != nullptr);
+	if (module_file_name == nullptr || res == nullptr || args != 0 || argp != nullptr ||
+	    flags != 0x20000 || opt != nullptr) {
 		if (res != nullptr) {
-			*res = KERNEL_ERROR_ENOENT;
+			*res = KERNEL_ERROR_EINVAL;
 		}
-		return KERNEL_ERROR_ENOENT;
+		LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD rejected unsupported request\n");
+		return KERNEL_ERROR_EINVAL;
+	}
+	const std::string requested(module_file_name);
+	// ShellUI's native AOT app.exe.sprx sits beside app.exe in /app0/psm/Application
+	constexpr const char* app_prefix = "/app0/psm/Application/";
+	if (requested.starts_with(app_prefix) &&
+	    (requested.ends_with(".dll.sprx") || requested.ends_with(".exe.sprx")) &&
+	    requested.find('/', std::strlen(app_prefix)) == std::string::npos &&
+	    requested.find("..") == std::string::npos) {
+		auto       source = OpenNativeModuleSource(requested);
+		const auto actual = source.file_name;
+		if (source.result != OK) {
+			*res = source.result;
+			LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD app native ELF missing=%s\n",
+			     Common::PathToString(actual).c_str());
+			return source.result;
+		}
+		// still an encrypted SELF; the linker would map ciphertext as code
+		std::array<uint8_t, 4> magic {};
+		if (source.image.size() < magic.size() || std::memcmp(source.image.data(),
+		                                                      "\x7f"
+		                                                      "ELF",
+		                                                      magic.size()) != 0) {
+			if (source.image.size() >= magic.size()) {
+				std::memcpy(magic.data(), source.image.data(), magic.size());
+			}
+			*res = KERNEL_ERROR_ENOEXEC;
+			LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD app module is not a decrypted ELF"
+			     " (magic %02x %02x %02x %02x), not loaded: %s\n",
+			     magic[0], magic[1], magic[2], magic[3], Common::PathToString(actual).c_str());
+			return KERNEL_ERROR_ENOEXEC;
+		}
+		const auto handle =
+		    KernelLoadStartModuleResolved(requested.c_str(), std::move(source), 0, nullptr, res);
+		LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD app_elf=%s"
+		     " handle=%d start_result=0x%08x\n",
+		     Common::PathToString(actual).c_str(), static_cast<int>(handle),
+		     static_cast<uint32_t>(*res));
+		return handle;
+	}
+	// Mono probes //common_ex/lib/mono/2.1/<name> and //common_ex/lib/<name>;
+	// System.Reactive.Core.dll.sprx is in the latter
+	constexpr const char* psm_prefix      = "//common_ex/lib/mono/2.1/";
+	constexpr const char* shared_prefix   = "//common_ex/lib/";
+	const char*           accepted_prefix = requested.starts_with(psm_prefix)      ? psm_prefix
+	                                        : requested.starts_with(shared_prefix) ? shared_prefix
+	                                                                               : nullptr;
+	if (accepted_prefix == nullptr || !requested.ends_with(".dll.sprx")) {
+		*res = KERNEL_ERROR_EINVAL;
+		LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD unexpected source namespace\n");
+		return KERNEL_ERROR_EINVAL;
+	}
+	const std::string native_name = requested.substr(std::strlen(accepted_prefix));
+	bool              valid_name  = native_name.size() >= 9 && native_name.size() <= 128 &&
+	                                native_name.find("..") == std::string::npos;
+	for (const char c: native_name) {
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+		      c == '_' || c == '.' || c == '-')) {
+			valid_name = false;
+			break;
+		}
+	}
+	if (!valid_name) {
+		*res = KERNEL_ERROR_EINVAL;
+		LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD rejected unsafe filename\n");
+		return KERNEL_ERROR_EINVAL;
+	}
+	const std::string guest_native = "/system_ex/common_ex/lib/" + native_name;
+	auto              source       = OpenNativeModuleSource(guest_native);
+	const auto        actual       = source.file_name;
+	if (source.result != OK) {
+		*res = source.result;
+		LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD original Sony ELF absent: %s\n",
+		     Common::PathToString(actual).c_str());
+		return source.result;
+	}
+	if (source.image.size() < 4 || std::memcmp(source.image.data(),
+	                                           "\x7f"
+	                                           "ELF",
+	                                           4) != 0) {
+		*res = KERNEL_ERROR_ENOEXEC;
+		LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD original Sony source is not a decrypted ELF\n");
+		return KERNEL_ERROR_ENOEXEC;
+	}
+	const auto handle =
+	    KernelLoadStartModuleResolved(guest_native.c_str(), std::move(source), 0, nullptr, res);
+	LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_AOT_LOAD elf=%s handle=%d start_result=0x%08x\n",
+	     Common::PathToString(actual).c_str(), static_cast<int>(handle),
+	     static_cast<uint32_t>(*res));
+	if (native_name == "Sce.Vsh.ShellUI.CaptureMenu.dll.sprx" &&
+	    std::getenv("KYTY_DIAGNOSTIC_CAPTUREMENU_ATTACH_WINDOW") != nullptr && handle >= 0) {
+		auto*       linker  = Common::Singleton<Loader::RuntimeLinker>::Instance();
+		const auto* program = linker->FindProgramById(handle);
+		if (program != nullptr) {
+			LOGF("FIRST_FRAME_AUDIT CAPTUREMENU_ATTACH_WINDOW base=0x%016" PRIx64
+			     " plt=0x%016" PRIx64 " got=0x%016" PRIx64
+			     " duration_seconds=25 READ_ONLY_DIAGNOSTIC\n",
+			     program->base_vaddr, program->base_vaddr + 0x12b7ec,
+			     program->base_vaddr + 0x285ce0);
+			std::this_thread::sleep_for(std::chrono::seconds(25));
+		}
+	}
+	return handle;
+}
+
+static KYTY_SYSV_ABI KernelModule DiagnosticPsmMscorlibAotLoad(const char* module_file_name,
+                                                               size_t args, const void* argp,
+                                                               uint32_t                   flags,
+                                                               const KernelLoadModuleOpt* opt,
+                                                               int*                       res) {
+	if (!IsPsmNativeAotMscorlibOnlyRequest(module_file_name, args, argp, flags, opt, res)) {
+		if (res != nullptr) {
+			*res = KERNEL_ERROR_EINVAL;
+		}
+		LOGF("FIRST_FRAME_AUDIT PSM_MSCORLIB_AOT_LOAD rejected request\n");
+		return KERNEL_ERROR_EINVAL;
+	}
+	auto source = OpenNativeModuleSource("/system_ex/common_ex/lib/mscorlib.dll.sprx");
+	if (source.result != OK) {
+		*res = source.result;
+		LOGF("FIRST_FRAME_AUDIT PSM_MSCORLIB_AOT_LOAD source_missing result=0x%08x\n",
+		     static_cast<uint32_t>(source.result));
+		return source.result;
+	}
+	if (source.image.size() < 4 || std::memcmp(source.image.data(),
+	                                           "\x7f"
+	                                           "ELF",
+	                                           4) != 0) {
+		*res = KERNEL_ERROR_ENOEXEC;
+		LOGF("FIRST_FRAME_AUDIT PSM_MSCORLIB_AOT_LOAD source_not_decrypted_elf\n");
+		return KERNEL_ERROR_ENOEXEC;
+	}
+	const auto handle = KernelLoadStartModuleResolved("/system_ex/common_ex/lib/mscorlib.dll.sprx",
+	                                                  std::move(source), 0, nullptr, res);
+	LOGF("FIRST_FRAME_AUDIT PSM_MSCORLIB_AOT_LOAD handle=%d result=0x%08x\n",
+	     static_cast<int>(handle), static_cast<uint32_t>(*res));
+	return handle;
+}
+
+static KYTY_SYSV_ABI KernelModule DiagnosticPsmAotLoad(const char* module_file_name, size_t args,
+                                                       const void* argp, uint32_t flags,
+                                                       const KernelLoadModuleOpt* opt, int* res) {
+	const bool  mscorlib = std::getenv("KYTY_DIAGNOSTIC_PSM_MSCORLIB_AOT_LOAD") != nullptr;
+	const bool  native   = std::getenv("KYTY_DIAGNOSTIC_PSM_NATIVE_AOT_LOAD") != nullptr;
+	std::string unworded;
+	if (module_file_name != nullptr) {
+		unworded = WithoutPsmSandboxWord(module_file_name, "//");
+		if (unworded != module_file_name) {
+			LOGF("FIRST_FRAME_AUDIT PSM_SANDBOX_WORD_STRIP guest=%s diagnostic=%s NON_AUTHENTIC\n",
+			     module_file_name, unworded.c_str());
+			module_file_name = unworded.c_str();
+		}
+	}
+	if (mscorlib &&
+	    IsPsmNativeAotMscorlibOnlyRequest(module_file_name, args, argp, flags, opt, res)) {
+		return DiagnosticPsmMscorlibAotLoad(module_file_name, args, argp, flags, opt, res);
+	}
+	if (native) {
+		return DiagnosticPsmNativeAotLoad(module_file_name, args, argp, flags, opt, res);
+	}
+	return DiagnosticPsmMscorlibAotLoad(module_file_name, args, argp, flags, opt, res);
+}
+
+int KYTY_SYSV_ABI KernelLoadModuleByName(const char* module_name, size_t args, const void* argp,
+                                         uint32_t flags, int* res) {
+	PRINT_NAME();
+
+	if (module_name == nullptr || *module_name == '\0' || flags != 0) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	auto* program = rt->FindProgramByFileName(module_path);
-	if (program != nullptr) {
-		++program->load_count;
-		if (res != nullptr) {
-			*res = OK;
-		}
-		return static_cast<KernelModule>(program->unique_id);
+	const std::string name(module_name);
+	if (name.find_first_of("/\\") != std::string::npos) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
-	program = rt->LoadProgram(module_path);
-
-	auto handle = program->unique_id;
-
-	program->dbg_print_reloc = true;
-
-	rt->RelocateProgram(program);
-
-	program->load_count = 1;
-	int result = rt->StartModule(program, args, argp, nullptr);
-
-	LOGF("\tmodule_start() result = %d\n", result);
-
-	EXIT_NOT_IMPLEMENTED(result < 0);
+	for (const char* base: {"system_ex/priv_ex/lib", "system_ex/common_ex/lib", "system/priv/lib",
+	                        "system/common/lib"}) {
+		for (const char* extension: {".sprx", ".prx"}) {
+			const auto path   = fmt::format("/{}/{}{}", base, name, extension);
+			auto       source = OpenNativeModuleSource(path);
+			if (source.result == OK) {
+				const auto result =
+				    KernelLoadStartModuleResolved(path.c_str(), std::move(source), args, argp, res);
+				LOGF("FIRST_FRAME_AUDIT named_sysmodule_load name=%s path=%s result=0x%08x\n",
+				     module_name, path.c_str(), static_cast<uint32_t>(result));
+				return result;
+			}
+			if (source.result != KERNEL_ERROR_ENOENT) {
+				if (res != nullptr) *res = source.result;
+				return source.result;
+			}
+		}
+	}
 
 	if (res != nullptr) {
-		*res = result;
+		*res = KERNEL_ERROR_ENOENT;
 	}
-
-	return static_cast<KernelModule>(handle);
+	LOGF("FIRST_FRAME_AUDIT named_sysmodule_not_found name=%s\n", module_name);
+	return KERNEL_ERROR_ENOENT;
 }
 
 static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
@@ -1536,8 +2026,11 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr || handle == 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	std::lock_guard lock(g_module_load_mutex);
 
 	auto* program = rt->FindProgramById(handle);
 
@@ -1546,34 +2039,49 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	if (program->load_count > 1) {
-		--program->load_count;
+	bool      retained = false;
+	const int released = rt->ReleaseProgram(program, &retained);
+	if (released != OK) {
+		return released;
+	}
+	if (retained) {
+		if (res != nullptr) *res = OK;
 		return OK;
 	}
 
-	if (g_get_thread_atexit_count_func != nullptr &&
-	    g_get_thread_atexit_count_func(program->unique_id) > 0) {
+	bool has_thread_atexit = false;
+	if (g_get_thread_atexit_count_func != nullptr) {
+		ModuleLifecycleCallbackScope callback_scope;
+		has_thread_atexit = g_get_thread_atexit_count_func(program->unique_id) > 0;
+	}
+	if (has_thread_atexit) {
 		LOGF("KernelStopUnloadModule: cannot unload %s\n",
 		     Common::PathToString(program->file_name).c_str());
 		if (g_thread_atexit_report_func != nullptr) {
+			ModuleLifecycleCallbackScope callback_scope;
 			g_thread_atexit_report_func(program->unique_id);
 		}
+		EXIT_IF(rt->AcquireProgram(program) != OK);
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	int result = rt->StopModule(program, args, argp, nullptr);
+	int result = 0;
+	{
+		ModuleLifecycleCallbackScope callback_scope;
+		result = rt->StopModule(program, args, argp, nullptr);
+	}
 
 	LOGF("\tmodule_stop() result = %d\n", result);
-
-	EXIT_NOT_IMPLEMENTED(result < 0);
 
 	if (res != nullptr) {
 		*res = result;
 	}
 
-	rt->UnloadProgram(program);
+	return rt->UnloadProgram(program);
+}
 
-	return OK;
+int KYTY_SYSV_ABI KernelUnloadModuleByHandle(KernelModule handle, int* res) {
+	return KernelStopUnloadModule(handle, 0, nullptr, 0, nullptr, res);
 }
 
 static void* KYTY_SYSV_ABI tls_get_addr(TlsInfo* info) {
@@ -1613,12 +2121,24 @@ static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
 	return OK;
 }
 
+static int KYTY_SYSV_ABI KernelIsM2DeviceAttached(int* attached) {
+	PRINT_NAME();
+
+	if (attached == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	*attached = 0;
+
+	return OK;
+}
+
 static int KYTY_SYSV_ABI KernelFsync(int fd) {
 	PRINT_NAME();
 
 	LOGF("\t fd = %d\n", fd);
 
-	return OK;
+	return FileSystem::KernelFsync(fd);
 }
 
 static void KYTY_SYSV_ABI KernelSync() {
@@ -1628,7 +2148,7 @@ static void KYTY_SYSV_ABI KernelSync() {
 static int KYTY_SYSV_ABI getpid() {
 	PRINT_NAME();
 
-	return 100;
+	return Process::GetPid();
 }
 
 static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
@@ -1662,10 +2182,8 @@ static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 	if (d > 2) {
 		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
 	}
-
-	int size_int = static_cast<int>(size);
-
-	return size_int;
+	// stdout/stderr may be dup2'd onto pipes ShellUI reads, so this goes through KernelWrite
+	return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {
@@ -1681,6 +2199,13 @@ static int KYTY_SYSV_ABI fsync(int d) {
 }
 
 static int KYTY_SYSV_ABI close(int d) {
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr && (d == 10 || d == 11)) {
+		static std::atomic_uint32_t trace_count {0};
+		if (trace_count.fetch_add(1) < 16) {
+			LOGF("SYSCORE_GUEST_LIBKERNEL_CLOSE_CALLER return=%p fd=%d\n",
+			     __builtin_return_address(0), d);
+		}
+	}
 	if (d < 0) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
 		return -1;
@@ -1703,6 +2228,7 @@ static int KYTY_SYSV_ABI ioctl(int d, uint64_t request, void* arg) {
 	}
 	return POSIX_N_CALL(FileSystem::KernelIoctl(d, request, arg));
 }
+
 static int KYTY_SYSV_ABI sysctlbyname(const char* name, void* oldp, size_t* oldlenp,
                                       const void* newp, size_t newlen) {
 	if (name == nullptr || oldlenp == nullptr) {
@@ -1736,6 +2262,7 @@ static int KYTY_SYSV_ABI sysctlbyname(const char* name, void* oldp, size_t* oldl
 	*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
 	return -1;
 }
+
 int KYTY_SYSV_ABI KernelSysctl(const uint32_t* mib, uint32_t mib_count, void* oldp, size_t* oldlenp,
                                const void* newp, size_t newlen) {
 	if (mib == nullptr) {
@@ -1850,20 +2377,25 @@ int KYTY_SYSV_ABI KernelSysctl(const uint32_t* mib, uint32_t mib_count, void* ol
 	*Posix::GetErrorAddr() = Posix::POSIX_ENOENT;
 	return -1;
 }
+
 int KYTY_SYSV_ABI KernelSysctlStub(const uint32_t* mib, uint32_t mib_count, void* oldp,
                                    size_t* oldlenp, const void* newp, size_t newlen) {
 	return KernelSysctl(mib, mib_count, oldp, oldlenp, newp, newlen) == 0 ? 0
 	                                                                      : *Posix::GetErrorAddr();
 }
+
 int KYTY_SYSV_ABI KernelNativeOpen(const char* path, int flags, int mode) {
 	return POSIX_N_CALL(FileSystem::KernelOpen(path, flags, (flags & 0x200) != 0 ? mode : 0));
 }
+
 int64_t KYTY_SYSV_ABI KernelNativeWrite(int d, const void* buf, size_t nbytes) {
 	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
 }
+
 int KYTY_SYSV_ABI KernelNativeClose(int d) {
 	return POSIX_CALL(FileSystem::KernelClose(d));
 }
+
 // non-zero *error goes to libkernel's cerror (+0xd4), which sets errno and returns -1
 int64_t KYTY_SYSV_ABI KernelRawSyscallStub(uint64_t arg0, uint64_t arg1, uint64_t arg2,
                                            uint64_t arg3, uint64_t arg4, uint64_t arg5,
@@ -1888,6 +2420,7 @@ int64_t KYTY_SYSV_ABI KernelRawSyscallStub(uint64_t arg0, uint64_t arg1, uint64_
 	*error = static_cast<uint64_t>(posix_errno);
 	return reply.value;
 }
+
 // called mid-wrapper by the census stub (+0x47080) on any thread, so the line is built on the stack
 void KYTY_SYSV_ABI KernelRawSyscallCensus(uint64_t number, uint64_t caller) {
 	static std::atomic_uint64_t calls[0x300];
@@ -1905,6 +2438,78 @@ void KYTY_SYSV_ABI KernelRawSyscallCensus(uint64_t number, uint64_t caller) {
 		::Log::Write(std::string_view(line, static_cast<size_t>(length)));
 	}
 }
+
+static int KYTY_SYSV_ABI KernelGetIdTableCurrentCount() {
+	static std::atomic_uint32_t call_count {0};
+
+	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
+	if (count < 8 || (count % 1024) == 0) {
+		PRINT_NAME();
+		LOGF("\tcall = %u, return = ENOENT (no id table)\n", count + 1);
+	}
+
+	// sysctl {CTL_KERN, KERN_PROC, 37, -1}. No handle id table here, answer as a missing node
+	return KERNEL_ERROR_ENOENT;
+}
+
+struct ProcessProperty {
+	const void* value;
+	uint64_t    flags;
+	uint64_t    arg4;
+	uint64_t    arg5;
+};
+
+static std::mutex                                       g_process_properties_mutex;
+static std::unordered_map<std::string, ProcessProperty> g_process_properties;
+
+static int KYTY_SYSV_ABI KernelSetProcessProperty(const char* name, const void* value,
+                                                  uint64_t flags, uint64_t arg4, uint64_t arg5) {
+	if (name == nullptr || value == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_LOG_AREA") != nullptr &&
+	    std::strcmp(name, "Sce.PSM:LogArea") == 0 && flags != 0 && flags <= 0x40000 && arg4 == 0 &&
+	    arg5 == 0) {
+		constexpr uint64_t CaptureLimit = 0x10000;
+		const auto         captured     = static_cast<size_t>(std::min(flags, CaptureLimit));
+		std::vector<char>  snapshot(captured);
+		const bool         readable = Memory::CopyFromGuest(snapshot.data(), value, captured);
+		if (readable) {
+			const auto text    = std::string_view(snapshot.data(), snapshot.size());
+			const auto escaped = Log::EscapeField(text);
+			LOGF("SHELLUI_PSM_LOG_AREA_CAPTURE guest_pid=%d guest_tid=%d bytes_total=%" PRIu64
+			     " bytes_captured=%zu truncated=%u text=\"%s\" outcome_unchanged=1\n",
+			     Process::GetPid(), PthreadGetthreadid(), flags, captured,
+			     captured < flags ? 1u : 0u, escaped.c_str());
+		} else {
+			LOGF("SHELLUI_PSM_LOG_AREA_CAPTURE guest_pid=%d guest_tid=%d bytes_total=%" PRIu64
+			     " readable=0 outcome_unchanged=1\n",
+			     Process::GetPid(), PthreadGetthreadid(), flags);
+		}
+	}
+	const bool gnm_property      = std::strcmp(name, "Sce.Debug:Gnm") == 0 && flags == 0x180000;
+	const bool user_object_table = std::strcmp(name, "Sce.Debug:UserObjArray") == 0 && flags == 0;
+	if ((!gnm_property && !user_object_table) || arg4 != 0 || arg5 != 0) {
+		LOGF("KERNEL_PROCESS_PROPERTY unsupported registration name=%s flags=0x%016" PRIx64
+		     " args=0x%016" PRIx64 ",0x%016" PRIx64 "\n",
+		     name, flags, arg4, arg5);
+		return KERNEL_ERROR_EINVAL;
+	}
+	std::lock_guard lock(g_process_properties_mutex);
+	auto [it, inserted] =
+	    g_process_properties.emplace(name, ProcessProperty {value, flags, arg4, arg5});
+	if (!inserted) {
+		if (it->second.value != value || it->second.flags != flags || it->second.arg4 != arg4 ||
+		    it->second.arg5 != arg5) {
+			return KERNEL_ERROR_EEXIST;
+		}
+	}
+	LOGF("KERNEL_PROCESS_PROPERTY registered %s value=0x%016" PRIx64 " flags=0x%016" PRIx64
+	     " (kernel consumers not yet implemented)\n",
+	     name, reinterpret_cast<uint64_t>(value), flags);
+	return OK;
+}
+
 static int64_t KYTY_SYSV_ABI read(int d, void* buf, uint64_t nbytes) {
 	// PRINT_NAME();
 
@@ -2149,12 +2754,125 @@ static int KYTY_SYSV_ABI KernelGetModuleInfoFromAddr(uint64_t addr, int n, Modul
 	     "\tn = %d\n",
 	     addr, n);
 
-	EXIT_NOT_IMPLEMENTED(n != 2);
 	EXIT_NOT_IMPLEMENTED(r == nullptr);
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
 	auto* p = rt->FindProgramByAddr(addr);
+	if (p != nullptr && std::getenv("KYTY_DIAGNOSTIC_CAPTUREMENU_AOT_GOT") != nullptr &&
+	    p->file_name.filename() == "Sce.Vsh.ShellUI.CaptureMenu.dll.sprx" &&
+	    p->base_size_aligned >= 0x285ce8) {
+		static std::atomic<uint64_t> previous {UINT64_MAX};
+		const auto* slot  = reinterpret_cast<const uint64_t*>(p->base_vaddr + 0x285ce0);
+		uint64_t    value = 0;
+		std::memcpy(&value, slot, sizeof(value));
+		const uint64_t prior = previous.exchange(value, std::memory_order_relaxed);
+		if (prior != value) {
+			LOGF("FIRST_FRAME_AUDIT CAPTUREMENU_AOT_GOT module=%d slot=0x%016" PRIx64
+			     " value=0x%016" PRIx64 " previous=0x%016" PRIx64 " mode=%d READ_ONLY_DIAGNOSTIC\n",
+			     p->unique_id, p->base_vaddr + 0x285ce0, value, prior, n);
+			const auto* target = rt->FindProgramByAddr(value);
+			if (target != nullptr && target->file_name.filename() == "mscorlib.dll.sprx" &&
+			    value >= target->base_vaddr && target->base_size_aligned >= 18 &&
+			    value - target->base_vaddr <= target->base_size_aligned - 18) {
+				const auto* code = reinterpret_cast<const uint8_t*>(value);
+				if (code[0] == 0x48 && code[1] == 0x8b && code[2] == 0x05 && code[12] == 0xff &&
+				    code[13] == 0x15) {
+					int32_t load_disp = 0;
+					int32_t call_disp = 0;
+					std::memcpy(&load_disp, code + 3, 4);
+					std::memcpy(&call_disp, code + 14, 4);
+					const uint64_t load_slot  = value + 7 + static_cast<int64_t>(load_disp);
+					const uint64_t call_slot  = value + 18 + static_cast<int64_t>(call_disp);
+					const auto*    load_owner = rt->FindProgramByAddr(load_slot);
+					const auto*    call_owner = rt->FindProgramByAddr(call_slot);
+					if (load_owner == target && call_owner == target) {
+						uint64_t load_value = 0;
+						uint64_t call_value = 0;
+						std::memcpy(&load_value, reinterpret_cast<const void*>(load_slot), 8);
+						std::memcpy(&call_value, reinterpret_cast<const void*>(call_slot), 8);
+						LOGF("FIRST_FRAME_AUDIT CAPTUREMENU_AOT_TRAMPOLINE entry=0x%016" PRIx64
+						     " load_slot=0x%016" PRIx64 " load_value=0x%016" PRIx64
+						     " call_slot=0x%016" PRIx64 " call_value=0x%016" PRIx64
+						     " READ_ONLY_DIAGNOSTIC\n",
+						     value, load_slot, load_value, call_slot, call_value);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+						MEMORY_BASIC_INFORMATION region {};
+						if (::VirtualQuery(reinterpret_cast<const void*>(load_value), &region,
+						                   sizeof(region)) != 0 &&
+						    region.State == MEM_COMMIT &&
+						    (region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
+						    (region.Protect &
+						     (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+						      PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0 &&
+						    load_value >= reinterpret_cast<uint64_t>(region.BaseAddress) &&
+						    region.RegionSize >= 64 &&
+						    load_value - reinterpret_cast<uint64_t>(region.BaseAddress) <=
+						        region.RegionSize - 64) {
+							uint64_t words[8] {};
+							std::memcpy(words, reinterpret_cast<const void*>(load_value),
+							            sizeof(words));
+							LOGF(
+							    "FIRST_FRAME_AUDIT CAPTUREMENU_AOT_DESCRIPTOR address=0x%016" PRIx64
+							    " words=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+							    ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+							    " READ_ONLY_DIAGNOSTIC\n",
+							    load_value, words[0], words[1], words[2], words[3], words[4],
+							    words[5], words[6], words[7]);
+						}
+#endif
+					}
+				}
+			}
+		}
+	}
+	if (n != 2) {
+		// Mono's AOT unwind setup reads .eh_frame_hdr from +0x148; a handle-only answer leaves a
+		// stack pointer there
+		const auto basename = p != nullptr ? p->file_name.filename().string() : std::string {};
+		const auto normalized_path =
+		    p != nullptr ? Common::FixFilenameSlash(Common::PathToString(p->file_name))
+			             : std::string {};
+		const bool verified_native_aot_path =
+		    basename.ends_with(".dll.sprx") &&
+		    normalized_path.find("/system_ex/common_ex/lib/") != std::string::npos;
+		const bool allow_mode_1 =
+		    (n == 1 && std::getenv("KYTY_DIAGNOSTIC_PSM_AOT_MODULE_INFO1") != nullptr &&
+			 p != nullptr &&
+			 (verified_native_aot_path ||
+			  (basename == "app.exe.sprx" &&
+			   std::getenv("KYTY_DIAGNOSTIC_PSM_SHELLUI_MANAGED_APP") != nullptr)));
+		LOGF("FIRST_FRAME_AUDIT PSM_AOT_MODULE_INFO addr=0x%016" PRIx64 " mode=%d size=%" PRIu64
+		     " program=%s allow=%d\n",
+		     addr, n, r->size,
+		     p != nullptr ? Common::PathToString(p->file_name).c_str() : "(unmapped)",
+		     allow_mode_1);
+		// +0x36040 answers mode 1 for any caller, ESRCH with a zeroed buffer outside every module
+		EXIT_NOT_IMPLEMENTED(n != 1);
+		if (p == nullptr) {
+			std::memset(r, 0, sizeof(ModuleInfo));
+			return KERNEL_ERROR_ESRCH;
+		}
+		const auto* ehdr = p->elf->GetEhdr();
+		const auto* phdr = p->elf->GetPhdr();
+		EXIT_NOT_IMPLEMENTED(ehdr == nullptr || phdr == nullptr);
+		uint64_t           eh_frame_hdr_address = 0;
+		uint64_t           eh_frame_hdr_length  = 0;
+		constexpr uint32_t kPtGnuEhFrame        = 0x6474e550;
+		for (uint16_t i = 0; i < ehdr->e_phnum; ++i) {
+			if (phdr[i].p_type == kPtGnuEhFrame && phdr[i].p_filesz >= 12) {
+				eh_frame_hdr_address = p->base_vaddr + phdr[i].p_vaddr;
+				eh_frame_hdr_length  = phdr[i].p_filesz;
+				break;
+			}
+		}
+		EXIT_NOT_IMPLEMENTED(allow_mode_1 && eh_frame_hdr_address == 0);
+		std::memcpy(reinterpret_cast<uint8_t*>(r) + 0x148, &eh_frame_hdr_address,
+		            sizeof(eh_frame_hdr_address));
+		LOGF("FIRST_FRAME_AUDIT PSM_AOT_EH_FRAME_HDR addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " loaded=%s\n",
+		     eh_frame_hdr_address, eh_frame_hdr_length, Common::PathToString(p->file_name).c_str());
+	}
 
 	if (p == nullptr) {
 		LOGF("\thandle: not found\n");
@@ -2321,7 +3039,141 @@ static int KYTY_SYSV_ABI KernelIpmiManagerCall(uint32_t command, int32_t client_
 		}
 		return kernel_result;
 	}
+	static std::atomic<int32_t> next_client_id          = 1;
+	static std::atomic<int32_t> psm_shared_dmem_client  = 0;
+	static std::atomic<bool>    psm_shared_dmem_created = false;
+	if (command == 2 && std::getenv("KYTY_DIAGNOSTIC_PSM_SHARED_DMEM_RESPONDER") != nullptr &&
+	    args != nullptr && args_size >= sizeof(uint64_t) * 3 &&
+	    reinterpret_cast<const char**>(args)[1] != nullptr &&
+	    std::strcmp(reinterpret_cast<const char**>(args)[1], "ScePsmSharedDmem") == 0) {
+		*result                = next_client_id.fetch_add(1, std::memory_order_relaxed);
+		psm_shared_dmem_client = *result;
+	} else if (command == 0x320 &&
+	           std::getenv("KYTY_DIAGNOSTIC_PSM_SHARED_DMEM_RESPONDER") != nullptr &&
+	           client_id != 0 && client_id == psm_shared_dmem_client && args != nullptr &&
+	           args_size >= 0x30 && *static_cast<uint32_t*>(args) == 0x34560000) {
+		// ScePsmSharedDmem Create (SceShellCore's server). Block is {method, in count, out count,
+		// in list, out list, method result}; the caller opens the 1 MiB object by name
+		auto* values = reinterpret_cast<uint64_t*>(args);
+		auto* in     = reinterpret_cast<uint32_t**>(values[2]);
+		auto* out    = reinterpret_cast<uint8_t**>(values[3]);
+		auto* status = reinterpret_cast<int32_t*>(values[4]);
+		if (in == nullptr || *in == nullptr || out == nullptr || *out == nullptr ||
+		    status == nullptr) {
+			return -22;
+		}
+		const uint32_t       type   = **in;
+		const auto           name   = fmt::format("/ScePsmSharedDmem_{:08X}", type);
+		int                  object = -1;
+		uint64_t             size   = 0;
+		Process::PeerProcess caller;
+		if (!Process::FindPeerByPid(Process::GetPid(), &caller) ||
+		    caller.auth_id != 0x480000000000000Full) {
+			*status = static_cast<int32_t>(0x81668204u);
+		} else if (type > 2) {
+			*status = static_cast<int32_t>(0x81668206u);
+		} else if (psm_shared_dmem_created ||
+		           Memory::OpenScopeSharedMemory(name.c_str(), 0xa02, &object, &size) != 0) {
+			*status = static_cast<int32_t>(0x81668204u);
+		} else {
+			Memory::ResizeScopeSharedMemory(object, 0x100000);
+			psm_shared_dmem_created = true;
+			// +0x10 would be the server pid, nothing reads it
+			std::memset(*out + 0x14, 0, 4);
+			*status = 0;
+		}
+		*result = 0;
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_PSM_SHARED_DMEM_CREATE type=%u status=0x%08x "
+		     "NON_AUTHENTIC\n",
+		     type, static_cast<uint32_t>(*status));
+	} else {
+		LOGF("IPMI_IMPORTED_UNIMPLEMENTED command=0x%08x handle=%d args_size=%zu\n", command,
+		     client_id, args_size);
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
+		return -1;
+	}
+
+	LOGF("\tcommand = 0x%08x\n\tresult = %d\n", command, *result);
+	return 0;
 }
+
+static int KYTY_SYSV_ABI KernelSetIccConfiguration(uint8_t value) {
+	PRINT_NAME();
+
+	static std::atomic<uint8_t> current_value = 0;
+	current_value.store(value, std::memory_order_relaxed);
+	LOGF("\tvalue = %u\n", static_cast<unsigned>(value));
+	return 0;
+}
+
+static std::array<std::atomic<uint8_t>, 256>& IccConfigurationValues() {
+	static std::array<std::atomic<uint8_t>, 256> values {};
+	return values;
+}
+
+static int KYTY_SYSV_ABI KernelSetIccConfigurationEntry(uint32_t selector, uint32_t value) {
+	PRINT_NAME();
+
+	auto& values = IccConfigurationValues();
+	values[static_cast<uint8_t>(selector)].store(static_cast<uint8_t>(value),
+	                                             std::memory_order_relaxed);
+	LOGF("\tselector = %u\n\tvalue    = %u\n",
+	     static_cast<unsigned>(static_cast<uint8_t>(selector)),
+	     static_cast<unsigned>(static_cast<uint8_t>(value)));
+	return 0;
+}
+
+static int KYTY_SYSV_ABI KernelGetIccConfigurationEntry(uint32_t selector, uint8_t* value) {
+	PRINT_NAME();
+
+	if (value == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto& values = IccConfigurationValues();
+	*value       = values[static_cast<uint8_t>(selector)].load(std::memory_order_relaxed);
+	LOGF("\tselector = %u\n\tvalue    = %u\n",
+	     static_cast<unsigned>(static_cast<uint8_t>(selector)), static_cast<unsigned>(*value));
+	return 0;
+}
+
+static int KYTY_SYSV_ABI KernelIccGetPowerUpCause(void* value) {
+	PRINT_NAME();
+
+	if (value == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	std::memset(value, 0, 9);
+	*reinterpret_cast<uint32_t*>(value) = 1;
+	return 0;
+}
+
+static std::atomic<uint8_t>& IccUsbPowerState() {
+	static std::atomic<uint8_t> state {0};
+	return state;
+}
+
+static int KYTY_SYSV_ABI KernelIccSetUsbPowerState(uint8_t state) {
+	PRINT_NAME();
+
+	IccUsbPowerState().store(state, std::memory_order_relaxed);
+	LOGF("\tstate = %u\n", static_cast<unsigned>(state));
+	return 0;
+}
+
+static int KYTY_SYSV_ABI KernelIccGetUsbPowerState(uint8_t* state) {
+	PRINT_NAME();
+
+	if (state == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	*state = IccUsbPowerState().load(std::memory_order_relaxed);
+	LOGF("\tstate = %u\n", static_cast<unsigned>(*state));
+	return 0;
+}
+
 static int32_t KYTY_SYSV_ABI KernelDebugRaiseException(int32_t code, const void* context) {
 	PRINT_NAME();
 	if (std::getenv("KYTY_DIAGNOSTIC_SHELLUI_EXCEPTION_ORIGIN") != nullptr) {
@@ -2444,6 +3296,7 @@ static KYTY_SYSV_ABI int KernelGetOpenPsIdForSystem(void* open_ps_id) {
 
 	return OK;
 }
+
 static KYTY_SYSV_ABI void pthread_cxa_finalize(void* /*p*/) {
 	PRINT_NAME();
 }
@@ -2464,18 +3317,20 @@ void KYTY_SYSV_ABI KernelSetThreadAtexitReport(thread_atexit_report_func_t func)
 	g_thread_atexit_report_func = func;
 }
 
-int KYTY_SYSV_ABI KernelRtldThreadAtexitIncrement(uint64_t* /*c*/) {
+int KYTY_SYSV_ABI KernelRtldThreadAtexitIncrement(uint64_t* c) {
 	PRINT_NAME();
 
-	//__sync_fetch_and_add(c, 1);
-
-	return 0;
+	return Common::Singleton<Loader::RuntimeLinker>::Instance()->AcquireThreadAtexit(
+	           reinterpret_cast<uint64_t>(c)) < 0
+	           ? -1
+			   : 0;
 }
 
-int KYTY_SYSV_ABI KernelRtldThreadAtexitDecrement(uint64_t* /*c*/) {
+int KYTY_SYSV_ABI KernelRtldThreadAtexitDecrement(uint64_t* c) {
 	PRINT_NAME();
 
-	//__sync_fetch_and_sub(c, 1);
+	Common::Singleton<Loader::RuntimeLinker>::Instance()->ReleaseThreadAtexitByAddr(
+	    reinterpret_cast<uint64_t>(c));
 
 	return 0;
 }
@@ -2595,6 +3450,7 @@ struct KernelRusage {
 	LibKernel::KernelTimeval ru_stime;
 	int64_t                  ru_counters[14];
 };
+
 int KYTY_SYSV_ABI wait4(int pid, int32_t* status, int options, KernelRusage* usage) {
 	if (usage != nullptr) {
 		*GetErrorAddr() = POSIX_ENOSYS;
@@ -2612,6 +3468,58 @@ int KYTY_SYSV_ABI wait4(int pid, int32_t* status, int options, KernelRusage* usa
 	}
 	return child;
 }
+
+int KYTY_SYSV_ABI getrusage(int who, KernelRusage* usage) {
+	PRINT_NAME();
+
+	if (who < -1 || who > 1) {
+		*GetErrorAddr() = POSIX_EINVAL;
+		return -1;
+	}
+	if (usage == nullptr) {
+		*GetErrorAddr() = POSIX_EFAULT;
+		return -1;
+	}
+
+	uint64_t user_100ns   = 0;
+	uint64_t system_100ns = 0;
+	// RUSAGE_CHILDREN keeps zero times, nothing is ever forked
+	if (who != -1) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		FILETIME create_time {};
+		FILETIME exit_time {};
+		FILETIME kernel_time {};
+		FILETIME user_time {};
+		BOOL     ok = FALSE;
+		if (who == 0) {
+			ok = GetProcessTimes(GetCurrentProcess(), &create_time, &exit_time, &kernel_time,
+			                     &user_time);
+		} else {
+			ok = GetThreadTimes(GetCurrentThread(), &create_time, &exit_time, &kernel_time,
+			                    &user_time);
+		}
+		if (!ok) {
+			*GetErrorAddr() = POSIX_EFAULT;
+			return -1;
+		}
+		user_100ns =
+		    (static_cast<uint64_t>(user_time.dwHighDateTime) << 32u) | user_time.dwLowDateTime;
+		system_100ns =
+		    (static_cast<uint64_t>(kernel_time.dwHighDateTime) << 32u) | kernel_time.dwLowDateTime;
+#else
+		*GetErrorAddr() = POSIX_ENOSYS;
+		return -1;
+#endif
+	}
+
+	std::memset(usage, 0, sizeof(KernelRusage));
+	usage->ru_utime.tv_sec  = static_cast<int64_t>(user_100ns / 10000000);
+	usage->ru_utime.tv_usec = static_cast<int64_t>((user_100ns % 10000000) / 10);
+	usage->ru_stime.tv_sec  = static_cast<int64_t>(system_100ns / 10000000);
+	usage->ru_stime.tv_usec = static_cast<int64_t>((system_100ns % 10000000) / 10);
+	return 0;
+}
+
 int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
                             LibKernel::KernelTimespec*       rmtp) {
 	PRINT_NAME();
@@ -2619,10 +3527,46 @@ int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
 	return POSIX_CALL(LibKernel::KernelNanosleep(rqtp, rmtp));
 }
 
-int KYTY_SYSV_ABI stat(const char* path, LibKernel::FileSystem::FileStat* sb) {
+// libkernel's sleep: libthr's cancellation point around FreeBSD __sleep, which splits off anything
+// above INT_MAX
+unsigned int KYTY_SYSV_ABI sleep(unsigned int seconds) {
 	PRINT_NAME();
 
-	return POSIX_CALL(LibKernel::FileSystem::KernelStat(path, sb));
+	LibKernel::PthreadTestcancel();
+	unsigned int over = 0;
+	if (seconds > static_cast<unsigned int>(INT32_MAX)) {
+		over    = seconds - INT32_MAX;
+		seconds = INT32_MAX;
+	}
+	LibKernel::KernelTimespec rqt {seconds, 0};
+	LibKernel::KernelTimespec rem {};
+	const int                 result = LibKernel::KernelNanosleep(&rqt, &rem);
+	LibKernel::PthreadTestcancel();
+	if (result == OK) {
+		return over;
+	}
+	if (result != LibKernel::KERNEL_ERROR_EINTR) {
+		return over + seconds;
+	}
+	return over + static_cast<unsigned int>(rem.tv_sec) + (rem.tv_nsec != 0 ? 1 : 0);
+}
+
+int KYTY_SYSV_ABI stat(const char* path, LibKernel::FileSystem::FileStat* sb) {
+	PRINT_NAME();
+	const bool trace_pss =
+	    std::getenv("KYTY_DIAGNOSTIC_PSS_FILESTAT") != nullptr &&
+	    (path == nullptr || path[0] == '\0' || std::strncmp(path, "/app0/psm", 9) == 0);
+	if (trace_pss) {
+		LOGF("PSS_FILESTAT caller=0x%016" PRIx64 " guest_path=%s sb=%p\n",
+		     reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+		     path != nullptr ? path : "(null)", static_cast<const void*>(sb));
+	}
+	const int kernel_status = LibKernel::FileSystem::KernelStat(path, sb);
+	if (trace_pss) {
+		LOGF("PSS_FILESTAT result=0x%08x guest_path=%s\n", static_cast<uint32_t>(kernel_status),
+		     path != nullptr ? path : "(null)");
+	}
+	return POSIX_CALL(kernel_status);
 }
 
 int KYTY_SYSV_ABI mkdir(const char* path, uint16_t mode) {
@@ -2636,15 +3580,23 @@ int KYTY_SYSV_ABI rmdir(const char* path) {
 
 	return POSIX_CALL(LibKernel::FileSystem::KernelRmdir(path));
 }
+
 int KYTY_SYSV_ABI unlink(const char* path) {
 	PRINT_NAME();
 
 	return POSIX_CALL(LibKernel::FileSystem::KernelUnlink(path));
 }
+
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();
 
 	return POSIX_N_CALL(LibKernel::FileSystem::KernelLseek(d, offset, whence));
+}
+
+int KYTY_SYSV_ABI dup2(int oldd, int newd) {
+	PRINT_NAME();
+
+	return POSIX_N_CALL(LibKernel::FileSystem::KernelDup2(oldd, newd));
 }
 
 int64_t KYTY_SYSV_ABI pread(int d, void* buf, size_t nbytes, int64_t offset) {
@@ -2683,6 +3635,60 @@ int KYTY_SYSV_ABI flock(int d, int operation) {
 	return 0;
 }
 
+int KYTY_SYSV_ABI fcntl(int d, int cmd, uint64_t arg) {
+	PRINT_NAME();
+
+	struct Flock {
+		int64_t l_start;
+		int64_t l_len;
+		int32_t l_pid;
+		int16_t l_type;
+		int16_t l_whence;
+		int32_t l_sysid;
+	};
+
+	constexpr int f_getlk  = 11;
+	constexpr int f_setlk  = 12;
+	constexpr int f_setlkw = 13;
+
+	constexpr int16_t f_rdlck = 1;
+	constexpr int16_t f_unlck = 2;
+	constexpr int16_t f_wrlck = 3;
+
+	LOGF("\t fd = %d, cmd = %d\n", d, cmd);
+
+	// record locks only. Mono probes fd 0-2 with F_GETFL and takes -1 as closed
+	if (cmd != f_getlk && cmd != f_setlk && cmd != f_setlkw) {
+		return LibKernel::KERNEL_ERROR_ENOSYS;
+	}
+
+	LibKernel::FileSystem::FileStat sb {};
+	auto                            result = LibKernel::FileSystem::KernelFstat(d, &sb);
+	if (result != OK) {
+		*GetErrorAddr() = LibKernel::KernelToPosix(result);
+		return -1;
+	}
+
+	auto* lock = reinterpret_cast<Flock*>(arg);
+	if (lock == nullptr) {
+		*GetErrorAddr() = POSIX_EFAULT;
+		return -1;
+	}
+	if ((lock->l_type != f_rdlck && lock->l_type != f_unlck && lock->l_type != f_wrlck) ||
+	    lock->l_whence < 0 || lock->l_whence > 2) {
+		*GetErrorAddr() = POSIX_EINVAL;
+		return -1;
+	}
+
+	// nothing else holds this file table, so the lock is granted. XXX: two emulator processes
+	// sharing a state directory aren't arbitrated
+	if (cmd == f_getlk) {
+		lock->l_type = f_unlck;
+	}
+
+	return 0;
+}
+
 int64_t KYTY_SYSV_ABI fstat(int d, LibKernel::FileSystem::FileStat* sb) {
 	PRINT_NAME();
 
@@ -2699,6 +3705,7 @@ int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
 }
+
 
 int KYTY_SYSV_ABI bind(int s, const void* addr, uint32_t addrlen) {
 	PRINT_NAME();
@@ -2869,16 +3876,25 @@ int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
 }
 
 LIB_DEFINE(InitLibKernel_1_Posix) {
+	if (std::getenv("KYTY_DIAGNOSTIC_GUEST_EXECVE") != nullptr) {
+		LIB_FUNC("UFKprwxNhT8", wait4);
+	}
 	LIB_FUNC("k+AXqu2-eBc", getpagesize);
 	LIB_FUNC("lLMT9vJAck0", clock_gettime);
 	LIB_FUNC("smIj7eqzZE8", clock_getres);
 	LIB_FUNC("n88vx3C5nW8", gettimeofday);
+	LIB_FUNC("hHlZQUnlxSM", getrusage);
 	LIB_FUNC("NhpspxdjEKU", nanosleep);
 	LIB_FUNC("yS8U2TGCe1A", nanosleep);
+	LIB_FUNC("0wu33hunNdE", sleep);
 	LIB_FUNC("E6ao34wPw+U", stat);
+	LIB_FUNC("DRGXpDDh8Ng", stat); // lstat, the file system layer has no notion of a link
 	LIB_FUNC("JGMio+21L4c", mkdir);
+	LIB_FUNC("c7ZnT7V1B98", rmdir);
+	LIB_FUNC("VAzswvTOCzI", unlink);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
+	LIB_FUNC("-wUggz2S5yk", Posix::sem_setname);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
 	LIB_FUNC("WBWzsRifCEA", Posix::sem_trywait);
@@ -3124,12 +4140,11 @@ static void FiberSetThreadContext(FiberThreadContext* context) {
 }
 
 static uint32_t FiberLoadState(const FiberObject* fiber) {
-	auto& state = const_cast<uint32_t&>(fiber->state);
-	return std::atomic_ref<uint32_t>(state).load(std::memory_order_acquire);
+	return __atomic_load_n(&fiber->state, __ATOMIC_ACQUIRE);
 }
 
 static void FiberStoreState(FiberObject* fiber, uint32_t state) {
-	std::atomic_ref<uint32_t>(fiber->state).store(state, std::memory_order_release);
+	__atomic_store_n(&fiber->state, state, __ATOMIC_RELEASE);
 }
 
 static void FiberCompleteSwitch(FiberObject* current) {
@@ -3144,9 +4159,8 @@ static void FiberCompleteSwitch(FiberObject* current) {
 }
 
 static bool FiberCompareExchangeState(FiberObject* fiber, uint32_t expected, uint32_t desired) {
-	return std::atomic_ref<uint32_t>(fiber->state)
-	    .compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
-	                             std::memory_order_acquire);
+	return __atomic_compare_exchange_n(&fiber->state, &expected, desired, false, __ATOMIC_ACQ_REL,
+	                                   __ATOMIC_ACQUIRE);
 }
 
 static void FiberSetContextValid(FiberObject* fiber, bool valid) {
@@ -3362,7 +4376,7 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 		FiberStartOnGuestStack(fiber);
 	}
 
-	auto* returned_fiber  = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
+	auto* returned_fiber    = (context.returned_fiber != nullptr ? context.returned_fiber : fiber);
 	const auto return_value = returned_fiber->arg_on_return;
 	const auto return_code =
 	    FiberLoadState(returned_fiber) == FIBER_STATE_TERMINATED ? FIBER_ERROR_STATE : OK;
@@ -3424,7 +4438,7 @@ int32_t KYTY_SYSV_ABI FiberGetSelf(FiberObject** fiber) {
 	}
 
 	const auto* context = FiberGetThreadContext();
-	*fiber = context != nullptr ? context->current_fiber : nullptr;
+	*fiber              = context != nullptr ? context->current_fiber : nullptr;
 
 	return OK;
 }
@@ -3442,7 +4456,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 
 	if (FiberSaveContext(&fiber->saved_context) == 0) {
 		FiberSetContextValid(fiber, true);
-		context->returned_fiber = fiber;
+		context->returned_fiber     = fiber;
 		context->pending_idle_fiber = fiber;
 		FiberRestoreContext(&context->cpu_context, 1);
 	}
@@ -3533,16 +4547,19 @@ int KYTY_SYSV_ABI KernelGetSpecialModelFlag(uint16_t* flag) {
 	*flag = 0;
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelIsEcoChargeAvailable() {
 	PRINT_NAME();
 
 	return 0;
 }
+
 int KYTY_SYSV_ABI KernelIsAuthenticTrinity() {
 	PRINT_NAME();
 
 	return 0;
 }
+
 int KYTY_SYSV_ABI KernelGetCurrentFanDuty(uint16_t* duty, uint64_t* chassis_info) {
 	PRINT_NAME();
 
@@ -3554,6 +4571,7 @@ int KYTY_SYSV_ABI KernelGetCurrentFanDuty(uint16_t* duty, uint64_t* chassis_info
 	*chassis_info = 0;
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelGetSocPowerConsumption(void* info) {
 	PRINT_NAME();
 
@@ -3564,6 +4582,7 @@ int KYTY_SYSV_ABI KernelGetSocPowerConsumption(void* info) {
 	std::memset(info, 0, 0x70);
 	return OK;
 }
+
 // diagnostic: selected peers get the 0x4800000000000015 SceAvCapture authority
 static bool DiagnosticCompositorClientAuthorityMatches(uint64_t authority_id) {
 	const char* value = std::getenv("KYTY_DIAGNOSTIC_AUTHINFO_COMPOSITOR_CLIENT");
@@ -3581,6 +4600,7 @@ static bool DiagnosticCompositorClientAuthorityMatches(uint64_t authority_id) {
 	}
 	return false;
 }
+
 int KYTY_SYSV_ABI KernelGetAuthinfo(int pid, void* info) {
 	PRINT_NAME();
 
@@ -3679,6 +4699,7 @@ int KYTY_SYSV_ABI KernelGetAuthinfo(int pid, void* info) {
 	LOGF("\t pid = %d, authority id = 0x%016" PRIx64 "\n", pid, process.auth_id);
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelGetAppInfo2(int pid, void* info, size_t size) {
 	PRINT_NAME();
 	LibKernel::AppMount::Record record {};
@@ -3703,6 +4724,7 @@ int KYTY_SYSV_ABI KernelGetAppInfo2(int pid, void* info, size_t size) {
 	     static_cast<uint64_t>(size), app_id, reinterpret_cast<const char*>(record.data() + 0x10));
 	return OK;
 }
+
 // Without this export the unresolved-import stub returns 0, which SysCore addShellCoreApp takes as
 // a mounted appid 0.
 static uint32_t AppMountRead32(const std::array<uint8_t, 0x18b0>& info, size_t offset) {
@@ -3710,6 +4732,7 @@ static uint32_t AppMountRead32(const std::array<uint8_t, 0x18b0>& info, size_t o
 	std::memcpy(&value, info.data() + offset, sizeof(value));
 	return value;
 }
+
 // The kind byte the wrapper stores at +0x1a of the syscall block; -1 is its EINVAL.
 static int AppMountKind(uint32_t category, uint32_t mode) {
 	switch (category) {
@@ -3742,6 +4765,7 @@ static int AppMountKind(uint32_t category, uint32_t mode) {
 		default: return -1;
 	}
 }
+
 int KYTY_SYSV_ABI KernelSetAppState(int32_t app_id, uint32_t state) {
 	PRINT_NAME();
 	const int32_t mib[4] {1, 14, 0x40, app_id};
@@ -3758,6 +4782,7 @@ int KYTY_SYSV_ABI KernelSetAppState(int32_t app_id, uint32_t state) {
 	     result);
 	return result;
 }
+
 // libkernel_sys +0x42f10: an 8-byte read of the same oid; the outputs are only written once the
 // sysctl succeeds.
 int KYTY_SYSV_ABI KernelGetAppState(int32_t app_id, int32_t* state, int32_t* secondary) {
@@ -3782,6 +4807,7 @@ int KYTY_SYSV_ABI KernelGetAppState(int32_t app_id, int32_t* state, int32_t* sec
 	if (secondary != nullptr) *secondary = buf[1];
 	return OK;
 }
+
 // libkernel_sys +0x43040 passes the caller's buffer straight through as oldp with oldlen 0x98.
 int KYTY_SYSV_ABI KernelGetAppInfoByAppId(int32_t app_id, void* info) {
 	PRINT_NAME();
@@ -3799,6 +4825,7 @@ int KYTY_SYSV_ABI KernelGetAppInfoByAppId(int32_t app_id, void* info) {
 	LOGF("APP_INFO_BY_ID_EXPORT app_id=%d result=0x%x nid=zsMzX135ofU\n", app_id, result);
 	return result;
 }
+
 // processSpawn gate: Prospero SDK word from PT_OS_PROCPARAM, taken from the decrypted overlay
 static int SdkVersionByPath(const char* path, uint64_t shift, uint32_t* out, const char* tag) {
 	if (path == nullptr || out == nullptr) {
@@ -3839,6 +4866,17 @@ static int SdkVersionByPath(const char* path, uint64_t shift, uint32_t* out, con
 	LOGF("%s path=%s result=0x%x reason=no_procparam\n", tag, path, LibKernel::KERNEL_ERROR_ENOENT);
 	return LibKernel::KERNEL_ERROR_ENOENT;
 }
+
+int KYTY_SYSV_ABI KernelGetProsperoSdkVersionByPath(const char* path, uint32_t* out) {
+	PRINT_NAME();
+	return SdkVersionByPath(path, 32, out, "PROSPERO_SDK_BY_PATH");
+}
+
+int KYTY_SYSV_ABI KernelGetPs4SdkVersionByPath(const char* path, uint32_t* out) {
+	PRINT_NAME();
+	return SdkVersionByPath(path, 0, out, "PS4_SDK_BY_PATH");
+}
+
 // 4P1e01mbenA is sceKernelGetProcessTypeOfBudget (SysCore stub slot 246, called twice from
 // createApp with rdi=[r15+8]). SysCore only takes the NotifyAppStateChanged(1) branch when the
 // result is 0.
@@ -3852,6 +4890,7 @@ int KYTY_SYSV_ABI KernelGetProcessTypeOfBudget(int32_t pid) {
 	LOGF("PROCESS_TYPE_OF_BUDGET pid=%d ptype=%d result=0\n", pid, ptype);
 	return ptype;
 }
+
 // The budget wrappers below sit on raw 0x238-0x23a, whose handlers put an sce error in the value
 // rather than an errno.
 static int BudgetErrno(const NativeKernelBridge::Reply& reply) {
@@ -3861,6 +4900,7 @@ static int BudgetErrno(const NativeKernelBridge::Reply& reply) {
 	}
 	return reply.posix_errno;
 }
+
 int KYTY_SYSV_ABI KernelCreateBudget(int64_t* id, const char* name, uint32_t ptype,
                                      const void* entries, uint32_t count, void* out_entries) {
 	PRINT_NAME();
@@ -3886,6 +4926,7 @@ int KYTY_SYSV_ABI KernelCreateBudget(int64_t* id, const char* name, uint32_t pty
 	     ptype, count, result, error == 0 ? *id : -1);
 	return result;
 }
+
 int KYTY_SYSV_ABI KernelDeleteBudget(int32_t budget) {
 	PRINT_NAME();
 	const int error = BudgetErrno(NativeKernelBridge::DispatchSyscall(
@@ -3895,6 +4936,7 @@ int KYTY_SYSV_ABI KernelDeleteBudget(int32_t budget) {
 	LOGF("BUDGET_DELETE_EXPORT id=%d result=0x%x nid=vs+KPSoE7AM\n", budget, result);
 	return result;
 }
+
 // libkernel_sys +0x46b00: the builtin budget of process type n is id -2-n.
 int KYTY_SYSV_ABI KernelGetResourceLimit(uint32_t ptype, void* entries, int32_t* count) {
 	PRINT_NAME();
@@ -3909,6 +4951,7 @@ int KYTY_SYSV_ABI KernelGetResourceLimit(uint32_t ptype, void* entries, int32_t*
 	LOGF("BUDGET_RESOURCE_LIMIT_EXPORT ptype=%u result=0x%x nid=S2-4Sh3qnm8\n", ptype, result);
 	return result;
 }
+
 // libkernel_sys +0x46b40 reads up to 14 entries of the given budget and copies out the first of
 // that kind; none is ENOENT.
 int KYTY_SYSV_ABI KernelGetResourceOne(int32_t budget, uint32_t kind, void* entry) {
@@ -3933,6 +4976,7 @@ int KYTY_SYSV_ABI KernelGetResourceOne(int32_t budget, uint32_t kind, void* entr
 	}
 	return LibKernel::KERNEL_ERROR_ENOENT;
 }
+
 // libkernel_sys +0x42820 hands the caller's own 0x178-byte block to raw 0x2c2, so the id goes
 // wherever its +0xb0 points
 int KYTY_SYSV_ABI KernelBeginAppMount(void* request) {
@@ -3947,6 +4991,7 @@ int KYTY_SYSV_ABI KernelBeginAppMount(void* request) {
 	LOGF("APP_MOUNT_EXPORT result=0x%x nid=H69MYqpNjCc\n", result);
 	return result;
 }
+
 int KYTY_SYSV_ABI KernelEndAppMount2(int32_t app_id) {
 	PRINT_NAME();
 	const auto reply =
@@ -3959,6 +5004,7 @@ int KYTY_SYSV_ABI KernelEndAppMount2(int32_t app_id) {
 	LOGF("APP_MOUNT_END_EXPORT app_id=%d result=0x%x nid=CYIzY6OXyAs\n", app_id, result);
 	return result;
 }
+
 int KYTY_SYSV_ABI KernelBeginAppMount2(void* info, uint64_t arg1, uint64_t arg2) {
 	PRINT_NAME();
 	if (info == nullptr) return LibKernel::KERNEL_ERROR_EINVAL;
@@ -4053,6 +5099,7 @@ int KYTY_SYSV_ABI KernelBeginAppMount2(void* info, uint64_t arg1, uint64_t arg2)
 	}
 	return app_id;
 }
+
 static int KYTY_SYSV_ABI KernelGetAppInfoBit(const void* record, size_t size, uint32_t bit,
                                              int* output) {
 	PRINT_NAME();
@@ -4071,6 +5118,7 @@ static int KYTY_SYSV_ABI KernelGetAppInfoBit(const void* record, size_t size, ui
 	           ? OK
 			   : LibKernel::KERNEL_ERROR_EFAULT;
 }
+
 static int KYTY_SYSV_ABI KernelQueryAppClassification(int* output) {
 	PRINT_NAME();
 	if (output == nullptr) return LibKernel::KERNEL_ERROR_EINVAL;
@@ -4089,6 +5137,7 @@ static int KYTY_SYSV_ABI KernelQueryAppClassification(int* output) {
 	LOGF("APP_CLASSIFICATION_FROM_PROCPARAM value=0x%08x mib=1,14,68,self\n", classification);
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelGetAppInfo(int pid, void* info) {
 	PRINT_NAME();
 	// A record set through {1,14,35} is the kernel's own; the SFO category below only covers
@@ -4129,6 +5178,7 @@ int KYTY_SYSV_ABI KernelGetAppInfo(int pid, void* info) {
 	LOGF("\t pid = %d, category = 0x%x\n", pid, process.category);
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelGetProcessName(int pid, char* name) {
 	PRINT_NAME();
 
@@ -4144,6 +5194,7 @@ int KYTY_SYSV_ABI KernelGetProcessName(int pid, char* name) {
 	LOGF("\t pid = %d, name = %s\n", pid, name);
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelGetAppCategoryType(int pid, int* category) {
 	PRINT_NAME();
 
@@ -4182,6 +5233,7 @@ int KYTY_SYSV_ABI KernelGetAppCategoryType(int pid, int* category) {
 	LOGF("\t pid = %d, category = 0x%x\n", pid, process.category);
 	return OK;
 }
+
 // fh-Bb3wl0Vs: AgcCompositor reads the app record category by app id rather than by pid.
 int KYTY_SYSV_ABI KernelGetAppCategoryTypeByAppId(int32_t app_id, int* category) {
 	PRINT_NAME();
@@ -4205,6 +5257,80 @@ int KYTY_SYSV_ABI KernelGetAppCategoryTypeByAppId(int32_t app_id, int* category)
 	LOGF("\t app_id = %d, category = 0x%x\n", app_id, value);
 	return OK;
 }
+
+int KYTY_SYSV_ABI TraceSceNetConfigure(const void* config) {
+	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceNet.sprx");
+	auto* program     = rt->FindProgramByFileName(module_path);
+	EXIT_IF(program == nullptr);
+
+	auto*      initialized   = reinterpret_cast<uint32_t*>(program->base_vaddr + 0x440a0);
+	auto*      configured    = reinterpret_cast<uint32_t*>(program->base_vaddr + 0x440a4);
+	auto*      native_config = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x64228);
+	const auto input0        = config != nullptr ? *reinterpret_cast<const uint32_t*>(config) : 0;
+	LOGF("SceNet config before: initialized=%u configured=%u input0=0x%08x native0=0x%02x\n",
+	     *initialized, *configured, input0, static_cast<unsigned>(native_config[0]));
+
+	using configure_func_t = KYTY_SYSV_ABI int (*)(const void*);
+	const auto result = reinterpret_cast<configure_func_t>(program->base_vaddr + 0x290)(config);
+	LOGF("SceNet config after: result=0x%08x initialized=%u configured=%u native0=0x%02x\n",
+	     static_cast<unsigned>(result), *initialized, *configured,
+	     static_cast<unsigned>(native_config[0]));
+	return result;
+}
+
+int KYTY_SYSV_ABI TraceSceNetPoolCreate(const char* name, uint32_t size, uint32_t flags) {
+	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceNet.sprx");
+	auto* program     = rt->FindProgramByFileName(module_path);
+	EXIT_IF(program == nullptr);
+
+	auto* native_config = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x64228);
+	auto* slots         = reinterpret_cast<uint32_t*>(program->base_vaddr + 0x642a0);
+	LOGF(
+	    "SceNet pool before: name=%s size=%u flags=0x%x config0=0x%02x slots=%08x,%08x,%08x,%08x\n",
+	    name != nullptr ? name : "(null)", size, flags, static_cast<unsigned>(native_config[0]),
+	    slots[0], slots[1], slots[2], slots[3]);
+
+	using pool_create_func_t = KYTY_SYSV_ABI int (*)(const char*, uint32_t, uint32_t);
+	const auto result =
+	    reinterpret_cast<pool_create_func_t>(program->base_vaddr + 0x1760)(name, size, flags);
+	LOGF("SceNet pool after: name=%s result=0x%08x config0=0x%02x slots=%08x,%08x,%08x,%08x\n",
+	     name != nullptr ? name : "(null)", static_cast<unsigned>(result),
+	     static_cast<unsigned>(native_config[0]), slots[0], slots[1], slots[2], slots[3]);
+	return result;
+}
+
+int KYTY_SYSV_ABI TraceSysCoreFinalize() {
+	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceSysCore.sprx");
+	auto* program     = rt->FindProgramByFileName(module_path);
+	EXIT_IF(program == nullptr);
+	const auto caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+	LOGF("SysCore finalize called: caller=%016" PRIx64 " module=%s\n", caller,
+	     Common::PathToString(program->file_name).c_str());
+	using finalize_func_t = KYTY_SYSV_ABI int (*)();
+	return reinterpret_cast<finalize_func_t>(program->base_vaddr + 0x470)();
+}
+
+int KYTY_SYSV_ABI TraceSysCoreInitializeForShellCore(const char* title_id) {
+	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceSysCore.sprx");
+	auto* program     = rt->FindProgramByFileName(module_path);
+	EXIT_IF(program == nullptr);
+	auto* initialized = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x10048);
+	auto* connected   = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x10049);
+	LOGF("SysCore init before: initialized=%u connected=%u title=%s\n",
+	     static_cast<unsigned>(*initialized), static_cast<unsigned>(*connected),
+	     title_id != nullptr ? title_id : "(null)");
+	using init_func_t = KYTY_SYSV_ABI int (*)(const char*);
+	const auto result = reinterpret_cast<init_func_t>(program->base_vaddr + 0x2c0)(title_id);
+	LOGF("SysCore init after: initialized=%u connected=%u result=0x%08x\n",
+	     static_cast<unsigned>(*initialized), static_cast<unsigned>(*connected),
+	     static_cast<unsigned>(result));
+	return result;
+}
+
 int KYTY_SYSV_ABI TraceSysCoreGetShellCoreAppId(int32_t* app_id) {
 	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceSysCore.sprx");
@@ -4222,6 +5348,7 @@ int KYTY_SYSV_ABI TraceSysCoreGetShellCoreAppId(int32_t* app_id) {
 	     app_id != nullptr ? static_cast<unsigned>(*app_id) : 0xffffffffu);
 	return result;
 }
+
 int KYTY_SYSV_ABI TraceIpmiCreateClient(void** out_client, void* config, void* arg, void* storage) {
 	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceIpmi.sprx");
@@ -4244,6 +5371,8 @@ int KYTY_SYSV_ABI TraceIpmiCreateClient(void** out_client, void* config, void* a
 	     static_cast<unsigned>(result), client, vtable, slot58, program->base_vaddr + 0xc010);
 	return result;
 }
+
+
 int KYTY_SYSV_ABI KernelAioInitializeImpl(void* param, int32_t size) {
 	PRINT_NAME();
 
@@ -4512,6 +5641,8 @@ LIB_DEFINE(InitCoredump_1) {
 LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("1G3lF1Gg1k8", FileSystem::KernelOpen);
 	LIB_FUNC("UK2Tl2DWUns", FileSystem::KernelClose);
+	LIB_FUNC("VW3TVZiM4-E", FileSystem::KernelFtruncate);
+	LIB_FUNC("PfccT7qURYE", LibKernel::ioctl);
 	LIB_FUNC("Cg4srZ6TKbU", FileSystem::KernelRead);
 	LIB_FUNC("4wSze92BhLI", FileSystem::KernelWrite);
 	LIB_FUNC("+r3rMFwItV4", FileSystem::KernelPread);
@@ -4530,6 +5661,54 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("uWyW3v98sU4", FileSystem::KernelCheckReachability);
 }
 
+// dYK287SsmDs (+0x17d70): mode 0 via mmap, mode 2 via 0x2d5. A guest syscall on Windows can come
+// back as NTSTATUS 0xc0000061, read as a pointer
+static int KYTY_SYSV_ABI DiagnosticNativeMonoMap2D5(void** addr_in_out, size_t size, int prot,
+                                                    int flags, uint64_t mode, uint64_t hint) {
+	return static_cast<int>(
+	    NativeKernelBridge::Dispatch(
+	        {NativeKernelBridge::Service::FlexibleMapExport,
+			 {reinterpret_cast<uint64_t>(addr_in_out), static_cast<uint64_t>(size),
+			  static_cast<uint64_t>(static_cast<uint32_t>(prot)),
+			  static_cast<uint64_t>(static_cast<uint32_t>(flags)), mode, hint}})
+	        .value);
+}
+
+// sysconf(47) asks for {9,20} and otherwise issues guest syscall 0xca straight to Windows (Mono got
+// 0x3f800000). Case 93 is a constant 0x4000.
+static int64_t KYTY_SYSV_ABI DiagnosticMonoSysconf47PageSize(int name) {
+	const auto reply =
+	    NativeKernelBridge::Dispatch({NativeKernelBridge::Service::SysconfExport,
+		                              {static_cast<uint64_t>(static_cast<uint32_t>(name))}});
+	if (reply.posix_errno != 0) {
+		*Posix::GetErrorAddr() = reply.posix_errno;
+	}
+	return reply.value;
+}
+
+// pd02UI9TbOA is a direct syscall 0x3a (readlink). Unresolved it returns 0, a zero-byte link target
+// to Mono
+static int64_t KYTY_SYSV_ABI DiagnosticGuestReadlink(const char* path, char* out, size_t length) {
+	const auto reply = NativeKernelBridge::Dispatch(
+	    {NativeKernelBridge::Service::ReadlinkExport,
+		 {reinterpret_cast<uint64_t>(path), reinterpret_cast<uint64_t>(out),
+		  static_cast<uint64_t>(length)}});
+	if (reply.posix_errno != 0) {
+		*Posix::GetErrorAddr() = reply.posix_errno;
+	}
+	return reply.value;
+}
+
+static int KYTY_SYSV_ABI KernelNmount(const void* vectors, uint32_t count, int flags) {
+	const auto reply = NativeKernelBridge::DispatchSyscall(
+	    {0x17a, {reinterpret_cast<uint64_t>(vectors), count, static_cast<uint32_t>(flags)}});
+	if (reply.posix_errno != 0) {
+		*Posix::GetErrorAddr() = reply.posix_errno;
+		return -1;
+	}
+	return static_cast<int>(reply.value);
+}
+
 // unmount(2), syscall 22
 static int KYTY_SYSV_ABI KernelUnmount(const char* path, int flags) {
 	const int result = LibKernel::FileSystem::KernelUnmount(path, flags);
@@ -4539,6 +5718,19 @@ static int KYTY_SYSV_ABI KernelUnmount(const char* path, int flags) {
 	}
 	return 0;
 }
+
+// 8vE6Z6VEYyk: access(2), syscall 0x21
+static int KYTY_SYSV_ABI DiagnosticGuestAccess(const char* path, int mode) {
+	const auto reply = NativeKernelBridge::DispatchSyscall(
+	    {0x21,
+		 {reinterpret_cast<uint64_t>(path), static_cast<uint64_t>(static_cast<uint32_t>(mode))}});
+	if (reply.value != 0) {
+		*Posix::GetErrorAddr() = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+		return -1;
+	}
+	return 0;
+}
+
 // 7NwggrWJ5cA (+0x1a00) is the raw 0x214 wrapper under libSceRegMgr, which reads errno after any
 // nonzero return
 static int KYTY_SYSV_ABI DiagnosticRegMgrCall(uint64_t op, uint64_t reg_id, int32_t* status,
@@ -4552,9 +5744,50 @@ static int KYTY_SYSV_ABI DiagnosticRegMgrCall(uint64_t op, uint64_t reg_id, int3
 	}
 	return static_cast<int>(reply.value);
 }
+
+// Y1nEpkCieOY (libkernel_sys +0x363F0) forwards to +0x35C90, ABI unknown; log the six args and
+// return ENOSYS
+static int64_t KYTY_SYSV_ABI DiagnosticMonoUnknownY1(uint64_t arg0, uint64_t arg1, uint64_t arg2,
+                                                     uint64_t arg3, uint64_t arg4, uint64_t arg5) {
+	LOGF("FIRST_FRAME_AUDIT MONO_Y1_UNSUPPORTED args=0x%016" PRIx64 ",0x%016" PRIx64
+	     ",0x%016" PRIx64 ",0x%016" PRIx64 ",0x%016" PRIx64 ",0x%016" PRIx64 " return=ENOSYS\n",
+	     arg0, arg1, arg2, arg3, arg4, arg5);
+	return LibKernel::KERNEL_ERROR_ENOSYS;
+}
+
 LIB_DEFINE(InitLibKernel_1_Mem) {
+	NativeSyscallGuards::Register(s);
+	LIB_FUNC("3YnXspQNyw8", KernelNmount);
+	LIB_FUNC("tpThrBsInto", KernelUnmount);
+	if (std::getenv("KYTY_DIAGNOSTIC_NATIVE_KERNEL_BRIDGE_SELFTEST") != nullptr) {
+		EXIT_IF(!NativeKernelBridge::RunSelfTests());
+	}
 	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);
+	LIB_FUNC("BPE9s9vQQXo", Memory::KernelMmap);
+	LIB_FUNC("PGhQHd-dzv8", Memory::SceKernelMmap);
+	const bool shared_bridge = std::getenv("KYTY_DIAGNOSTIC_NATIVE_KERNEL_BRIDGE") != nullptr;
+	if (shared_bridge || std::getenv("KYTY_DIAGNOSTIC_MONO_NATIVE_MAP2D5") != nullptr) {
+		LIB_FUNC("dYK287SsmDs", DiagnosticNativeMonoMap2D5);
+	}
+	if (shared_bridge || std::getenv("KYTY_DIAGNOSTIC_MONO_SYSCONF47_PAGESIZE") != nullptr) {
+		LIB_FUNC("mkawd0NA9ts", DiagnosticMonoSysconf47PageSize);
+	}
+	if (shared_bridge || std::getenv("KYTY_DIAGNOSTIC_MONO_READLINK") != nullptr) {
+		LIB_FUNC("pd02UI9TbOA", DiagnosticGuestReadlink);
+	}
+	if (shared_bridge || std::getenv("KYTY_DIAGNOSTIC_GUARD_RAW_LIBKERNEL_SYSCALLS") != nullptr) {
+		// Overrides the generated ENOSYS-only guard for this one NID.
+		LIB_FUNC("8vE6Z6VEYyk", DiagnosticGuestAccess);
+		LIB_FUNC("7NwggrWJ5cA", DiagnosticRegMgrCall);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_MONO_Y1_ERROR") != nullptr) {
+		LIB_FUNC("Y1nEpkCieOY", DiagnosticMonoUnknownY1);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_MSCORLIB_AOT_LOAD") != nullptr ||
+	    std::getenv("KYTY_DIAGNOSTIC_PSM_NATIVE_AOT_LOAD") != nullptr) {
+		LIB_FUNC("Y1nEpkCieOY", LibKernel::DiagnosticPsmAotLoad);
+	}
 	LIB_FUNC("DGMG3JshrZU", Memory::KernelSetVirtualRangeName);
 	LIB_FUNC("mkgXxsoxWHg", Memory::KernelClearVirtualRangeName);
 	// 6xx
@@ -4592,8 +5825,32 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("bvD+95Q6asU", Memory::KernelMemoryPoolGetBlockStats);
 }
 
+static int KYTY_SYSV_ABI SysCoreOriginalEqueueFd(int64_t handle, int32_t* fd_out) {
+	if (!EventQueue::KernelPinEqueue(handle)) {
+		return LibKernel::KERNEL_ERROR_EBADF;
+	}
+	LibKernel::Memory::VirtualQueryInfo memory {};
+	const auto                          address = reinterpret_cast<uintptr_t>(fd_out);
+	if (address == 0 || address > UINTPTR_MAX - sizeof(int32_t) ||
+	    LibKernel::Memory::KernelVirtualQuery(fd_out, 0, &memory, sizeof(memory)) != 0 ||
+	    !memory.is_committed || memory.start > address || memory.end < address + sizeof(int32_t) ||
+	    (memory.protection & 2u) == 0) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	const int fd = LibKernel::FileSystem::CreateEqueueDescriptor(handle);
+	if (fd < 0) {
+		return fd;
+	}
+	LibKernel::Memory::InvalidateMemory(address, sizeof(int32_t));
+	std::memcpy(fd_out, &fd, sizeof(fd));
+	return 0;
+}
+
 LIB_DEFINE(InitLibKernel_1_Equeue) {
 	LIB_FUNC("D0OdFMjp46I", EventQueue::KernelCreateEqueue);
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_EQUEUE_FD") != nullptr) {
+		LIB_FUNC("QyrxcdBrb0M", SysCoreOriginalEqueueFd);
+	}
 	LIB_FUNC("jpFjmgAC5AE", EventQueue::KernelDeleteEqueue);
 	LIB_FUNC("fzyMKs9kim0", EventQueue::KernelWaitEqueue);
 	LIB_FUNC("vz+pg2zdopI", EventQueue::KernelGetEventUserData);
@@ -4602,6 +5859,9 @@ LIB_DEFINE(InitLibKernel_1_Equeue) {
 	LIB_FUNC("kwGyyjohI50", EventQueue::KernelGetEventData);
 	LIB_FUNC("Q0qr9AyqJSk", EventQueue::KernelGetEventFflags);
 	LIB_FUNC("Uu-iDFC9aUc", EventQueue::KernelGetEventError);
+	LIB_FUNC("dGFwUPT+BK8", EventQueue::KernelAddDynlibEvent);
+	LIB_FUNC("VHCS3rCd0PM", EventQueue::KernelAddReadEvent);
+	LIB_FUNC("JxJ4tfgKlXA", EventQueue::KernelDeleteReadEvent);
 	LIB_FUNC("4R6-OvI2cEA", EventQueue::KernelAddUserEvent);
 	LIB_FUNC("WDszmSbWuDk", EventQueue::KernelAddUserEventEdge);
 	LIB_FUNC("F6e0kwo4cnk", EventQueue::KernelTriggerUserEvent);
@@ -4645,6 +5905,20 @@ LIB_DEFINE(InitLibKernel_1_Semaphore) {
 	LIB_FUNC("DjpBvGlaWbQ", Semaphore::PthreadSemGetvalue);
 }
 
+// these wrap a pointer-sized mutex slot; native bodies read the tid from FS:0x10, absent on Windows
+// Native init takes (slot, flags), not pthread's (slot,attr*,name).
+static int KYTY_SYSV_ABI DiagnosticPsmMutexInit(LibKernel::PthreadMutex* slot, int flags) {
+	if (slot == nullptr || flags != 0 || *slot != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_MUTEX init_rejected slot=%p flags=%d\n",
+		     static_cast<void*>(slot), flags);
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	const int result = LibKernel::PthreadMutexInit(slot, nullptr, "PSMNativeMutex");
+	LOGF("FIRST_FRAME_AUDIT PSM_NATIVE_MUTEX init slot=%p value=%p result=0x%08x\n",
+	     static_cast<void*>(slot), static_cast<void*>(*slot), static_cast<uint32_t>(result));
+	return result;
+}
+
 static int KYTY_SYSV_ABI DiagnosticPsmThreadRename(LibKernel::Pthread thread, const char* name) {
 	thread                 = LibKernel::PthreadHostObjectFor(thread);
 	const bool target_self = thread != nullptr && thread == LibKernel::PthreadSelfOrNull();
@@ -4654,7 +5928,16 @@ static int KYTY_SYSV_ABI DiagnosticPsmThreadRename(LibKernel::Pthread thread, co
 	    target_self ? 1u : 0u, name != nullptr ? 1u : 0u, static_cast<uint32_t>(result));
 	return result;
 }
+
 LIB_DEFINE(InitLibKernel_1_Pthread) {
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_NATIVE_MUTEX") != nullptr) {
+		// 0x9CA0 init, 0x9D20 trylock, 0x9D70 lock, 0x9E30 unlock, 0x9CF0 destroy
+		LIB_FUNC("ZMn3clnAGBA", DiagnosticPsmMutexInit);
+		LIB_FUNC("rCTGkBIHfPY", LibKernel::PthreadMutexTrylock);
+		LIB_FUNC("pw+70ClLYlY", LibKernel::PthreadMutexLock);
+		LIB_FUNC("LEfMMCT+SlM", LibKernel::PthreadMutexUnlock);
+		LIB_FUNC("IJIggoPZExk", LibKernel::PthreadMutexDestroy);
+	}
 	LIB_FUNC("9UK1vLZQft4", LibKernel::PthreadMutexLock);
 	LIB_FUNC("tn3VlD0hG60", LibKernel::PthreadMutexUnlock);
 	LIB_FUNC("2Of0f+3mhhE", LibKernel::PthreadMutexDestroy);
@@ -4677,15 +5960,26 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("sCJd99Phct0", LibKernel::PthreadSetcanceltype);
 	LIB_FUNC("How7B8Oet6k", LibKernel::PthreadGetname);
 	LIB_FUNC("GBUY7ywdULE", LibKernel::PthreadRename);
+	// oxMp8uPqa+U (+0x8420) takes (pthread, name) and reads FS:0x10 as well; route to the
+	// guest-thread rename
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_NATIVE_THREAD_RENAME") != nullptr) {
+		LIB_FUNC("oxMp8uPqa+U", DiagnosticPsmThreadRename);
+	}
 	LIB_FUNC("bt3CTBKmGyI", LibKernel::PthreadSetaffinity);
 	LIB_FUNC("rcrVFJsQWRY", LibKernel::PthreadGetaffinity);
 	LIB_FUNC("1tKyG7RlMJo", LibKernel::PthreadGetprio);
 	LIB_FUNC("W0Hpm2X0uPE", LibKernel::PthreadSetprio);
+	LIB_FUNC("i3tB6CuvHb4", LibKernel::PthreadSetprioAndAffinity);
 	LIB_FUNC("T72hz6ffq08", LibKernel::PthreadYield);
 	LIB_FUNC("6XG4B33N09g", LibKernel::PthreadYield);
 	LIB_FUNC("CBNtXOoef-E", Posix::sched_get_priority_max);
 	LIB_FUNC("m0iS6jNsXds", Posix::sched_get_priority_min);
 	LIB_FUNC("EI-5-jlq2dE", LibKernel::PthreadGetthreadid);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	LIB_FUNC("cfjAjVTFG6A", Posix::pthread_suspend_user_context_np);
+	LIB_FUNC("YkGOXpJEtO8", Posix::pthread_get_user_context_np);
+	LIB_FUNC("QRdE7dBfNks", Posix::pthread_resume_user_context_np);
+#endif
 	LIB_FUNC("geDaqgH9lTg", LibKernel::PthreadKeyCreate);
 	LIB_FUNC("PrdHuuDekhY", LibKernel::PthreadKeyDelete);
 	LIB_FUNC("+BzXYkqYeLE", LibKernel::PthreadSetspecific);
@@ -4742,6 +6036,7 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("o69RpYO-Mu0", LibKernel::PthreadCondSignalto);
 	LIB_FUNC("BmMjYxmew1w", LibKernel::PthreadCondTimedwait);
 	LIB_FUNC("27bAgiJmOh0", Posix::pthread_cond_timedwait);
+	LIB_FUNC("K953PF5u6Pc", Posix::pthread_cond_reltimedwait_np);
 	LIB_FUNC("m5-2bsNfv7s", LibKernel::PthreadCondattrInit);
 	LIB_FUNC("mKoTx03HRWA", Posix::pthread_condattr_init);
 	LIB_FUNC("waPcxYiR3WA", LibKernel::PthreadCondattrDestroy);
@@ -4770,9 +6065,12 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("14bOACANTBo", Posix::pthread_once);
 	LIB_FUNC("Z4QosVuAsA0", Posix::pthread_once);
 	LIB_FUNC("Oy6IpwgtYOk", Posix::lseek);
+	LIB_FUNC("wdUufa9g-D8", Posix::dup2);
 	LIB_FUNC("ezv-RSBNKqI", Posix::pread);
 	LIB_FUNC("C2kJ-byS5rM", Posix::pwrite);
 	LIB_FUNC("9eMlfusH4sU", Posix::flock);
+	LIB_FUNC("8nY19bKoiZk", Posix::fcntl);
+	LIB_FUNC("t0fXUzq61Z4", Posix::fcntl);
 	LIB_FUNC("mqQMh1zPPT8", Posix::fstat);
 
 	LIB_FUNC("z0dtnPxYgtg", chmod);
@@ -4804,7 +6102,10 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("VAzswvTOCzI", Posix::unlink);
 	LIB_FUNC("c7ZnT7V1B98", Posix::rmdir);
 	LIB_FUNC("JGMio+21L4c", Posix::mkdir);
-	LIB_FUNC("wuCroIGjt2g", FileSystem::KernelOpen);
+	LIB_FUNC("wuCroIGjt2g", LibKernel::open);
+	LIB_FUNC("-W4xI5aVI8w", LibKernel::KernelSetProcessProperty);
+	LIB_FUNC("QuJYZ2KVGGQ", FileSystem::KernelShmOpen);
+	LIB_FUNC("tPWsbOUGO8k", FileSystem::KernelShmUnlink);
 	LIB_FUNC("bY-PO6JhzhQ", FileSystem::KernelClose);
 	LIB_FUNC("FN4gaPmuFV8", FileSystem::KernelWrite);
 }
@@ -4836,10 +6137,18 @@ LIB_DEFINE(InitLibKernel_1) {
 
 	LIB_OBJECT("f7uOxY9mM1U", &LibKernel::g_stack_chk_guard);
 	LIB_OBJECT("djxxOmW6-aw", &LibKernel::g_progname);
+	LIB_FUNC("JGfTMBOdUJo", LibKernel::KernelGetFsSandboxRandomWord);
 
 	LIB_FUNC("1jfXLRVzisc", LibKernel::KernelUsleep);
 	LIB_FUNC("QcteRwbsnV0", LibKernel::KernelUsleep);
 	LIB_FUNC("QvsZxomvUHs", LibKernel::KernelNanosleep);
+	LIB_FUNC("Hk7iHmGxB18", LibKernel::KernelIpmiManagerCall);
+	LIB_FUNC("Ht23vmmuP0Q", LibKernel::KernelSetIccConfiguration);
+	LIB_FUNC("RP9ImTNDfP8", LibKernel::KernelSetIccConfigurationEntry);
+	LIB_FUNC("Z7NoR9m5SVo", LibKernel::KernelGetIccConfigurationEntry);
+	LIB_FUNC("wXmx+vN8puE", LibKernel::KernelIccGetPowerUpCause);
+	LIB_FUNC("wNeGsNes5ck", LibKernel::KernelIccSetUsbPowerState);
+	LIB_FUNC("NtOA+0RApBg", LibKernel::KernelIccGetUsbPowerState);
 	LIB_FUNC("LwG8g3niqwA", LibKernel::KernelDlsym);
 	LIB_FUNC("-ZR+hG7aDHw", LibKernel::KernelSleep);
 	LIB_FUNC("6c3rCVE-fTU", LibKernel::open);
@@ -4849,6 +6158,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
+	LIB_FUNC("mC57yegC040", LibKernel::KernelIsM2DeviceAttached);
 	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
@@ -4896,6 +6206,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);
 	LIB_FUNC("DLORcroUqbc", LibKernel::KernelGetOpenPsId);
+	LIB_FUNC("ul57hvm6mBc", LibKernel::KernelGetOpenPsIdForSystem);
 	LIB_FUNC("zE-wXIZjLoM", LibKernel::KernelDebugRaiseExceptionOnReleaseMode);
 	LIB_FUNC("Hc4CaR6JBL0", Posix::KernelSyncOnAddressWait);
 	LIB_FUNC("B2n8aDorSH4", Posix::KernelSyncOnAddressWait32);
@@ -4914,3 +6225,21 @@ LIB_DEFINE(InitLibKernel_1) {
 }
 
 } // namespace Libs
+
+extern "C" int KYTY_SYSV_ABI KytyGuestJumpSaveMask(void* buf) {
+	const auto address = reinterpret_cast<uint64_t>(buf);
+	if (buf == nullptr || address > UINT64_MAX - 0x58) {
+		*Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EFAULT;
+		return -1;
+	}
+	return Libs::LibKernel::sigprocmask(1, nullptr, reinterpret_cast<void*>(address + 0x48));
+}
+
+extern "C" int KYTY_SYSV_ABI KytyGuestJumpRestoreMask(void* buf) {
+	const auto address = reinterpret_cast<uint64_t>(buf);
+	if (buf == nullptr || address > UINT64_MAX - 0x58) {
+		*Libs::Posix::GetErrorAddr() = Libs::Posix::POSIX_EFAULT;
+		return -1;
+	}
+	return Libs::LibKernel::sigprocmask(3, reinterpret_cast<void*>(address + 0x48), nullptr);
+}

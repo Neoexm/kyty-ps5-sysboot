@@ -1,6 +1,17 @@
 #if defined(_WIN32)
 namespace NativeAvTest {
+namespace VO = Libs::VideoOut;
 namespace Memory = Libs::LibKernel::Memory;
+constexpr std::array<const char*, 8> controls {
+    "KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS",
+    "KYTY_DIAGNOSTIC_SYSAV_AV_DEVICE_PROBE",
+    "KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_DISPCLK",
+    "KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_PIXEL_PLL",
+    "KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_OTG_TIMING",
+    "KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_OTG_CONTROL",
+    "KYTY_DIAGNOSTIC_SYSAV_VIRTUAL_FORMAT_REGISTERS",
+    "KYTY_DIAGNOSTIC_SYSAV_SPLASH_SHARE_DCE_HEAD",
+};
 class Environment {
 public:
   Environment() {

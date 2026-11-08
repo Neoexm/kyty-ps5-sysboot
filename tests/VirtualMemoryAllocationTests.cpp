@@ -4174,6 +4174,8 @@ void TestSmallFiberStacksAndMigration() {
 }
 #endif
 
+#include "ModuleInitializerStackTests.inc"
+
 } // namespace
 
 int main(int argc, char** argv) {

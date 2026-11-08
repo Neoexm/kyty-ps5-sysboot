@@ -10,5 +10,7 @@ struct Credentials {
 	Fact capability62 = Fact::Unknown;
 	Fact word68_bit57 = Fact::Unknown;
 };
+
+enum class Admission { Allow, Deny, Unknown };
 } // namespace Libs::LibKernel::SocketPolicy
 #endif

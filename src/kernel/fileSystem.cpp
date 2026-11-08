@@ -3032,6 +3032,20 @@ static bool SamePsmShellUiFile(HANDLE left, HANDLE right) {
 	       left_info.nFileIndexLow == right_info.nFileIndexLow;
 }
 
+static bool SamePsmShellUiFile(const std::filesystem::path& left,
+                               const std::filesystem::path& right) {
+	const auto open = [](const std::filesystem::path& path) {
+		return CreateFileW(path.c_str(), GENERIC_READ,
+		                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+		                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	};
+	const HANDLE left_handle  = open(left);
+	const HANDLE right_handle = open(right);
+	const bool   same         = SamePsmShellUiFile(left_handle, right_handle);
+	if (left_handle != INVALID_HANDLE_VALUE) CloseHandle(left_handle);
+	if (right_handle != INVALID_HANDLE_VALUE) CloseHandle(right_handle);
+	return same;
+}
 #else
 static bool SamePsmShellUiFile(const std::filesystem::path& left,
                                const std::filesystem::path& right) {
@@ -3134,6 +3148,28 @@ static void ReleasePsmShellUiApplicationLeases() {
 	}
 }
 
+static const PsmShellUiApplicationRoute*
+ClassifyPsmShellUiApplicationRoute(const std::string& mounted_name, bool* exact) {
+	if (exact != nullptr) *exact = false;
+	for (const auto& route: kPsmShellUiApplicationRoutes) {
+		if (mounted_name == route.guest_path) {
+			if (exact != nullptr) *exact = true;
+			return &route;
+		}
+	}
+	auto normalized = Common::FixFilenameSlash(mounted_name);
+	while (normalized.starts_with("//"))
+		normalized.erase(0, 1);
+	normalized = Common::PathToGenericString(Common::PathFromUtf8(normalized).lexically_normal());
+	for (const auto& route: kPsmShellUiApplicationRoutes) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (Common::EqualNoCase(normalized, route.guest_path)) return &route;
+#else
+		if (normalized == route.guest_path) return &route;
+#endif
+	}
+	return nullptr;
+}
 
 static std::filesystem::path ResolvePsmShellUiApplicationPath(const std::string& mounted_name,
                                                               bool*              matched) {
@@ -3249,7 +3285,26 @@ static bool IsPsmShellUiApplicationHostPath(const std::filesystem::path& path) {
 	return false;
 }
 
+static bool ResolvePsmShellUiPackageRoot(std::filesystem::path* root) {
+	if (root == nullptr) return false;
+	if (Process::ResolveExecChildApp0PackageTarget("NPXS40087", root)) return true;
+#if defined(KYTY_PSM_SHELLUI_APPLICATION_ROUTE_TESTS)
+	const char* test_root = std::getenv("KYTY_TEST_PSM_SHELLUI_PACKAGE_ROOT");
+	if (std::getenv("KYTY_TEST_PSM_SHELLUI_APPLICATION_ROUTE") != nullptr && test_root != nullptr &&
+	    test_root[0] != '\0') {
+		*root = std::filesystem::path(test_root);
+		return root->is_absolute();
+	}
+#endif
+	return false;
+}
 
+static bool IsPsmShellUiProtectedPackageFile(const std::filesystem::path& path) {
+	std::filesystem::path root;
+	if (!ResolvePsmShellUiPackageRoot(&root)) return false;
+	return SamePsmShellUiFile(path, root / "eboot.bin") ||
+	       SamePsmShellUiFile(path, root / "psm" / "Application" / "app.exe.sprx");
+}
 
 bool MountPoints::IsReadOnly(const std::filesystem::path& path) {
 	if (Process::IsExecChildImagePath(path) || IsPsmShellUiApplicationHostPath(path)) return true;
@@ -3531,6 +3586,30 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 #else
 		auto actual = ResolvePathIgnoringCase(p.dir / native_rel_path);
 #endif
+		std::error_code error;
+		const auto      root = std::filesystem::weakly_canonical(p.dir, error);
+		if (error) return {};
+		actual = std::filesystem::weakly_canonical(actual, error);
+		if (error) return {};
+		auto target = actual.begin();
+		for (auto component = root.begin(); component != root.end(); ++component, ++target) {
+			if (target == actual.end()) return {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (_wcsicmp(component->c_str(), target->c_str()) != 0) return {};
+#else
+			if (*component != *target) return {};
+#endif
+		}
+		if (IsPsmShellUiProtectedPackageFile(actual)) {
+			static std::atomic_uint32_t rejected {0};
+			if (rejected.fetch_add(1) < 12) {
+				LOGF("FIRST_FRAME_AUDIT PSM_SHELLUI_PACKAGE_ALIAS_REJECTED guest=%s"
+				     " resolved_identity=protected_package_file\n",
+				     Log::EscapeField(mounted_name).c_str());
+			}
+			return {};
+		}
+		return actual;
 	}
 
 	return {};
@@ -5602,7 +5681,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tCreate: %s, %s\n",
 			           EscapeLogPath(file->real_name).c_str(), result ? "[ok]" : "[fail]");
 		} else {
-			result = file->f.Open(file->real_name, rw_mode);
+			bool exact_shellui_route = false;
+			ClassifyPsmShellUiApplicationRoute(file->name, &exact_shellui_route);
+			result = exact_shellui_route ? OpenPsmShellUiApplicationSnapshot(file->name, &file->f)
+			                             : file->f.Open(file->real_name, rw_mode);
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           EscapeLogPath(file->real_name).c_str(), result ? "[ok]" : "[fail]");

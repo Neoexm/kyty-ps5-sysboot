@@ -972,6 +972,8 @@ static MemoryOperationMutex g_memory_operation_mutex;
 uint64_t MemoryOperationOwnerThreadId() {
 	return g_memory_operation_mutex.Owner();
 }
+static std::set<uint64_t>    g_locked_guest_pages;
+static bool                  g_residency_uncertain = false;
 static std::atomic<uint64_t> g_next_anonymous_shared_memory_id {0};
 #if defined(KYTY_SHM_ANON_TESTS)
 static std::atomic<uint64_t> g_test_objects {0};
@@ -2813,6 +2815,17 @@ void* KYTY_SYSV_ABI KernelMmap(void* addr, size_t len, int prot, int flags, int 
 
 	return mapped;
 }
+// libkernel 13.60 +0x16e90: 7th arg written only on success, PSM's font loader leaves it
+// uninitialised
+int KYTY_SYSV_ABI SceKernelMmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset,
+                                void** res) {
+	void* mapped = KernelMmap(addr, len, prot, flags, fd, offset);
+	if (mapped == reinterpret_cast<void*>(static_cast<intptr_t>(-1))) {
+		return KERNEL_ERROR_UNKNOWN + *Posix::GetErrorAddr();
+	}
+	*res = mapped;
+	return OK;
+}
 static ScopeMemory::SharedObject* FindScopeSharedMemory(const char* name) {
 	for (uint32_t i = 0; i < g_scope_memory->shared_count; i++) {
 		auto& shared = g_scope_memory->shared[i];
@@ -4606,6 +4619,107 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	return FreeGuestMemoryOwner(vaddr, mapped_size);
 }
 
+static int UnlockHostMemory(uint64_t start, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (VirtualUnlock(reinterpret_cast<void*>(start), size)) return 0;
+	if (GetLastError() != ERROR_NOT_LOCKED) return Posix::POSIX_ENOMEM;
+	SYSTEM_INFO info {};
+	GetSystemInfo(&info);
+	for (uint64_t page = start; page < start + size; page += info.dwPageSize) {
+		if (!VirtualUnlock(reinterpret_cast<void*>(page), info.dwPageSize) &&
+		    GetLastError() != ERROR_NOT_LOCKED)
+			return Posix::POSIX_ENOMEM;
+	}
+	return 0;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	if (::munlock(reinterpret_cast<void*>(start), size) == 0) return 0;
+	return errno == EPERM ? Posix::POSIX_EPERM : Posix::POSIX_ENOMEM;
+#else
+	return Posix::POSIX_ENOSYS;
+#endif
+}
+static int LockMemoryRange(const void* addr, size_t len, bool lock) {
+	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
+	constexpr uint64_t                    PageSize = 0x4000;
+	const auto                            address  = reinterpret_cast<uint64_t>(addr);
+	const auto                            start    = address & ~(PageSize - 1);
+	const auto                            offset   = address - start;
+	auto                                  failure  = [](int error) {
+		*Posix::GetErrorAddr() = error;
+		return static_cast<int32_t>(0x80020000u | static_cast<uint32_t>(error));
+	};
+	if (len > UINT64_MAX - offset || len + offset > UINT64_MAX - (PageSize - 1)) {
+		return failure(Posix::POSIX_EINVAL);
+	}
+	const auto size = (len + offset + PageSize - 1) & ~(PageSize - 1);
+	if (size > UINT64_MAX - start) return failure(Posix::POSIX_EINVAL);
+	if (size == 0) return OK;
+	std::vector<VirtualRanges::Range> ranges;
+	if (!g_virtual_ranges->QuerySpan(start, size, &ranges) ||
+	    std::any_of(ranges.begin(), ranges.end(), [lock](const auto& range) {
+		    return !IsCommittedRangeType(range.type) || (lock && (range.protection & 7) == 0);
+	    })) {
+		return failure(Posix::POSIX_ENOMEM);
+	}
+	if (!lock) {
+		const int error = UnlockHostMemory(start, size);
+		if (error != 0) return failure(error);
+		for (auto page = start; page < start + size; page += PageSize)
+			g_locked_guest_pages.erase(page);
+		return OK;
+	}
+	int  error   = Posix::POSIX_ENOSYS;
+	bool success = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	success               = VirtualLock(reinterpret_cast<void*>(start), size) != 0;
+	const auto host_error = GetLastError();
+	error = host_error == ERROR_ACCESS_DENIED ? Posix::POSIX_EPERM : Posix::POSIX_ENOMEM;
+	if (!success)
+		LOGF("MEMORY_RESIDENCY lock=1 addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " host_error=%lu guest_errno=%d\n",
+		     start, size, host_error, error);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	success = ::mlock(reinterpret_cast<void*>(start), size) == 0;
+	switch (errno) {
+		case EPERM: error = Posix::POSIX_EPERM; break;
+		case EINVAL: error = Posix::POSIX_EINVAL; break;
+		case EAGAIN: error = Posix::POSIX_EAGAIN; break;
+		default: error = Posix::POSIX_ENOMEM; break;
+	}
+#endif
+	if (success) {
+		for (auto page = start; page < start + size; page += PageSize)
+			g_locked_guest_pages.insert(page);
+		return OK;
+	}
+	for (auto page = start; page < start + size; page += PageSize) {
+		if (!g_locked_guest_pages.contains(page) && UnlockHostMemory(page, PageSize) != 0) {
+			g_residency_uncertain = true;
+		}
+	}
+	return failure(error);
+}
+int KYTY_SYSV_ABI KernelMunlockAll() {
+	PRINT_NAME();
+	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
+	while (!g_locked_guest_pages.empty()) {
+		const auto                        page = *g_locked_guest_pages.begin();
+		std::vector<VirtualRanges::Range> ranges;
+		if (!g_virtual_ranges->QuerySpan(page, 0x4000, &ranges) ||
+		    std::any_of(ranges.begin(), ranges.end(),
+		                [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
+			g_locked_guest_pages.erase(page);
+			continue;
+		}
+		const int result = LockMemoryRange(reinterpret_cast<void*>(page), 0x4000, false);
+		if (result != OK) return result;
+	}
+	if (g_residency_uncertain) {
+		*Posix::GetErrorAddr() = Posix::POSIX_ENOSYS;
+		return KERNEL_ERROR_ENOSYS;
+	}
+	return OK;
+}
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	PRINT_NAME();
 

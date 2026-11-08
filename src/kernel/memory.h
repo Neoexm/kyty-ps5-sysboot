@@ -135,6 +135,9 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags);
+void* KYTY_SYSV_ABI KernelMmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset);
+int KYTY_SYSV_ABI SceKernelMmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset,
+                                void** res);
 int KYTY_SYSV_ABI KernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name);
 int KYTY_SYSV_ABI KernelClearVirtualRangeName(const void* addr, uint64_t len);
 int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len);

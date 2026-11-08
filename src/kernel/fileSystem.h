@@ -156,6 +156,7 @@ int  MountRegisteredPartitionPassthrough(const std::string& device, const std::s
 void                  Umount(const std::string& folder_or_point);
 // Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
+bool OpenPsmShellUiApplicationSnapshot(const std::string& guest_path, Common::File* file);
 bool ReadPsmShellUiApplicationSnapshot(const std::string& guest_path, std::vector<uint8_t>* image);
 bool IsNullfsNoExec(const std::string& mounted_file_name);
 
@@ -194,6 +195,7 @@ int KYTY_SYSV_ABI     KernelPhyshmOpen(const char* path, int flags, uint16_t mod
 int KYTY_SYSV_ABI     KernelShmUnlink(const char* path);
 void*                 MapSharedMemory(int d, void* addr, size_t len, int prot, int flags);
 int KYTY_SYSV_ABI     KernelClose(int d);
+int KYTY_SYSV_ABI     KernelDup2(int oldd, int newd);
 int KYTY_SYSV_ABI     KernelPipe(int* fds);
 int                   CreateGuestSocketPair(int* fds);
 int KYTY_SYSV_ABI     KernelIoctl(int d, uint64_t request, void* arg);

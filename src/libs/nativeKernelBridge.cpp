@@ -4884,7 +4884,42 @@ Reply RegMgrCall(const SyscallRequest& request) {
 	return reply;
 }
 
+Reply RandomizedPath(const SyscallRequest& request) {
+	// 0x25a get form: sceKernelGetFsSandboxRandomWord (+0x1c3f0) sends (0, buf, &length=0xff); -1
+	// is NULL, length 0 is ""
+	auto* word   = reinterpret_cast<char*>(request.args[1]);
+	auto* length = reinterpret_cast<size_t*>(request.args[2]);
+	if (request.args[0] != 0) {
+		// set form (word, 0, 0) from SceSysCore sub_18880; execve hands the word to the child
+		std::string assigned;
+		const int   rc = ReadExecveGuestString(request.args[0], 256,
+		                                       LibKernel::KERNEL_ERROR_ENAMETOOLONG, &assigned);
+		LOGF("SYSCORE_APP_SPAWN randomized_path_set pid=%d path=0x%" PRIx64
+		     " word=%s result=0x%x\n",
+		     LibKernel::Process::GetPid(), request.args[0], rc == 0 ? assigned.c_str() : "", rc);
+		if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+		LibKernel::Process::RecordSpawnSandbox(LibKernel::Process::GetPid(), nullptr, &assigned);
+		return {0, 0};
+	}
+	if (word == nullptr || length == nullptr) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	const auto sandbox_word = LibKernel::Process::GetExecChildSandboxWord();
+	if (sandbox_word.size() >= *length) {
+		return {-1, Libs::Posix::POSIX_ENAMETOOLONG};
+	}
+	std::memcpy(word, sandbox_word.c_str(), sandbox_word.size() + 1);
+	*length = sandbox_word.size();
+	return {0, 0};
+}
 
+// app spawn trampoline (SceSysCore 0x900018880) sandbox setup. No host state, success gets the
+// child to execve
+Reply AppSandboxPath(const SyscallRequest& request) {
+	LOGF("SYSCORE_APP_SPAWN sandbox_path pid=%d path=0x%" PRIx64 " result=0\n",
+	     LibKernel::Process::GetPid(), request.args[0]);
+	return {0, 0};
+}
 
 Reply GuestChdir(const SyscallRequest& request) {
 	LOGF("SYSCORE_APP_SPAWN chdir pid=%d path=0x%" PRIx64 " result=0\n",
@@ -4905,6 +4940,12 @@ Reply GuestChroot(const SyscallRequest& request) {
 	return {0, 0};
 }
 
+// sys_is_in_sandbox: 0 before execve, the child is still SceSysCore. Also takes the trampoline's
+// jle proceed edge.
+Reply AppIsInSandbox(const SyscallRequest&) {
+	LOGF("SYSCORE_APP_SPAWN is_in_sandbox pid=%d result=0\n", LibKernel::Process::GetPid());
+	return {0, 0};
+}
 
 // sys_budget_get_ptype. XXX: ptype not recoverable from the dump; 2 takes the cmp eax,2 edge to
 // execve unless the budget block marks 0x2000100

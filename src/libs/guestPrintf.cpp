@@ -14,8 +14,11 @@
 #include "common/stringUtils.h"
 #include "libs/vaContext.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace Libs {
@@ -444,6 +447,7 @@ static size_t _strnlen_s(const Char* str, size_t maxsize) {
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* format,
                                 VaList* va_list) {
+	const char*       original_format = format;
 	std::vector<char> buffer;
 
 	uint32_t flags     = 0;
@@ -704,7 +708,9 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 				const size_t limit = (flags & FLAGS_PRECISION) != 0u ? precision : maxlen;
 				const char* p = VaArg_ptr<const char>(va_list);
 				std::string converted;
-				if ((flags & FLAGS_LONG) != 0u) {
+				if (p == nullptr) {
+					p = "(null)";
+				} else if ((flags & FLAGS_LONG) != 0u) {
 					// The guest ABI uses a 16-bit code unit for wchar_t.
 					const auto* wide = reinterpret_cast<const char16_t*>(p);
 					std::u16string_view text(wide, _strnlen_s(wide, limit));
@@ -771,10 +777,17 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 
 	// termination
 	out(static_cast<char>(0), &buffer, idx < maxlen ? idx : maxlen - 1U, maxlen);
+	if (!sn && std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr &&
+	    std::strstr(buffer.data(), "launching") != nullptr) {
+		LOGF("SYSCORE_LAUNCH_OUTPUT format=%s rendered=%s\n", original_format, buffer.data());
+	}
 
 	if (sn) {
-		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
-		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
+		if (sn_n != 0) {
+			const size_t copy_size = std::min(idx, sn_n - 1);
+			std::memcpy(sn_s, buffer.data(), copy_size);
+			sn_s[copy_size] = '\0';
+		}
 	} else {
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}
@@ -784,11 +797,23 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 }
 
 static int kyty_vprintf(const char* format, VaList* va_list) {
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr && format != nullptr &&
+	    std::strstr(format, "launching") != nullptr) {
+		LOGF("SYSCORE_LAUNCH_MESSAGE entry=vprintf guest_return=%p format=%s\n",
+		     __builtin_return_address(0), format);
+	}
 	return kyty_printf_internal(false, nullptr, 0, format, va_list);
 }
 
 static int kyty_printf_ctx(VaContext* ctx) {
 	const char* format = VaArg_ptr<const char>(&ctx->va_list);
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr && format != nullptr &&
+	    std::strstr(format, "[UMD MAIN] launching") != nullptr) {
+		auto          diagnostic_args = ctx->va_list;
+		const int32_t guest_return    = VaArg_int(&diagnostic_args);
+		LOGF("SYSCORE_LAUNCH_PRINT_ABI guest_caller=%p error_argument=0x%08x format=%s",
+		     __builtin_return_address(0), static_cast<uint32_t>(guest_return), format);
+	}
 
 	return kyty_printf_internal(false, nullptr, 0, format, &ctx->va_list);
 }
@@ -803,6 +828,12 @@ static int kyty_snprintf_ctx(VaContext* ctx) {
 
 static int KYTY_SYSV_ABI kyty_printf_std(VA_ARGS) {
 	VA_CONTEXT(ctx); // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
+	const auto* format = reinterpret_cast<const char*>(rdi);
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_LAUNCH_TRACE") != nullptr && format != nullptr &&
+	    std::strstr(format, "launching") != nullptr) {
+		LOGF("SYSCORE_LAUNCH_MESSAGE entry=printf guest_return=%p format=%s\n",
+		     __builtin_return_address(0), format);
+	}
 
 	return kyty_printf_ctx(&ctx);
 }
