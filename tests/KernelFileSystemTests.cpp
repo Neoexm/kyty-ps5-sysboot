@@ -796,6 +796,37 @@ void CheckMonoNativeMemoryContract() {
       {0x1dd, {0x200000000ull, 0x4000, 1, 0x1000, UINT32_MAX, 0}},
       {0x1dd, {0x200000000ull, 0x4000, 4, 0x1000, UINT32_MAX, 0}},
   }};
+  for (const auto& request: rejected) {
+    const auto reply = DispatchSyscall(request);
+    size_t rejected_available = 0;
+    Check(reply.value == -1 && reply.posix_errno == Libs::Posix::POSIX_ENOSYS,
+          "unsupported native anonymous mmap tuple remains rejected");
+    Check(Kernel::Memory::KernelAvailableFlexibleMemorySize(&rejected_available) == OK &&
+              rejected_available == rw_available,
+          "rejected native anonymous mmap tuple does not consume flexible backing");
+  }
+
+  const auto rw_released = DispatchSyscall(
+      {0x49, {static_cast<uint64_t>(rw_reply.value), 0x4000}});
+  Check(rw_released.value == 0 && rw_released.posix_errno == 0,
+        "native read-write anonymous mapping releases through munmap");
+  size_t post_rw_available = 0;
+  Check(Kernel::Memory::KernelAvailableFlexibleMemorySize(&post_rw_available) == OK &&
+            post_rw_available == mapped_available,
+        "read-write anonymous teardown restores its exact flexible-memory page");
+
+  for (const auto reply: {first, second}) {
+    const auto released = DispatchSyscall(
+        {0x49, {static_cast<uint64_t>(reply.value), 0x60000}});
+    Check(released.value == 0 && released.posix_errno == 0,
+          "native Mono reservation releases through the munmap path");
+    Kernel::Memory::VirtualQueryInfo released_info {};
+    const int query_result = Kernel::Memory::KernelVirtualQuery(
+        reinterpret_cast<void*>(static_cast<uintptr_t>(reply.value)), 0,
+        &released_info, sizeof(released_info));
+    Check(query_result != OK || !released_info.is_committed || !released_info.is_flexible,
+          "released native reservation is absent from committed flexible mappings");
+  }
   size_t final_available = 0;
   Check(Kernel::Memory::KernelAvailableFlexibleMemorySize(&final_available) == OK &&
             final_available == baseline_available,
@@ -862,6 +893,45 @@ void CheckMonoNativeMemoryContract() {
             Kernel::Memory::KernelVirtualQuery(chunk, 0, &chunk_info, sizeof(chunk_info)) == OK &&
             chunk_info.is_flexible && (chunk_info.protection & 7) == 0,
         "hermes MAP_FIXED PROT_NONE releases the chunk back to a reservation");
+  const auto recommitted = commit(3);
+  Check(recommitted.value == static_cast<int64_t>(heap_base + 0x400000) && chunk[0] == 0 &&
+            chunk[0x3fffff] == 0,
+        "recommitted hermes chunk is fresh zeroed anonymous memory");
+
+  const std::array<Libs::NativeKernelBridge::SyscallRequest, 3> fixed_rejected {{
+      {0x1dd, {heap_base + 0x9000000, 0x400000, 3, 0x1010, UINT32_MAX, 0}},
+      {0x1dd, {heap_base + 0x8e00000, 0x400000, 3, 0x1010, UINT32_MAX, 0}},
+      {0x1dd, {heap_base, 0x400000, 7, 0x1010, UINT32_MAX, 0}},
+  }};
+  for (const auto& request: fixed_rejected) {
+    const auto reply = DispatchSyscall(request);
+    size_t fixed_available = 0;
+    Check(reply.value == -1 && reply.posix_errno == Libs::Posix::POSIX_ENOSYS &&
+              Kernel::Memory::KernelAvailableFlexibleMemorySize(&fixed_available) == OK &&
+              fixed_available == heap_floor,
+          "MAP_FIXED outside existing flexible memory or with other protection stays rejected");
+  }
+
+  Check(DispatchSyscall({0x49, {heap_base, 0x400000}}).value == 0 &&
+            DispatchSyscall({0x49, {heap_base + 0x400000, 0x400000}}).value == 0 &&
+            DispatchSyscall({0x49, {heap_base + 0x800000, 0x8800000}}).value == 0 &&
+            DispatchSyscall({0x49, {static_cast<uint64_t>(name_page.value), 0x4000}}).value == 0,
+        "hermes heap ranges and name page release through munmap");
+  size_t hermes_final_available = 0;
+  Check(Kernel::Memory::KernelAvailableFlexibleMemorySize(&hermes_final_available) == OK &&
+            hermes_final_available == baseline_available,
+        "hermes heap teardown restores exact flexible-memory capacity");
+#if defined(_WIN32)
+  Check(_putenv_s("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS", saved_trap.c_str()) == 0 &&
+            _putenv_s("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP", saved_native_heap.c_str()) == 0,
+        "restore native mmap fixture environment");
+#else
+  Check((trap ? setenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS", saved_trap.c_str(), 1)
+              : unsetenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS")) == 0 &&
+            (native_heap ? setenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP", saved_native_heap.c_str(), 1)
+                         : unsetenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP")) == 0,
+        "restore native mmap fixture environment");
+#endif
 }
 
 void CheckNativeUserServiceInitProviderGate() {
@@ -4198,6 +4268,26 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (argc == 1 || sysav_audio_shm_only) {
+    TempDirectory sysav_audio_shm_temporary;
+    CheckSysAvAudioShm(sysav_audio_shm_temporary.Path());
+    if (sysav_audio_shm_only) {
+      subsystems.Destroy();
+      std::printf("KernelFileSystemTests: SysAv audio-out shm lifecycle cases passed\n");
+      return 0;
+    }
+  }
+
+  if (argc == 1 || physhm_only) {
+    TempDirectory physhm_temporary;
+    CheckPhyshm(physhm_temporary.Path());
+    if (physhm_only) {
+      subsystems.Destroy();
+      std::printf("KernelFileSystemTests: physical-shm ABI and lifecycle cases passed\n");
+      return 0;
+    }
+  }
+
   if (argc == 1 || sysav_raw_syscall_trap_only) {
     TempDirectory sysav_raw_syscall_trap_temporary;
     CheckSysAvRawSyscallTrap(sysav_raw_syscall_trap_temporary.Path());
@@ -4377,6 +4467,31 @@ int main(int argc, char** argv) {
     graphics.reset();
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: thread atexit lifetime cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--module-lifetime-only") == 0) {
+    CheckModuleLifetimes(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: module lifetime cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--read-only-stdio-only") == 0) {
+    CheckJemspaceAllocationRanges();
+    CheckGuestReadOnlyStdio(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: read-only stdio cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sandbox-word-only") == 0) {
+    CheckSandboxWord(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: sandbox word cases passed\n");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--guest-jump-only") == 0) {
@@ -4631,6 +4746,34 @@ int main(int argc, char** argv) {
     graphics.reset();
     subsystems.Destroy();
     return 2;
+  }
+  CheckGuestSignalMasks();
+  CheckGuestJumps();
+  CheckGuestPendingSignalDelivery();
+  CheckSandboxWord(temporary.Path());
+  CheckGuestReadOnlyStdio(temporary.Path());
+  CheckJemspaceAllocationRanges();
+  CheckNativeMbusDevices();
+  CheckReadEventRegistration();
+  CheckMbusDescriptorLifetimes();
+  CheckNestedReadiness();
+  CheckNativeKeventSafety();
+  CheckSysAvKeventUmd();
+  CheckWaitOutputCounts();
+  if (argc == 2 && std::strcmp(argv[1], "--native-mbus-only") == 0) {
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: native MBus cases passed\n");
+    return 0;
+  }
+  CheckNativeAvDevices(*graphics);
+  if (argc == 2 && std::strcmp(argv[1], "--native-av-devices-only") == 0) {
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: native AV device cases passed\n");
+    return 0;
   }
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());

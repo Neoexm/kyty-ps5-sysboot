@@ -4695,6 +4695,46 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					return true;
 				}
 			}
+			// Splash mmap of its /dev/dmem0 descriptor at 0x200000000, 96 MiB.
+			if (info->rax == 0x1dd && info->rdi == 0x200000000ull && info->rsi == 0x6000000 &&
+			    info->rdx == 1 && info->r10 == 0x15000001 && info->r8 >= 3 &&
+			    info->r8 <= INT32_MAX && (info->r9 & 0x1fffffull) == 0 && info->r9 <= INT64_MAX &&
+			    Libs::LibKernel::FileSystem::IsNativeDmemDescriptor(static_cast<int>(info->r8))) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value > 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					return true;
+				}
+			}
+			// 36 MiB writable CPU/GPU mapping of /dev/dmem0
+			if (info->rax == 0x1dd && (info->rdi == 0 || info->rdi == 0x200000000ull) &&
+			    info->rsi == 0x2400000 && info->rdx == 0x33 && info->r10 == 0x15000001 &&
+			    info->r8 >= 3 && info->r8 <= INT32_MAX && (info->r9 & 0x1fffff) == 0) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value > 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno)
+					                                  : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_DMEM_MMAP_RETURN"
+					     " value=0x%016" PRIx64 " errno=%d"
+					     " guest_CF=%u\n",
+					     context->Rax, reply.posix_errno,
+					     static_cast<unsigned>(context->EFlags & 1));
+					return true;
+				}
+			}
 			if (info->rax == 0x1dd && info->rsi != 0 && info->rsi <= 0x1000000 &&
 			    (info->rsi & 0x3fff) == 0 && (info->rdi & 0x3fff) == 0 &&
 			    ((info->rdx == 3 &&

@@ -41,11 +41,15 @@ public:
 		AddressRangeUnavailable,
 	};
 
-	explicit GuestBackingStore(uint64_t size): m_size(size) {
+	GuestBackingStore(uint64_t size, [[maybe_unused]] const char* name, uint64_t private_start = 0,
+	                  uint64_t private_size = 0)
+	    : m_size(size), m_private_start(private_start), m_private_size(private_size) {
+		EXIT_IF(private_start > size || private_size > size - private_start);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		m_shared = name != nullptr && name[0] != '\0';
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
-		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
+		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), name);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
@@ -60,6 +64,22 @@ public:
 			           static_cast<uint32_t>(GetLastError()));
 			CloseHandle(m_handle);
 			m_handle = nullptr;
+			return;
+		}
+		if (m_private_size != 0) {
+			m_private_handle = CreateFileMappingA(
+			    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
+			    static_cast<DWORD>(m_private_size >> 32u),
+			    static_cast<DWORD>(m_private_size & 0xffffffffu), nullptr);
+			if (m_private_handle != nullptr) {
+				m_private_base = static_cast<uint8_t*>(MapViewOfFile(
+				    m_private_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_private_size));
+			}
+			if (m_private_base == nullptr) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t flexible-memory backing: allocation failed: 0x%08" PRIx32 "\n",
+				           static_cast<uint32_t>(GetLastError()));
+			}
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
@@ -110,6 +130,12 @@ public:
 		if (m_handle != nullptr) {
 			CloseHandle(m_handle);
 		}
+		if (m_private_base != nullptr) {
+			UnmapViewOfFile(m_private_base);
+		}
+		if (m_private_handle != nullptr) {
+			CloseHandle(m_private_handle);
+		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		for (const auto& [_, entry]: m_maps) {
 			EXIT_IF(
@@ -143,7 +169,8 @@ public:
 
 	[[nodiscard]] bool IsAvailable() const {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return m_handle != nullptr && m_backing_base != nullptr;
+		return m_handle != nullptr && m_backing_base != nullptr &&
+		       (m_private_size == 0 || (m_private_handle != nullptr && m_private_base != nullptr));
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		return m_fd >= 0 && m_backing_base != nullptr;
 #else
@@ -161,7 +188,59 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
-		std::memset(m_backing_base + backing_offset, 0, size);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!EnsureCommitted(backing_offset, size)) {
+			return false;
+		}
+#endif
+		std::memset(BackingData(backing_offset), 0, size);
+		return true;
+	}
+
+	bool ContainsLocalBacking(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || vaddr == 0 || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+
+		std::lock_guard lock(m_mutex);
+		const auto      end     = vaddr + size;
+		auto            current = vaddr;
+		while (current < end) {
+			MapEntry entry {};
+			if (!FindContainingUnlocked(current, 1, &entry)) {
+				return false;
+			}
+			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
+			const auto offset = entry.backing_offset + current - entry.vaddr;
+			if (!LocalBackingRangeOk(offset, bytes)) {
+				return false;
+			}
+			current += bytes;
+		}
+		return true;
+	}
+
+	bool TryWriteLocalBacking64(uint64_t vaddr, uint64_t value) {
+		static_assert(std::atomic_ref<uint64_t>::is_always_lock_free);
+		static_assert(std::atomic_ref<uint64_t>::required_alignment <= sizeof(uint64_t));
+		if (!IsAvailable() || vaddr == 0 || (vaddr & 7u) != 0) {
+			return false;
+		}
+
+		std::lock_guard lock(m_mutex);
+		MapEntry        entry {};
+		if (!FindContainingUnlocked(vaddr, sizeof(value), &entry)) {
+			return false;
+		}
+		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+		if (!LocalBackingRangeOk(offset, sizeof(value))) {
+			return false;
+		}
+		auto* destination = reinterpret_cast<uint64_t*>(BackingData(offset));
+		if ((reinterpret_cast<uint64_t>(destination) & 7u) != 0) {
+			return false;
+		}
+		std::atomic_ref<uint64_t>(*destination).store(value, std::memory_order_release);
 		return true;
 	}
 
@@ -222,7 +301,7 @@ public:
 			if (cursor < start) {
 				std::memset(destination + (cursor - vaddr), 0, start - cursor);
 			}
-			std::memcpy(destination + (start - vaddr), m_backing_base + offset, bytes);
+			std::memcpy(destination + (start - vaddr), BackingData(offset), bytes);
 			cursor = start + bytes;
 		}
 		if (cursor < end) {
@@ -240,6 +319,10 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!EnsureCommitted(backing_offset, size)) {
+			SetFailure(failure_reason, FailureReason::BackingUnavailable);
+			return false;
+		}
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
@@ -484,7 +567,12 @@ private:
 			EXIT_IF(!FindContainingUnlocked(current, 1, &entry));
 			const auto bytes  = std::min(end, entry.vaddr + entry.size) - current;
 			const auto offset = entry.backing_offset + current - entry.vaddr;
-			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (!EnsureCommitted(offset, bytes)) {
+				return false;
+			}
+#endif
+			transfer(BackingData(offset), current - vaddr, static_cast<size_t>(bytes));
 			current += bytes;
 		}
 		return true;
@@ -544,8 +632,43 @@ private:
 		return false;
 	}
 
+	[[nodiscard]] bool IsPrivateOffset(uint64_t backing_offset) const {
+		return backing_offset >= m_private_start &&
+		       backing_offset - m_private_start < m_private_size;
+	}
+
+	[[nodiscard]] uint8_t* BackingData(uint64_t backing_offset) const {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (IsPrivateOffset(backing_offset)) {
+			return m_private_base + (backing_offset - m_private_start);
+		}
+#endif
+		return m_backing_base + backing_offset;
+	}
+
 	[[nodiscard]] bool RangeOk(uint64_t backing_offset, uint64_t size) const {
-		return size != 0 && backing_offset < m_size && size <= m_size - backing_offset;
+		if (size == 0 || backing_offset >= m_size || size > m_size - backing_offset) {
+			return false;
+		}
+		if (IsPrivateOffset(backing_offset)) {
+			return size <= m_private_size - (backing_offset - m_private_start);
+		}
+		return m_private_size == 0 || backing_offset >= m_private_start ||
+		       size <= m_private_start - backing_offset;
+	}
+
+	[[nodiscard]] bool LocalBackingRangeOk(uint64_t backing_offset, uint64_t size) const {
+		if (!RangeOk(backing_offset, size)) {
+			return false;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (IsPrivateOffset(backing_offset)) {
+			return m_private_base != nullptr;
+		}
+		return !m_shared;
+#else
+		return true;
+#endif
 	}
 
 	static void SetFailure(FailureReason* out, FailureReason reason) {
@@ -555,6 +678,23 @@ private:
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool EnsureCommitted(uint64_t backing_offset, uint64_t size) {
+		if (!RangeOk(backing_offset, size)) {
+			return false;
+		}
+
+		void* committed =
+		    VirtualAlloc(BackingData(backing_offset), size, MEM_COMMIT, PAGE_READWRITE);
+		if (committed == nullptr) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t direct-memory backing: commit failed: offset=0x%016" PRIx64
+			           " size=0x%016" PRIx64 " error=0x%08" PRIx32 "\n",
+			           backing_offset, size, static_cast<uint32_t>(GetLastError()));
+			return false;
+		}
+		return true;
+	}
+
 	static DWORD GetProtect(VirtualMemory::Mode mode) {
 		switch (mode) {
 			case VirtualMemory::Mode::Read: return PAGE_READONLY;
@@ -586,9 +726,11 @@ private:
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
 		const DWORD map_protect =
 		    mode == VirtualMemory::Mode::NoAccess ? PAGE_READWRITE : GetProtect(mode);
-		void* ptr =
-		    MapViewOfFile3(m_handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr),
-		                   backing_offset, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
+		const bool private_backing = IsPrivateOffset(backing_offset);
+		const auto handle          = private_backing ? m_private_handle : m_handle;
+		const auto offset = private_backing ? backing_offset - m_private_start : backing_offset;
+		void* ptr = MapViewOfFile3(handle, GetCurrentProcess(), reinterpret_cast<void*>(vaddr),
+		                           offset, size, MEM_REPLACE_PLACEHOLDER, map_protect, nullptr, 0);
 		if (ptr == nullptr || reinterpret_cast<uint64_t>(ptr) != vaddr) {
 			if (ptr != nullptr) {
 				UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
@@ -609,7 +751,10 @@ private:
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
-	HANDLE m_handle = nullptr;
+	HANDLE   m_handle         = nullptr;
+	HANDLE   m_private_handle = nullptr;
+	uint8_t* m_private_base   = nullptr;
+	bool     m_shared         = false;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
 
@@ -655,21 +800,24 @@ private:
 #endif
 
 	uint8_t*                     m_backing_base = nullptr;
-	uint64_t                     m_size         = 0;
+	uint64_t                     m_size          = 0;
+	uint64_t                     m_private_start = 0;
+	uint64_t                     m_private_size  = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
 class GuestAddressSpace {
 public:
-	explicit GuestAddressSpace(uint64_t backing_size) {
+	GuestAddressSpace(uint64_t backing_size, const char* backing_name, uint64_t private_start = 0,
+	                  uint64_t private_size = 0) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		SYSTEM_INFO info {};
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 #endif
 		ReserveGuestRegions();
-		m_backing = new GuestBackingStore(backing_size);
+		m_backing = new GuestBackingStore(backing_size, backing_name, private_start, private_size);
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
@@ -741,6 +889,14 @@ public:
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return VirtualRangesOverlap(vaddr, size, range.first, range.second);
 		});
+	}
+
+	bool ContainsLocalBacking(uint64_t vaddr, uint64_t size) {
+		return m_backing->ContainsLocalBacking(vaddr, size);
+	}
+
+	bool TryWriteLocalBacking64(uint64_t vaddr, uint64_t value) {
+		return m_backing->TryWriteLocalBacking64(vaddr, value);
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
@@ -867,6 +1023,58 @@ public:
 		}
 		std::lock_guard lock(m_mutex);
 		return FindContaining(vaddr, size) != m_free.end();
+	}
+
+	bool ReserveStaticProgram(uint64_t vaddr, uint64_t size) {
+		if (vaddr == 0 || size == 0 || !IsGranularityAligned(vaddr)) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		if (FindContaining(vaddr, size) != m_free.end()) {
+			return true;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const uint64_t           aligned_size = AlignUp(size, m_granularity);
+		MEMORY_BASIC_INFORMATION info {};
+		const auto query_size = VirtualQuery(reinterpret_cast<void*>(vaddr), &info, sizeof(info));
+		LOGF("FIRST_FRAME_AUDIT STATIC_EXEC_HOST_REGION query=%zu state=0x%x type=0x%x protect=0x%x"
+		     " base=0x%016" PRIx64 " region_size=0x%016" PRIx64 " owner=0x%016" PRIx64
+		     " requested=0x%016" PRIx64 "\n",
+		     static_cast<size_t>(query_size), static_cast<unsigned>(info.State),
+		     static_cast<unsigned>(info.Type), static_cast<unsigned>(info.Protect),
+		     reinterpret_cast<uint64_t>(info.BaseAddress), static_cast<uint64_t>(info.RegionSize),
+		     reinterpret_cast<uint64_t>(info.AllocationBase), aligned_size);
+		if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_PRE_RESERVED") != nullptr &&
+		    aligned_size != 0 && query_size != 0 && info.State == MEM_RESERVE &&
+		    info.Type == MEM_PRIVATE && reinterpret_cast<uint64_t>(info.BaseAddress) == vaddr &&
+		    reinterpret_cast<uint64_t>(info.AllocationBase) == vaddr &&
+		    info.RegionSize == aligned_size) {
+			AddFreeUnlocked(vaddr, aligned_size);
+			m_owned.emplace_back(vaddr, aligned_size);
+			LOGF("FIRST_FRAME_AUDIT STATIC_EXEC_ADOPT_PRE_RESERVED"
+			     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     vaddr, aligned_size);
+			return true;
+		}
+		if (query_size == 0 || info.State != MEM_FREE ||
+		    reinterpret_cast<uint64_t>(info.BaseAddress) > vaddr || vaddr + aligned_size < vaddr ||
+		    vaddr + aligned_size > reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize) {
+			return false;
+		}
+		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), aligned_size,
+		                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+		if (reinterpret_cast<uint64_t>(ptr) != vaddr) {
+			if (ptr != nullptr) {
+				VirtualFree(ptr, 0, MEM_RELEASE);
+			}
+			return false;
+		}
+		AddFreeUnlocked(vaddr, aligned_size);
+		m_owned.emplace_back(vaddr, aligned_size);
+		return true;
+#else
+		return false;
+#endif
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1119,6 +1327,17 @@ private:
 #endif
 
 	void ReserveGuestRegions() {
+		if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_LOAD_ONLY") != nullptr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			MEMORY_BASIC_INFORMATION before {};
+			VirtualQuery(reinterpret_cast<void*>(0x400000), &before, sizeof(before));
+			LOGF("FIRST_FRAME_AUDIT STATIC_EXEC_HOST_REGION_BEFORE_RESERVE state=0x%x"
+			     " type=0x%x base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     static_cast<unsigned>(before.State), static_cast<unsigned>(before.Type),
+			     reinterpret_cast<uint64_t>(before.BaseAddress),
+			     static_cast<uint64_t>(before.RegionSize));
+#endif
+		}
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
 		    {HOST_USER_MIN, HOST_USER_MAX + 1u},

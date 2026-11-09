@@ -15,11 +15,14 @@ enum class PageFaultAccess;
 namespace Libs::LibKernel::Memory {
 
 class AnonymousSharedMemory;
+
 void Initialize();
 void Shutdown();
 
 int  MapOwnedFlexibleMemory(void** address, size_t len, const char* name, uint64_t* token);
+bool OwnsFlexibleMemory(uint64_t address, size_t len, uint64_t token);
 int  UnmapOwnedFlexibleMemory(uint64_t address, size_t len, uint64_t token);
+
 struct Lifecycle {
 	static constexpr const char* name       = "Memory";
 	static constexpr auto        initialize = Libs::LibKernel::Memory::Initialize;
@@ -117,6 +120,8 @@ void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+bool CanWriteGpuBacking(uint64_t vaddr, uint64_t size);
+bool TryWriteGpuBacking64(uint64_t vaddr, uint64_t value);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
@@ -125,7 +130,10 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 bool                   CanWriteGuest(const void* destination, uint64_t size);
+bool                   CanWriteGuestNoTrace(const void* destination, uint64_t size);
 bool                   QueryGuestRangeNoTrace(const void* address, VirtualQueryInfo* info);
+bool     ValidateGrantedNamedDirectMemory(const void* address, uint64_t size, int protection,
+                                          const char* name);
 bool     CopyToGuest(void* destination, const void* source, uint64_t size);
 bool     CopyFromGuest(void* destination, const void* source, uint64_t size);
 uint64_t MemoryOperationOwnerThreadId();
@@ -155,6 +163,7 @@ int KYTY_SYSV_ABI KernelAllocateMainDirectMemory(size_t len, size_t alignment, i
 int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len);
 int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len);
 int KYTY_SYSV_ABI    KernelProtectDirectMemory(int64_t start, size_t len, int prot);
+int KYTY_SYSV_ABI    KernelProtectDirectMemoryForPID(int64_t start, size_t len, int prot, int pid);
 int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
                                         int64_t direct_memory_start, size_t alignment);
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
@@ -174,6 +183,8 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size);
 int KYTY_SYSV_ABI KernelConfiguredFlexibleMemorySize(size_t* size);
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot);
+int KYTY_SYSV_ABI    KernelMlock(const void* addr, size_t len);
+int KYTY_SYSV_ABI    KernelMunlock(const void* addr, size_t len);
 int KYTY_SYSV_ABI    KernelMunlockAll();
 int KYTY_SYSV_ABI KernelMtypeprotect(const void* addr, size_t len, int type, int prot);
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
@@ -192,7 +203,8 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
                                                 size_t                      output_size);
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
-                               Common::VirtualMemory::Mode mode, const char* name);
+                               Common::VirtualMemory::Mode mode, const char* name,
+                               bool fixed = false);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
@@ -212,12 +224,16 @@ int  UnlinkScopeSharedMemory(const char* name);
 void ResizeScopeSharedMemory(int object, uint64_t size);
 void WriteScopeSharedMemory(int object, uint64_t offset, const void* data, uint64_t size);
 int  MapScopeSharedMemory(int object, void** addr, size_t len, int prot, int flags);
+
 std::shared_ptr<AnonymousSharedMemory> CreateAnonymousSharedMemory(uint16_t mode);
 uint64_t GetAnonymousSharedMemoryId(const std::shared_ptr<AnonymousSharedMemory>& object);
 uint64_t GetAnonymousSharedMemorySize(const std::shared_ptr<AnonymousSharedMemory>& object);
 uint16_t GetAnonymousSharedMemoryMode(const std::shared_ptr<AnonymousSharedMemory>& object);
+int      ResizeAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& object,
+                                     uint64_t                                      size);
 int      MapAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& object, void** addr,
                                   size_t len, int prot, int flags);
+
 #if defined(KYTY_SHM_ANON_TESTS)
 struct AnonymousSharedMemoryTestStats {
 	uint64_t objects;
@@ -225,7 +241,11 @@ struct AnonymousSharedMemoryTestStats {
 	uint64_t backing_bytes;
 	uint64_t mappings;
 };
+
+AnonymousSharedMemoryTestStats TestGetAnonymousSharedMemoryStats();
+void                           TestFailNextAnonymousSharedMemoryAllocation();
 #endif
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();

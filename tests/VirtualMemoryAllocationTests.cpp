@@ -1550,6 +1550,75 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestProtNoneReservationDefersFlexibleCharge() {
+	const char* test     = "ProtNoneReservationDefersFlexibleCharge";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	const auto  total    = SceKernelPageSize * 4;
+	const auto  half     = SceKernelPageSize * 2;
+
+	void* addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(&addr, total, 0, 0,
+	                                                              "prot_none_reserve"),
+	        "KernelMapNamedFlexibleMemory(prot_none)");
+	const auto base = reinterpret_cast<uint64_t>(addr);
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "PROT_NONE reservation charged the flexible budget");
+	ExpectRange(test, Query(test, base), base, base + total, 0, 0, 0, 0, 0, "prot_none_reserve");
+
+	void* commit = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &commit, half, SceKernelProtCpuRw, SceKernelMapFixed, "prot_none_commit"),
+	        "KernelMapNamedFlexibleMemory(fixed commit)");
+	Check(test, AvailableFlexibleMemory(test) == baseline - half,
+	      "fixed commit charged the wrong budget amount");
+	ExpectRange(test, Query(test, base), base, base + half, SceKernelProtCpuRw, 1, 0, 0, 1,
+	            "prot_none_commit");
+	ExpectRange(test, Query(test, base + half), base + half, base + total, 0, 0, 0, 0, 0);
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<const void*>(base + half),
+	                                                half, SceKernelProtCpuRw),
+	        "KernelMprotect(reserved tail)");
+	Check(test, AvailableFlexibleMemory(test) == baseline - total,
+	      "mprotect commit did not charge the flexible budget");
+	ExpectRange(test, Query(test, base + half), base + half, base + total, SceKernelProtCpuRw, 1, 0,
+	            0, 1);
+
+	void* decommit = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &decommit, SceKernelPageSize, 0, SceKernelMapFixed, "prot_none_reserve"),
+	        "KernelMapNamedFlexibleMemory(fixed prot_none decommit)");
+	Check(test, AvailableFlexibleMemory(test) == baseline - (total - SceKernelPageSize),
+	      "PROT_NONE decommit did not refund the flexible budget");
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, 0, 0, 0, 0, 0);
+
+	// Mimalloc commits its arena incrementally: mprotect spans that mix committed and reserved
+	// pages must commit the reserved parts and protect the rest.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<const void*>(base), total,
+	                                                SceKernelProtCpuRw),
+	        "KernelMprotect(mixed committed+reserved)");
+	Check(test, AvailableFlexibleMemory(test) == baseline - total,
+	      "mixed mprotect did not charge only the reserved parts");
+	for (uint64_t page = 0; page < total; page += SceKernelPageSize) {
+		const auto info = Query(test, base + page);
+		Check(test,
+		      info.is_flexible == 1 && info.is_committed == 1 &&
+		          info.protection == SceKernelProtCpuRw,
+		      "mixed mprotect left a page uncommitted");
+	}
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, total), "KernelMunmap");
+	Check(test, AvailableFlexibleMemory(test) == baseline, "unmap leaked flexible-memory budget");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + total - SceKernelPageSize);
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestNonzeroDirectOffsetAliasesSharedBacking() {
 	const char* test = "NonzeroDirectOffsetAliasesSharedBacking";
 
@@ -2967,7 +3036,32 @@ void TestProgramMemoryAllocationAndProtection() {
 void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
-	      "module relocation did not retain writable host memory and semantic guest protection");
+	      "module relocation did not retain writable host memory and "
+	      "semantic guest protection");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestAgcPoolMallocOutcomeDiagnostic() {
+	const char* test = "AgcPoolMallocOutcomeDiagnostic";
+	Check(test, Loader::TestAgcPoolMallocOutcomeDiagnostic(),
+	      "exact native allocator interposition did not preserve outcomes or "
+	      "reject mutations");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestOriginalPadProviderDiagnosticRouting() {
+	const char* test = "OriginalPadProviderDiagnosticRouting";
+	Check(test, Loader::TestOriginalPadProviderDiagnosticRouting(),
+	      "diagnostic pad routing did not keep original libScePad handles "
+	      "coherent");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestNativeLibkernelGetdirentriesTrap() {
+	const char* test = "NativeLibkernelGetdirentriesTrap";
+	Check(test, Loader::TestNativeLibkernelGetdirentriesTrap(),
+	      "native libkernel getdirentries wrapper was not installed through the "
+	      "exact trap path");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4106,9 +4200,19 @@ void TestSmallFiberStacksAndMigration() {
 		const auto check_stacks = [&] {
 			for (const auto* stack: {&first_stack, &second_stack}) {
 				const auto is_guard = [](uint8_t byte) { return byte == 0xa5; };
-				Check(test, std::all_of(stack->begin(), stack->begin() + GuardSize, is_guard) &&
-				                std::all_of(stack->begin() + GuardSize + stack_size, stack->end(), is_guard),
-				      "fiber wrote outside its supplied stack");
+				const auto lower =
+				    std::find_if_not(stack->begin(), stack->begin() + GuardSize, is_guard);
+				const auto upper = std::find_if_not(stack->begin() + GuardSize + stack_size,
+				                                    stack->end(), is_guard);
+				if (lower != stack->begin() + GuardSize || upper != stack->end()) {
+					char       message[128] {};
+					const auto changed = lower != stack->begin() + GuardSize ? lower : upper;
+					std::snprintf(message, sizeof(message),
+					              "fiber wrote outside its supplied stack: size=%zu offset=%td",
+					              stack_size,
+					              changed - stack->begin() - static_cast<ptrdiff_t>(GuardSize));
+					Fail(test, message);
+				}
 			}
 			Check(test, std::memcmp(&first_base, first_stack.data() + GuardSize, sizeof(first_base)) == 0 &&
 			                std::memcmp(&second_base, second_stack.data() + GuardSize, sizeof(second_base)) == 0,
@@ -4180,6 +4284,10 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--module-init-stack-only") == 0) {
+		RunTest(TestInitialModuleStageStackContract);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #if defined(__linux__)
 	if (argc == 2 && std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
 		RunTest(TestFixedDirectReplacementPreservesAccess);
@@ -4212,6 +4320,18 @@ int main(int argc, char** argv) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--agc-pool-malloc-outcome-only") == 0) {
+		RunTest(TestAgcPoolMallocOutcomeDiagnostic);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--original-pad-provider-only") == 0) {
+		RunTest(TestOriginalPadProviderDiagnosticRouting);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--native-libkernel-getdirentries-trap-only") == 0) {
+		RunTest(TestNativeLibkernelGetdirentriesTrap);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
@@ -4238,6 +4358,7 @@ int main(int argc, char** argv) {
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
+	RunTest(TestInitialModuleStageStackContract);
 	RunTest(TestFragmentedBackingUnmapRollback);
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
@@ -4246,6 +4367,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestProtNoneReservationDefersFlexibleCharge);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
@@ -4281,6 +4403,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestAgcPoolMallocOutcomeDiagnostic);
+	RunTest(TestOriginalPadProviderDiagnosticRouting);
+	RunTest(TestNativeLibkernelGetdirentriesTrap);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

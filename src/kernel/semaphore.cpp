@@ -1112,6 +1112,31 @@ static int SemInitImpl(void* sem, int pshared, unsigned int value, const char* n
 	if (sem == nullptr || value > POSIX_SEM_VALUE_MAX) {
 		return POSIX_EINVAL;
 	}
+	LibKernel::Memory::VirtualQueryInfo range {};
+	const bool     has_range = LibKernel::Memory::QueryGuestRangeNoTrace(sem, &range);
+	const auto     address   = reinterpret_cast<uint64_t>(sem);
+	const uint64_t relative  = has_range && address >= range.start ? address - range.start : 0;
+	const uint64_t range_bytes =
+	    has_range && range.end >= range.start ? range.end - range.start : 0;
+	uint64_t   jemspace_relative = 0;
+	uint64_t   jemspace_bytes    = 0;
+	const bool has_jemspace =
+	    Jemspace::QueryAllocation(sem, sizeof(PosixSemGuest), &jemspace_relative, &jemspace_bytes);
+	auto log_state = [&](const char* result) {
+		static std::atomic<uint32_t> state_log_count {0};
+		if (state_log_count.fetch_add(1) >= 32) return;
+		LOGF("FIRST_FRAME_AUDIT POSIX_SEM_INIT_STATE pid=%d result=%s value=%u pshared=%d "
+		     "guest_range=%d committed=%d flexible=%d direct=%d stack=%d pooled=%d prot=%d "
+		     "relative=%" PRIu64 " range_bytes=%" PRIu64 " native_prot_none=%d "
+		     "jemspace=%d jemspace_relative=%" PRIu64 " jemspace_bytes=%" PRIu64 "\n",
+		     LibKernel::Process::GetPid(), result, value, pshared, has_range ? 1 : 0,
+		     has_range && range.is_committed ? 1 : 0, has_range && range.is_flexible ? 1 : 0,
+		     has_range && range.is_direct ? 1 : 0, has_range && range.is_stack ? 1 : 0,
+		     has_range && range.is_pooled ? 1 : 0, has_range ? (range.protection & 7) : -1,
+		     relative, range_bytes,
+		     has_range && std::strcmp(range.name, "native_prot_none") == 0 ? 1 : 0,
+		     has_jemspace ? 1 : 0, jemspace_relative, jemspace_bytes);
+	};
 
 	auto* guest = static_cast<PosixSemGuest*>(sem);
 	auto*            obj               = new PosixSemPrivate(guest, value, pshared != 0 ? 1u : 0u);

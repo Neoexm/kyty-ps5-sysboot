@@ -8693,6 +8693,37 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	if (file->special == SpecialFile::SharedMemory) {
+		Common::LockGuard lock(file->mutex);
+		if (file->anonymous_shared) {
+			const int result = Memory::ResizeAnonymousSharedMemory(file->anonymous_shared,
+			                                                       static_cast<uint64_t>(length));
+			if (result != OK) {
+				return result;
+			}
+			file->special_size = static_cast<uint64_t>(length);
+			LOGF("SHM_ANON_TRUNCATE guest_pid=%d object=%" PRIu64 " fd=%d size=0x%016" PRIx64 "\n",
+			     Process::GetPid(), Memory::GetAnonymousSharedMemoryId(file->anonymous_shared), d,
+			     static_cast<uint64_t>(length));
+			return OK;
+		}
+		if (file->name == HMD_SHM_PATH && file->scope_shared < 0 && file->shared_mapped) {
+			return KERNEL_ERROR_ENOTSUP;
+		}
+		if (file->scope_shared >= 0) {
+			Memory::ResizeScopeSharedMemory(file->scope_shared, static_cast<uint64_t>(length));
+		}
+		file->special_size = static_cast<uint64_t>(length);
+		LOGF("\tFtruncate shared memory (size = %" PRId64 ") file: %s\n", length,
+		     Common::PathToString(file->real_name).c_str());
+		return OK;
+	}
+
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (g_mount_points->IsReadOnly(file->real_name)) return KERNEL_ERROR_EROFS;
+
 	Common::LockGuard lock(file->mutex);
 
 	if (file->f.IsInvalid() || !file->f.Truncate(static_cast<uint64_t>(length))) {

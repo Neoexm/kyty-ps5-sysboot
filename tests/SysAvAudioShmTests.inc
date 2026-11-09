@@ -127,6 +127,49 @@ int RunSysAvAudioShmChild(int argc, char** argv) {
         "a second mapping of the same anonymous object succeeds");
   const auto second_anon_map = reinterpret_cast<uint64_t>(second_anon_mapping);
   auto* first_anon_bytes = reinterpret_cast<volatile uint8_t*>(first_anon_map);
+  auto* second_anon_bytes = reinterpret_cast<volatile uint8_t*>(second_anon_map);
+  first_anon_bytes[0] = 0x41;
+  first_anon_bytes[0x1ffff] = 0x7e;
+  Check(second_anon_bytes[0] == 0x41 && second_anon_bytes[0x1ffff] == 0x7e,
+        "two mappings of one anonymous object share bytes");
+  Memory::VirtualQueryInfo anon_range {};
+  void* escaped_alias = nullptr;
+  Check(Memory::KernelVirtualQuery(reinterpret_cast<void*>(first_anon_map), 0,
+                                   &anon_range, sizeof(anon_range)) == OK &&
+            anon_range.is_direct &&
+            Memory::KernelMapDirectMemory(&escaped_alias, 0x4000, 3, 0,
+                                          static_cast<int64_t>(anon_range.offset), 0) ==
+                KERNEL_ERROR_ENOMEM &&
+            Memory::KernelCheckedReleaseDirectMemory(static_cast<int64_t>(anon_range.offset),
+                                                      0x4000) == KERNEL_ERROR_ENOENT &&
+            Memory::KernelProtectDirectMemory(static_cast<int64_t>(anon_range.offset),
+                                              0x4000, 3) == KERNEL_ERROR_EACCES &&
+            second_anon_bytes[0] == 0x41 && second_anon_bytes[0x1ffff] == 0x7e,
+        "anonymous backing cannot escape through public direct map, release or protect APIs");
+  Check(FS::KernelClose(anon_fd) == OK && second_anon_bytes[0] == 0x41,
+        "the original close export leaves live mappings backed");
+  auto anon_live = Memory::TestGetAnonymousSharedMemoryStats();
+  Check(anon_live.objects == anon_baseline.objects + 1 &&
+            anon_live.backings == anon_baseline.backings + 1 &&
+            anon_live.mappings == anon_baseline.mappings + 2,
+        "the object has one backing and two mapping leases");
+  Check(Memory::KernelMunmap(first_anon_map, 0x4000) == OK,
+        "a partial anonymous mapping unmap succeeds");
+  anon_live = Memory::TestGetAnonymousSharedMemoryStats();
+  Check(anon_live.mappings == anon_baseline.mappings + 2 && second_anon_bytes[0] == 0x41,
+        "a surviving mapping piece retains its single lease");
+  Check(Memory::KernelMunmap(first_anon_map + 0x4000, 0x1c000) == OK,
+        "the final piece of the first mapping unmaps");
+  anon_live = Memory::TestGetAnonymousSharedMemoryStats();
+  Check(anon_live.mappings == anon_baseline.mappings + 1 && second_anon_bytes[0] == 0x41,
+        "the second mapping remains live after the first lease ends");
+  Check(Memory::KernelMunmap(second_anon_map, 0x20000) == OK,
+        "the last anonymous mapping unmaps");
+  Check(Memory::TestGetAnonymousSharedMemoryStats().objects == anon_baseline.objects &&
+            Memory::TestGetAnonymousSharedMemoryStats().backings == anon_baseline.backings &&
+            Memory::TestGetAnonymousSharedMemoryStats().mappings == anon_baseline.mappings,
+        "the last legitimate reference releases the anonymous object and backing");
+
   auto independent_a = open_anon(2, 0600);
   auto independent_b = open_anon(2, 0600);
   Check(independent_a.value >= 3 && independent_b.value >= 3 &&

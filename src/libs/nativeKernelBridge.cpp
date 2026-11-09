@@ -2002,6 +2002,98 @@ Reply NativeAnonymousMmap(const SyscallRequest& request) {
 		     mapped, len);
 		return {static_cast<int64_t>(mapped), 0};
 	}
+	// libhermes 0xb9ba0/0xb9c80 (un)commit 4 MiB heap chunks with MAP_FIXED; dYK287SsmDs turns
+	// 0x1012 into 0x1010
+	if ((std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP") != nullptr ||
+	     LibKernel::Process::IsExecChild()) &&
+	    flags == 0x1010 && (prot == 0 || prot == 3) && addr >= 0x200000000ull &&
+	    (addr & 0x3fff) == 0 && len >= 0x4000 && len <= 0x1000000 && (len & 0x3fff) == 0 &&
+	    (fd == UINT64_MAX || fd == UINT32_MAX) && offset == 0) {
+		static std::atomic<uint32_t>        fixed_traces {0};
+		LibKernel::Memory::VirtualQueryInfo target {};
+		// only anonymous ranges the process mapped can be swapped, not module or pooled ones
+		if (LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(addr), 0, &target,
+		                                          sizeof(target)) != 0 ||
+		    !(target.is_flexible || (!target.is_committed && !target.is_pooled)) ||
+		    target.start > addr || target.end < addr + len) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_ANON_FIXED_MMAP"
+			     " pid=%d addr=0x%016" PRIx64 " bytes=0x%" PRIx64 " prot=%" PRIu64
+			     " result=unsupported_target_not_flexible\n",
+			     LibKernel::Process::GetPid(), addr, len, prot);
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		void*     mapped = reinterpret_cast<void*>(addr);
+		const int rc     = LibKernel::Memory::KernelMapNamedFlexibleMemory(
+		    &mapped, static_cast<size_t>(len), static_cast<int>(prot), 0x10,
+		    prot == 0 ? "native_prot_none" : "native_anonymous_rw");
+		if (rc != 0) {
+			const int guest_errno = LibKernel::KernelToPosix(rc);
+			LOGF("FIRST_FRAME_AUDIT NATIVE_ANON_FIXED_MMAP"
+			     " pid=%d addr=0x%016" PRIx64 " bytes=0x%" PRIx64 " prot=%" PRIu64
+			     " result=failed errno=%d\n",
+			     LibKernel::Process::GetPid(), addr, len, prot, guest_errno);
+			return {-1, guest_errno};
+		}
+		if (fixed_traces.fetch_add(1) < 512) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_ANON_FIXED_MMAP"
+			     " pid=%d addr=0x%016" PRIx64 " bytes=0x%" PRIx64 " prot=%" PRIu64
+			     " result=replaced backing=%d\n",
+			     LibKernel::Process::GetPid(), addr, len, prot, prot != 0 ? 1 : 0);
+		}
+		return {static_cast<int64_t>(addr), 0};
+	}
+	// libhermes 0x15366 reserves its heap (0x93fc000 for ShellUI) PROT_NONE at a random hint -
+	// address space only, no budget
+	if ((std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP") != nullptr ||
+	     LibKernel::Process::IsExecChild()) &&
+	    (addr == 0 || (addr >= 0x200000000ull && (addr & 0x3fff) == 0)) && len >= 0x4000 &&
+	    (len <= 0x1000000 || prot == 0) && (len & 0x3fff) == 0 &&
+	    (prot == 0 || prot == 2 || prot == 3 || prot == 0x12 || prot == 0x32) && flags == 0x1000 &&
+	    (fd == UINT64_MAX || fd == UINT32_MAX) && offset == 0) {
+		const bool mono_reservation = prot == 0;
+		const bool native_rw        = prot == 3;
+		void*      mapped           = reinterpret_cast<void*>(addr);
+		const int  rc               = LibKernel::Memory::KernelMapNamedFlexibleMemory(
+		    &mapped, static_cast<size_t>(len), static_cast<int>(prot), 0,
+		    mono_reservation ? "native_prot_none"
+			: native_rw      ? "native_anonymous_rw"
+			                 : "orbis_audiod");
+		if (rc != 0) {
+			const int guest_errno = LibKernel::KernelToPosix(rc);
+			if (mono_reservation) {
+				LOGF("FIRST_FRAME_AUDIT NATIVE_PROT_NONE_MMAP"
+				     " pid=%d hint=0x%016" PRIx64 " bytes=%" PRIu64
+				     " prot=0 flags=0x1000 result=failed errno=%d\n",
+				     LibKernel::Process::GetPid(), addr, len, guest_errno);
+			} else if (native_rw) {
+				LOGF("FIRST_FRAME_AUDIT NATIVE_ANON_RW_MMAP"
+				     " pid=%d bytes=%" PRIu64 " prot=3 flags=0x1000 result=failed errno=%d\n",
+				     LibKernel::Process::GetPid(), len, guest_errno);
+			} else {
+				LOGF("FIRST_FRAME_AUDIT AUDIOD_NATIVE_FLEX_MMAP_FAILED"
+				     " hint=0x%016" PRIx64 " size=0x%016" PRIx64 " rc=0x%08x errno=%d\n",
+				     addr, len, static_cast<uint32_t>(rc), guest_errno);
+			}
+			return {-1, guest_errno};
+		}
+		const uint64_t guest_addr = reinterpret_cast<uint64_t>(mapped);
+		if (mono_reservation) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_PROT_NONE_MMAP"
+			     " pid=%d hint=0x%016" PRIx64 " addr=0x%016" PRIx64 " bytes=%" PRIu64
+			     " prot=0 flags=0x1000 result=reserved\n",
+			     LibKernel::Process::GetPid(), addr, guest_addr, len);
+		} else if (native_rw) {
+			LOGF("FIRST_FRAME_AUDIT NATIVE_ANON_RW_MMAP"
+			     " pid=%d bytes=%" PRIu64 " prot=3 flags=0x1000 result=mapped backing=1\n",
+			     LibKernel::Process::GetPid(), len);
+		} else {
+			LOGF("FIRST_FRAME_AUDIT AUDIOD_NATIVE_FLEX_MMAP"
+			     " hint=0x%016" PRIx64 " size=0x%016" PRIx64 " committed_guest_addr=0x%016" PRIx64
+			     " flexible_backing\n",
+			     addr, len, guest_addr);
+		}
+		return {static_cast<int64_t>(guest_addr), 0};
+	}
 	if (len == 0 || len > 0x1000000 || (len & 0x3fff) != 0 || (addr != 0 && (addr & 0x3fff) != 0) ||
 	    prot != 3 || (flags != 0x9000 && !(flags == 0x1002 && addr == 0 && len == 0x4000)) ||
 	    (fd != UINT64_MAX && fd != UINT32_MAX) || offset != 0) {
@@ -4660,6 +4752,16 @@ Reply SysAvNativeMunmap(const SyscallRequest& request) {
 	return {0, 0};
 }
 
+Reply SysAvNativeMunlockAll(const SyscallRequest&) {
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	const int result = LibKernel::Memory::KernelMunlockAll();
+	LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_MUNLOCKALL"
+	     " guest_syscall=0x145 result=0x%08x\n",
+	     result);
+	return result == 0 ? Reply {0, 0} : Reply {-1, LibKernel::KernelToPosix(result)};
+}
 
 Reply AccessGuestPath(const SyscallRequest& request) {
 	// access (0x21). TODO: only F_OK, other modes need guest uid/gid

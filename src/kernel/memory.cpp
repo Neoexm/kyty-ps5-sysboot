@@ -91,7 +91,7 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size, bool cross_process = fals
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
 		return;
 	}
-	GetGpuResources().MapMemory(vaddr, size);
+	GetGpuResources().MapMemory(vaddr, size, cross_process);
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -226,7 +226,8 @@ public:
 	};
 
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
-	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
+	         VirtualRangeType type, const char* name, bool disallow_merge = false,
+	         uint64_t owner_token = 0, std::shared_ptr<void> lifetime = {}) {
 		Common::LockGuard lock(m_mutex);
 
 		if (start == 0 || size == 0) {
@@ -249,6 +250,8 @@ public:
 		r.memory_type    = memory_type;
 		r.type           = type;
 		r.disallow_merge = disallow_merge;
+		r.owner_token    = owner_token;
+		r.lifetime       = std::move(lifetime);
 		CopyVirtualRangeName(r.name, name);
 		const auto index = static_cast<size_t>(position - m_ranges.begin());
 		m_ranges.insert(position, r);
@@ -389,6 +392,7 @@ public:
 		}
 		return false;
 	}
+
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
 
@@ -461,6 +465,18 @@ public:
 		return false;
 	}
 
+	bool CanWriteGpuBacking(GuestAddressSpace& address_space, uint64_t vaddr, uint64_t size) {
+		Common::LockGuard lock(m_mutex);
+		return IsGpuWritableSpanUnlocked(vaddr, size) &&
+		       address_space.ContainsLocalBacking(vaddr, size);
+	}
+
+	bool TryWriteGpuBacking64(GuestAddressSpace& address_space, uint64_t vaddr, uint64_t value) {
+		Common::LockGuard lock(m_mutex);
+		return IsGpuWritableSpanUnlocked(vaddr, sizeof(value)) &&
+		       address_space.TryWriteLocalBacking64(vaddr, value);
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
@@ -523,6 +539,32 @@ public:
 	}
 
 private:
+	bool IsGpuWritableSpanUnlocked(uint64_t start, uint64_t size) const {
+		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
+			return false;
+		}
+		auto range = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), start,
+		    [](uint64_t value, const Range& entry) { return value < entry.start; });
+		if (range == m_ranges.begin()) {
+			return false;
+		}
+		--range;
+		const auto end = start + size;
+		for (auto current = start; current < end; ++range) {
+			if (range == m_ranges.end() || range->start > current ||
+			    End(range->start, range->size) <= current ||
+			    (range->type != VirtualRangeType::Direct &&
+			     range->type != VirtualRangeType::Flexible &&
+			     range->type != VirtualRangeType::Pooled) ||
+			    (range->protection & PROT_GPU_WRITE) == 0) {
+				return false;
+			}
+			current = std::min(end, End(range->start, range->size));
+		}
+		return true;
+	}
+
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
 	}
@@ -533,7 +575,8 @@ private:
 			return false;
 		}
 
-		return left.type == right.type && left.protection == right.protection &&
+		return left.owner_token == right.owner_token && left.lifetime == right.lifetime &&
+		       left.type == right.type && left.protection == right.protection &&
 		       left.memory_type == right.memory_type &&
 		       std::strncmp(left.name, right.name, KERNEL_MAXIMUM_NAME_LENGTH) == 0;
 	}
@@ -738,6 +781,7 @@ static HANDLE g_scope_memory_lock = nullptr;
 // views don't keep the section name; the state only survives while some process holds this
 static HANDLE g_scope_memory_section = nullptr;
 #endif
+
 class ScopeMemoryLock {
 public:
 	ScopeMemoryLock() {
@@ -753,6 +797,37 @@ public:
 
 	KYTY_CLASS_NO_COPY(ScopeMemoryLock);
 };
+
+class ScopeFreeRanges {
+public:
+	explicit ScopeFreeRanges(std::map<uint64_t, uint64_t>* ranges): m_ranges(ranges) {
+		if (g_scope_memory == nullptr) {
+			return;
+		}
+		m_lock.emplace();
+		m_ranges->clear();
+		for (uint32_t i = 0; i < g_scope_memory->free_count; i++) {
+			m_ranges->emplace(g_scope_memory->free[i].start, g_scope_memory->free[i].size);
+		}
+	}
+	~ScopeFreeRanges() {
+		if (g_scope_memory == nullptr) {
+			return;
+		}
+		EXIT_IF(m_ranges->size() > ScopeMemory::MaxFreeRanges);
+		g_scope_memory->free_count = 0;
+		for (const auto& [start, size]: *m_ranges) {
+			g_scope_memory->free[g_scope_memory->free_count++] = {start, size};
+		}
+	}
+
+	KYTY_CLASS_NO_COPY(ScopeFreeRanges);
+
+private:
+	std::map<uint64_t, uint64_t>*  m_ranges;
+	std::optional<ScopeMemoryLock> m_lock;
+};
+
 class PhysicalMemory {
 public:
 	// foreign blocks belong to the scope: mappable here, never released from here
@@ -931,6 +1006,7 @@ static callback_func_t                    g_alloc_callback        = nullptr;
 static callback_func_t                    g_free_callback         = nullptr;
 static std::atomic<uint64_t>              g_memory_pool_committed = 0;
 static void                               MemoryPoolSubtractCommitted(uint64_t len);
+
 static void MapGpuDirectRange(uint64_t vaddr, uint64_t phys_addr, uint64_t size,
                               GpuAccessMode gpu_mode) {
 	auto shared = gpu_mode != GpuAccessMode::NoAccess && g_physical_memory != nullptr
@@ -941,6 +1017,21 @@ static void MapGpuDirectRange(uint64_t vaddr, uint64_t phys_addr, uint64_t size,
 		MapGpuRange(vaddr + start - phys_addr, shared_size, true);
 	}
 }
+
+static void UpdateGpuDirectCrossProcessRange(uint64_t vaddr, uint64_t phys_addr, uint64_t size,
+                                             GpuAccessMode old_mode, GpuAccessMode new_mode) {
+	const bool was_gpu_visible = old_mode != GpuAccessMode::NoAccess;
+	const bool is_gpu_visible  = new_mode != GpuAccessMode::NoAccess;
+	if (was_gpu_visible == is_gpu_visible || g_gpu_resources == nullptr ||
+	    !IsGpuAddressRange(vaddr, size) || g_physical_memory == nullptr) {
+		return;
+	}
+	for (const auto& [start, shared_size]: g_physical_memory->CrossProcessRanges(phys_addr, size)) {
+		GetGpuResources().SetCrossProcessMemory(vaddr + start - phys_addr, shared_size,
+		                                        is_gpu_visible);
+	}
+}
+
 // owner published for pthread_suspend_user_context_np; a thread stopped holding this blocks every
 // memory call, the suspender's mmap too
 class MemoryOperationMutex {
@@ -966,6 +1057,7 @@ private:
 	uint32_t              m_depth = 0;
 	std::atomic<uint64_t> m_owner {0};
 };
+
 // Keep host mappings, physical blocks, placeholders, and virtual ranges in step.
 static MemoryOperationMutex g_memory_operation_mutex;
 
@@ -974,6 +1066,7 @@ uint64_t MemoryOperationOwnerThreadId() {
 }
 static std::set<uint64_t>    g_locked_guest_pages;
 static bool                  g_residency_uncertain = false;
+static bool                  g_memory_shutdown     = false;
 static std::atomic<uint64_t> g_next_anonymous_shared_memory_id {0};
 #if defined(KYTY_SHM_ANON_TESTS)
 static std::atomic<uint64_t> g_test_objects {0};
@@ -982,6 +1075,7 @@ static std::atomic<uint64_t> g_test_backing_bytes {0};
 static std::atomic<uint64_t> g_test_mappings {0};
 static std::atomic_bool      g_test_fail_next_anonymous_allocation {false};
 #endif
+
 class AnonymousSharedMemory {
 public:
 	explicit AnonymousSharedMemory(uint16_t object_mode, uint64_t object_id)
@@ -995,6 +1089,7 @@ public:
 	uint64_t              id              = 0;
 	std::atomic<uint64_t> mappings {0};
 };
+
 class AnonymousSharedMemoryLease {
 public:
 	explicit AnonymousSharedMemoryLease(std::shared_ptr<AnonymousSharedMemory> value)
@@ -1046,6 +1141,16 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 		addr = find_in(HOST_USER_MIN, HOST_USER_MAX + 1u);
 	}
 	return addr;
+}
+
+bool CanWriteGpuBacking(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges != nullptr && g_guest_address_space != nullptr &&
+	       g_virtual_ranges->CanWriteGpuBacking(*g_guest_address_space, vaddr, size);
+}
+
+bool TryWriteGpuBacking64(uint64_t vaddr, uint64_t value) {
+	return g_virtual_ranges != nullptr && g_guest_address_space != nullptr &&
+	       g_virtual_ranges->TryWriteGpuBacking64(*g_guest_address_space, vaddr, value);
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
@@ -1105,6 +1210,7 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 
 static int KernelVirtualQueryLocked(uint64_t vaddr, int flags, VirtualQueryInfo* info,
                                     uint64_t info_size);
+
 static bool CanWriteGuestInternal(const void* destination, uint64_t size, bool trace) {
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
 	const auto                            address = reinterpret_cast<uint64_t>(destination);
@@ -1123,12 +1229,15 @@ static bool CanWriteGuestInternal(const void* destination, uint64_t size, bool t
 	}
 	return true;
 }
+
 bool CanWriteGuest(const void* destination, uint64_t size) {
 	return CanWriteGuestInternal(destination, size, true);
 }
+
 bool CanWriteGuestNoTrace(const void* destination, uint64_t size) {
 	return CanWriteGuestInternal(destination, size, false);
 }
+
 bool QueryGuestRangeNoTrace(const void* address, VirtualQueryInfo* info) {
 	if (address == nullptr || info == nullptr) return false;
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
@@ -1136,6 +1245,68 @@ bool QueryGuestRangeNoTrace(const void* address, VirtualQueryInfo* info) {
 	return KernelVirtualQueryLocked(reinterpret_cast<uint64_t>(address), 0, info, sizeof(*info)) ==
 	       OK;
 }
+
+bool ValidateGrantedNamedDirectMemory(const void* address, uint64_t size, int protection,
+                                      const char* name) {
+	const uint64_t start          = reinterpret_cast<uint64_t>(address);
+	constexpr int  cpu_protection = PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC;
+	if (start == 0 || size == 0 || size > UINT64_MAX - start || protection == 0 ||
+	    (protection & ~cpu_protection) != 0 || name == nullptr)
+		return false;
+	size_t name_size = 0;
+	while (name_size < KERNEL_MAXIMUM_NAME_LENGTH && name[name_size] != '\0')
+		++name_size;
+	if (name_size == KERNEL_MAXIMUM_NAME_LENGTH) return false;
+	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
+	if (g_virtual_ranges == nullptr || g_physical_memory == nullptr || g_scope_memory == nullptr)
+		return false;
+	const uint64_t end            = start + size;
+	uint64_t       physical_start = 0;
+	for (uint64_t cursor = start; cursor < end;) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(cursor, 0, &range) || range.type != VirtualRangeType::Direct ||
+		    range.start > cursor || range.size > UINT64_MAX - range.start ||
+		    range.start + range.size <= cursor ||
+		    (range.protection & cpu_protection) != protection ||
+		    std::strcmp(range.name, name) != 0 ||
+		    range.offset > UINT64_MAX - (cursor - range.start)) {
+			return false;
+		}
+		const uint64_t physical = range.offset + (cursor - range.start);
+		if (cursor == start) {
+			physical_start = physical;
+			if (size > UINT64_MAX - physical_start) return false;
+		} else if (physical != physical_start + (cursor - start)) {
+			return false;
+		}
+		cursor = std::min(end, range.start + range.size);
+	}
+	if (!g_physical_memory->IsForeignSpan(physical_start, size)) {
+		return false;
+	}
+	const uint64_t physical_end = physical_start + size;
+	const int      pid          = Process::GetPid();
+	if (pid <= 0) return false;
+	ScopeMemoryLock lock;
+	for (uint64_t cursor = physical_start; cursor < physical_end;) {
+		uint64_t covered = cursor;
+		for (uint32_t i = 0; i < g_scope_memory->grant_count; ++i) {
+			const auto& grant = g_scope_memory->grants[i];
+			if (grant.pid != pid || (grant.prot & protection) != protection || grant.size == 0 ||
+			    grant.size > UINT64_MAX - grant.start) {
+				continue;
+			}
+			const uint64_t grant_end = grant.start + grant.size;
+			if (grant.start <= cursor && cursor < grant_end) {
+				covered = std::max(covered, std::min(physical_end, grant_end));
+			}
+		}
+		if (covered == cursor) return false;
+		cursor = covered;
+	}
+	return true;
+}
+
 bool CopyToGuest(void* destination, const void* source, uint64_t size) {
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
 	if (!CanWriteGuestNoTrace(destination, size)) return false;
@@ -1146,6 +1317,7 @@ bool CopyToGuest(void* destination, const void* source, uint64_t size) {
 	}
 	return true;
 }
+
 bool CopyFromGuest(void* destination, const void* source, uint64_t size) {
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
 	const auto                            address = reinterpret_cast<uint64_t>(source);
@@ -1163,9 +1335,23 @@ bool CopyFromGuest(void* destination, const void* source, uint64_t size) {
 	std::memcpy(destination, source, size);
 	return true;
 }
+
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
+	if (resources == nullptr || g_physical_memory == nullptr) {
+		return;
+	}
+
+	std::vector<PhysicalMemory::AllocatedBlock> mappings;
+	{
+		Common::LockGuard lock(g_physical_memory->GetMutex());
+		mappings = g_physical_memory->GetMappings();
+	}
+	for (const auto& mapping: mappings) {
+		MapGpuDirectRange(mapping.map_vaddr, mapping.start_addr, mapping.map_size,
+		                  mapping.gpu_mode);
+	}
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
@@ -1225,10 +1411,11 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 		return false;
 	}
 
+	const auto offset         = (g_scope_memory != nullptr ? PhysicalMemory::Size() : 0) + PageSize;
 	const auto alias          = base + PageSize;
 	bool       ok             = false;
 	auto       failure_reason = GuestBackingStore::FailureReason::None;
-	if (g_guest_address_space->MapBacking(alias, PageSize, PageSize, VirtualMemory::Mode::ReadWrite,
+	if (g_guest_address_space->MapBacking(alias, PageSize, offset, VirtualMemory::Mode::ReadWrite,
 	                                      &failure_reason)) {
 		auto* ptr = reinterpret_cast<uint64_t*>(alias);
 		*ptr      = 0x4b59545953553634ull; // "KYTYSU64"
@@ -1250,10 +1437,55 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
+static void OpenScopeMemory(const std::string& name) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	g_scope_memory_lock = CreateMutexA(nullptr, FALSE, (name + "_lock").c_str());
+	EXIT_IF(g_scope_memory_lock == nullptr);
+	WaitForSingleObject(g_scope_memory_lock, INFINITE);
+
+	const auto section = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+	                                        sizeof(ScopeMemory), (name + "_state").c_str());
+	const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
+	EXIT_IF(section == nullptr);
+	g_scope_memory = static_cast<ScopeMemory*>(
+	    MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(ScopeMemory)));
+	EXIT_IF(g_scope_memory == nullptr);
+	g_scope_memory_section = section;
+	// FNV-1a of the section name, same tag in every process of the scope
+	g_scope_memory_id = 2166136261u;
+	for (const char ch: name) {
+		g_scope_memory_id = (g_scope_memory_id ^ static_cast<uint8_t>(ch)) * 16777619u;
+	}
+	if (created) {
+		g_scope_memory->upper_end  = PhysicalMemory::TotalSize();
+		g_scope_memory->free[0]    = {0, PhysicalMemory::Size()};
+		g_scope_memory->free_count = 1;
+	}
+	LOGF("scope memory: %s %s, private flexible start = 0x%016" PRIx64 " size = 0x%016" PRIx64
+	     ", direct free ranges = %u\n",
+	     created ? "created" : "opened", name.c_str(), PhysicalMemory::Size(),
+	     FlexibleMemory::Size(), g_scope_memory->free_count);
+
+	ReleaseMutex(g_scope_memory_lock);
+#endif
+}
+
 void Initialize() {
+	g_memory_shutdown             = false;
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
-	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
+	std::string scope;
+	if (Process::GetScope(&scope)) {
+		const auto name = "kyty_ps5_" + scope + "_mem";
+		OpenScopeMemory(name);
+		g_guest_address_space = std::make_unique<GuestAddressSpace>(
+		    PhysicalMemory::TotalSize() + ScopeMemory::UpperSize, name.c_str(),
+		    g_scope_memory != nullptr ? PhysicalMemory::Size() : 0,
+		    g_scope_memory != nullptr ? FlexibleMemory::Size() : 0);
+	} else {
+		g_guest_address_space =
+		    std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize(), nullptr);
+	}
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
 	g_flexible_memory     = std::make_unique<FlexibleMemory>();
 	g_pooled_memory       = std::make_unique<PooledMemory>();
@@ -1263,11 +1495,29 @@ void Initialize() {
 }
 
 void Shutdown() {
+	g_memory_shutdown = true;
+	g_locked_guest_pages.clear();
+	g_residency_uncertain = false;
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
-	g_physical_memory.reset();
 	g_virtual_ranges.reset();
+	g_physical_memory.reset();
 	g_guest_address_space.reset();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_scope_memory != nullptr) {
+		UnmapViewOfFile(g_scope_memory);
+		g_scope_memory = nullptr;
+	}
+	if (g_scope_memory_section != nullptr) {
+		CloseHandle(g_scope_memory_section);
+		g_scope_memory_section = nullptr;
+	}
+	g_scope_memory_id = 0;
+	if (g_scope_memory_lock != nullptr) {
+		CloseHandle(g_scope_memory_lock);
+		g_scope_memory_lock = nullptr;
+	}
+#endif
 }
 
 struct AlignedPos {
@@ -1335,6 +1585,7 @@ bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t le
 	}
 
 	Common::LockGuard lock(m_mutex);
+	ScopeFreeRanges   scope_free(&m_free);
 
 	search_end = std::min<uint64_t>(search_end, Size());
 	if (search_start >= search_end) {
@@ -1367,6 +1618,16 @@ bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t le
 		b.kind           = kind;
 
 		RemoveFreeRange(m_free, free_pos, len);
+		// allocator offsets are free everywhere, so an import over one was released by its owner
+		for (auto stale = m_physical.begin(); stale != m_physical.end();) {
+			const auto& block = stale->second;
+			if (block.kind == AllocationKind::Foreign && block.start_addr < free_pos + len &&
+			    free_pos < block.start_addr + block.size) {
+				stale = m_physical.erase(stale);
+			} else {
+				++stale;
+			}
+		}
 		EXIT_IF(!m_physical.emplace(b.start_addr, b).second);
 		if (kind == AllocationKind::Automatic) {
 			AddFreeRange(m_automatic_free, free_pos, len);
@@ -1386,6 +1647,7 @@ bool PhysicalMemory::Available(uint64_t search_start, uint64_t search_end, size_
 	}
 
 	Common::LockGuard lock(m_mutex);
+	ScopeFreeRanges   scope_free(&m_free);
 
 	search_end = std::min<uint64_t>(search_end, Size());
 	if (search_start >= search_end) {
@@ -1521,6 +1783,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 	EXIT_IF(gpu_mode == nullptr);
 
 	Common::LockGuard lock(m_mutex);
+	ScopeFreeRanges   scope_free(&m_free);
 
 	auto next = m_physical.upper_bound(start);
 	if (next == m_physical.begin()) {
@@ -1544,6 +1807,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 
 		m_physical.erase(it);
 		AddFreeRange(m_free, start, len);
+		m_cross_process_physical.Subtract(start, len);
 		return true;
 	}
 	if (start > b.start_addr && start + len < b.start_addr + b.size) {
@@ -1569,6 +1833,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 
 		m_physical.emplace(right.start_addr, right);
 		AddFreeRange(m_free, start, len);
+		m_cross_process_physical.Subtract(start, len);
 		return true;
 	}
 	if (start == b.start_addr && len < b.size) {
@@ -1586,6 +1851,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 		}
 		m_physical.emplace(remaining.start_addr, remaining);
 		AddFreeRange(m_free, start, len);
+		m_cross_process_physical.Subtract(start, len);
 		return true;
 	}
 	if (start > b.start_addr && start + len == b.start_addr + b.size) {
@@ -1598,6 +1864,7 @@ bool PhysicalMemory::Release(uint64_t start, size_t len, uint64_t* vaddr, uint64
 			b.map_size = b.size;
 		}
 		AddFreeRange(m_free, start, len);
+		m_cross_process_physical.Subtract(start, len);
 		return true;
 	}
 
@@ -1674,8 +1941,9 @@ bool PhysicalMemory::CanMapDirect(uint64_t phys_addr, size_t len, bool allow_ano
 		}
 		--block;
 		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
-		    current >= block_end) {
+		if (block->second.kind == AllocationKind::Pooled ||
+		    (!allow_anonymous && block->second.kind == AllocationKind::Anonymous) ||
+		    current < block->second.start_addr || current >= block_end) {
 			return false;
 		}
 		current = std::min(end, block_end);
@@ -1723,8 +1991,10 @@ bool PhysicalMemory::Import(uint64_t start, uint64_t size) {
 	m_cross_process_physical.Add(start, size);
 	return true;
 }
+
 bool PhysicalMemory::ReleasePoolExpansion(uint64_t phys_addr, size_t len) {
 	Common::LockGuard lock(m_mutex);
+	ScopeFreeRanges   scope_free(&m_free);
 	const auto        it = m_physical.find(phys_addr);
 	if (it == m_physical.end() || it->second.kind != AllocationKind::Pooled ||
 	    it->second.size != len) {
@@ -1758,6 +2028,7 @@ bool PhysicalMemory::IsForeignSpan(uint64_t phys_addr, size_t len) {
 	}
 	return true;
 }
+
 void PhysicalMemory::MarkCrossProcess(uint64_t phys_addr, size_t len) {
 	if (len == 0 || len > UINT64_MAX - phys_addr) {
 		return;
@@ -1765,6 +2036,7 @@ void PhysicalMemory::MarkCrossProcess(uint64_t phys_addr, size_t len) {
 	Common::LockGuard lock(m_mutex);
 	m_cross_process_physical.Add(phys_addr, len);
 }
+
 PhysicalMemory::PhysicalRanges PhysicalMemory::CrossProcessRanges(uint64_t phys_addr, size_t len) {
 	PhysicalRanges ranges;
 	if (len == 0 || len > UINT64_MAX - phys_addr) {
@@ -1776,8 +2048,9 @@ PhysicalMemory::PhysicalRanges PhysicalMemory::CrossProcessRanges(uint64_t phys_
 	});
 	return ranges;
 }
+
 bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len,
-                                      std::vector<AllocatedBlock>* blocks) {
+                                      std::vector<AllocatedBlock>* blocks, bool allow_anonymous) {
 	EXIT_IF(blocks == nullptr);
 	blocks->clear();
 	if (len == 0 || UINT64_MAX - phys_addr < len) {
@@ -1795,8 +2068,10 @@ bool PhysicalMemory::GetAllocatedSpan(uint64_t phys_addr, size_t len,
 		}
 		--block;
 		const auto block_end = block->second.start_addr + block->second.size;
-		if (block->second.kind == AllocationKind::Pooled || current < block->second.start_addr ||
-		    current >= block_end) {
+		if (block->second.kind == AllocationKind::Pooled ||
+		    block->second.kind == AllocationKind::Foreign ||
+		    (!allow_anonymous && block->second.kind == AllocationKind::Anonymous) ||
+		    current < block->second.start_addr || current >= block_end) {
 			blocks->clear();
 			return false;
 		}
@@ -2604,7 +2879,8 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	if (len > g_flexible_memory->Available()) {
+	// PROT_NONE costs address space only, no flexible budget (flex.probe)
+	if (prot != 0 && len > g_flexible_memory->Available()) {
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -2672,6 +2948,23 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 		return KERNEL_ERROR_ENOMEM;
 	}
 
+	if (prot == 0) {
+		if (!reserved_target &&
+		    !g_virtual_ranges->Add(out_addr, len, 0, 0, 0, VirtualRangeType::Reserved, name,
+		                           (map_flags & GUEST_MAP_NO_COALESCE) != 0)) {
+			return KERNEL_ERROR_EBUSY;
+		}
+		LOGF("\t in_addr  = 0x%016" PRIx64 "\n"
+		     "\t out_addr = 0x%016" PRIx64 "\n"
+		     "\t size     = %" PRIu64 "\n"
+		     "\t mode     = %s\n"
+		     "\t flags    = 0x%08" PRIx32 "\n"
+		     "\t name     = %s\n",
+		     in_addr, out_addr, len, magic_enum::enum_name(mode), static_cast<uint32_t>(flags),
+		     name);
+		return OK;
+	}
+
 	if (!g_flexible_memory->Map(out_addr, len, prot, mode, gpu_mode, name)) {
 		LOGF_COLOR(Log::Color::Red, "\t [Fail]\n");
 		return KERNEL_ERROR_ENOMEM;
@@ -2724,6 +3017,7 @@ int MapOwnedFlexibleMemory(void** address, size_t len, const char* name, uint64_
 	*token = next_token;
 	return OK;
 }
+
 bool OwnsFlexibleMemory(uint64_t address, size_t len, uint64_t token) {
 	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
 	std::vector<VirtualRanges::Range>     ranges;
@@ -2732,11 +3026,13 @@ bool OwnsFlexibleMemory(uint64_t address, size_t len, uint64_t token) {
 		       return range.type == VirtualRangeType::Flexible && range.owner_token == token;
 	       });
 }
+
 int UnmapOwnedFlexibleMemory(uint64_t address, size_t len, uint64_t token) {
 	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
 	return OwnsFlexibleMemory(address, len, token) ? KernelMunmap(address, len)
 	                                               : KERNEL_ERROR_ENOENT;
 }
+
 void* KYTY_SYSV_ABI KernelMmap(void* addr, size_t len, int prot, int flags, int fd,
                                int64_t offset) {
 	PRINT_NAME();
@@ -2815,6 +3111,7 @@ void* KYTY_SYSV_ABI KernelMmap(void* addr, size_t len, int prot, int flags, int 
 
 	return mapped;
 }
+
 // libkernel 13.60 +0x16e90: 7th arg written only on success, PSM's font loader leaves it
 // uninitialised
 int KYTY_SYSV_ABI SceKernelMmap(void* addr, size_t len, int prot, int flags, int fd, int64_t offset,
@@ -2826,6 +3123,7 @@ int KYTY_SYSV_ABI SceKernelMmap(void* addr, size_t len, int prot, int flags, int
 	*res = mapped;
 	return OK;
 }
+
 static ScopeMemory::SharedObject* FindScopeSharedMemory(const char* name) {
 	for (uint32_t i = 0; i < g_scope_memory->shared_count; i++) {
 		auto& shared = g_scope_memory->shared[i];
@@ -2835,6 +3133,7 @@ static ScopeMemory::SharedObject* FindScopeSharedMemory(const char* name) {
 	}
 	return nullptr;
 }
+
 int OpenScopeSharedMemory(const char* name, int flags, int* object, uint64_t* size) {
 	constexpr int O_CREAT_GUEST = 0x200;
 	constexpr int O_TRUNC_GUEST = 0x400;
@@ -2883,6 +3182,7 @@ int OpenScopeSharedMemory(const char* name, int flags, int* object, uint64_t* si
 	*size   = shared->size;
 	return audit(created ? "created" : "opened", 0);
 }
+
 int UnlinkScopeSharedMemory(const char* name) {
 	if (g_scope_memory == nullptr) {
 		return Posix::POSIX_ENOTSUP;
@@ -2896,6 +3196,7 @@ int UnlinkScopeSharedMemory(const char* name) {
 	shared->linked = false;
 	return 0;
 }
+
 void ResizeScopeSharedMemory(int object, uint64_t size) {
 	constexpr uint64_t PAGE_SIZE = 0x4000;
 
@@ -2917,6 +3218,7 @@ void ResizeScopeSharedMemory(int object, uint64_t size) {
 	}
 	shared.size = size;
 }
+
 void WriteScopeSharedMemory(int object, uint64_t offset, const void* data, uint64_t size) {
 	ScopeMemoryLock lock;
 	const auto&     shared = g_scope_memory->shared[object];
@@ -2925,6 +3227,7 @@ void WriteScopeSharedMemory(int object, uint64_t offset, const void* data, uint6
 	                shared.offset + offset,
 	            data, size);
 }
+
 int MapScopeSharedMemory(int object, void** addr, size_t len, int prot, int flags) {
 	constexpr uint64_t PAGE_SIZE = 0x4000;
 
@@ -2947,6 +3250,7 @@ int MapScopeSharedMemory(int object, void** addr, size_t len, int prot, int flag
 	EXIT_IF(!g_physical_memory->Import(offset, capacity));
 	return KernelMapDirectMemory(addr, map_len, prot, flags, static_cast<int64_t>(offset), 0);
 }
+
 int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len) {
 	PRINT_NAME();
 
@@ -3164,12 +3468,27 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	if (len == 0 || UINT64_MAX - vaddr < len) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
-		return KERNEL_ERROR_EACCES;
-	}
+
+	// whole pages like the kernel; a sub-page sliver can't be split out of a placeholder
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+	const uint64_t     pageoff   = vaddr & (PAGE_SIZE - 1);
+	vaddr -= pageoff;
+	len = (len + pageoff + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
 	UnmapGpuRange(vaddr, len);
-	return UnmapMemoryRange(vaddr, len);
+
+	const uint64_t       end = vaddr + len;
+	VirtualRanges::Range range {};
+	while (vaddr < end && g_virtual_ranges->Query(vaddr, 1, &range) && range.start < end) {
+		const auto start = std::max(vaddr, range.start);
+		const auto size  = std::min(end, range.start + range.size) - start;
+		const int  ret   = UnmapMemoryRange(start, size);
+		if (ret != OK) {
+			return ret;
+		}
+		vaddr = start + size;
+	}
+	return OK;
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
@@ -3422,7 +3741,8 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool allow_ano
 	}
 
 	std::vector<PhysicalMemory::AllocatedBlock> allocated_span;
-	if (!g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, &allocated_span)) {
+	if (!g_physical_memory->GetAllocatedSpan(static_cast<uint64_t>(start), len, &allocated_span,
+	                                         allow_anonymous)) {
 		return KERNEL_ERROR_EACCES;
 	}
 
@@ -3443,7 +3763,7 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool allow_ano
 
 	auto restore_gpu_aliases = [&mapped_aliases]() {
 		for (const auto& alias: mapped_aliases) {
-			MapGpuRange(alias.map_vaddr, alias.map_size);
+			MapGpuDirectRange(alias.map_vaddr, alias.start_addr, alias.map_size, alias.gpu_mode);
 		}
 	};
 	auto restore_owner_aliases = [](const std::vector<PhysicalMemory::AllocatedBlock>& aliases) {
@@ -3490,6 +3810,7 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len, bool allow_ano
 		EXIT_IF(!g_physical_memory->Release(block.start_addr, block.size, &unused_vaddr,
 		                                    &unused_size, &unused_gpu));
 	}
+	DropScopeGrants(static_cast<uint64_t>(start), len);
 
 	if (g_free_callback != nullptr) {
 		for (const auto& alias: mapped_aliases) {
@@ -3591,6 +3912,7 @@ static int ProtectDirectMemory(int64_t start, size_t len, int prot, int pid) {
 	}
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelProtectDirectMemory(int64_t start, size_t len, int prot) {
 	PRINT_NAME();
 
@@ -3661,7 +3983,9 @@ static int MapDirectMemoryInternal(void** addr, size_t len, int prot, int flags,
 	if (!DecodeMemoryProtection(prot, &mode, &gpu_mode)) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	if (!g_physical_memory->CanMapDirect(static_cast<uint64_t>(direct_memory_start), len)) {
+	if (!g_physical_memory->CanMapDirect(static_cast<uint64_t>(direct_memory_start), len,
+	                                     allow_anonymous) &&
+	    !ImportGrantedDirectMemory(static_cast<uint64_t>(direct_memory_start), len, prot)) {
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -3690,7 +4014,9 @@ static int MapDirectMemoryInternal(void** addr, size_t len, int prot, int flags,
 			g_physical_memory->SetVirtualRangeMemoryType(old.map_vaddr, old.map_size,
 			                                          old.memory_type);
 		}
-		MapGpuRange(in_addr, len);
+		for (const auto& old: replaced_mappings) {
+			MapGpuDirectRange(old.map_vaddr, old.start_addr, old.map_size, old.gpu_mode);
+		}
 	};
 	if (fixed) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1u)) != 0 ||
@@ -3850,7 +4176,7 @@ static int MapDirectMemoryInternal(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_EBUSY;
 	}
 
-	MapGpuRange(out_addr, len);
+	MapGpuDirectRange(out_addr, static_cast<uint64_t>(direct_memory_start), len, gpu_mode);
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -3859,6 +4185,93 @@ static int MapDirectMemoryInternal(void** addr, size_t len, int prot, int flags,
 	LOGF_COLOR(Log::Color::Green, "\t [Ok]\n");
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int flags,
+                                        int64_t direct_memory_start, size_t alignment) {
+	return MapDirectMemoryInternal(addr, len, prot, flags, direct_memory_start, alignment, false);
+}
+
+static void UpdateAnonymousBackingStats(uint64_t old_capacity, uint64_t new_capacity) {
+#if defined(KYTY_SHM_ANON_TESTS)
+	if (old_capacity == 0 && new_capacity != 0) {
+		g_test_backings.fetch_add(1, std::memory_order_relaxed);
+	} else if (old_capacity != 0 && new_capacity == 0) {
+		g_test_backings.fetch_sub(1, std::memory_order_relaxed);
+	}
+	if (new_capacity > old_capacity) {
+		g_test_backing_bytes.fetch_add(new_capacity - old_capacity, std::memory_order_relaxed);
+	} else if (old_capacity > new_capacity) {
+		g_test_backing_bytes.fetch_sub(old_capacity - new_capacity, std::memory_order_relaxed);
+	}
+#else
+	(void)old_capacity;
+	(void)new_capacity;
+#endif
+}
+
+static bool ReleaseAnonymousSharedMemoryCapacity(AnonymousSharedMemory* object,
+                                                 uint64_t               new_capacity) {
+	if (object == nullptr || new_capacity > object->capacity || (new_capacity & 0x3fffu) != 0) {
+		return false;
+	}
+	if (new_capacity == object->capacity) {
+		return true;
+	}
+	const auto old_capacity  = object->capacity;
+	const auto release_start = object->physical_offset + new_capacity;
+	const auto release_size  = old_capacity - new_capacity;
+	if (ReleaseDirectMemoryInternal(static_cast<int64_t>(release_start), release_size, true) !=
+	    OK) {
+		return false;
+	}
+	object->capacity = new_capacity;
+	if (new_capacity == 0) {
+		object->physical_offset = 0;
+	}
+	UpdateAnonymousBackingStats(old_capacity, new_capacity);
+	return true;
+}
+
+AnonymousSharedMemory::~AnonymousSharedMemory() {
+	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+	if (capacity != 0) {
+		if (!g_memory_shutdown && g_physical_memory != nullptr) {
+			EXIT_IF(!ReleaseAnonymousSharedMemoryCapacity(this, 0));
+		} else {
+			UpdateAnonymousBackingStats(capacity, 0);
+			capacity        = 0;
+			physical_offset = 0;
+		}
+	}
+#if defined(KYTY_SHM_ANON_TESTS)
+	g_test_objects.fetch_sub(1, std::memory_order_relaxed);
+#endif
+}
+
+static void TrimAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& object) {
+	if (!object || g_memory_shutdown || object->mappings.load(std::memory_order_acquire) != 0) {
+		return;
+	}
+	const auto capacity = (object->size + 0x3fffu) & ~0x3fffull;
+	if (capacity < object->capacity &&
+	    !ReleaseAnonymousSharedMemoryCapacity(object.get(), capacity)) {
+		LOGF("SHM_ANON_TRIM_FAILED object=%" PRIu64 " capacity=0x%016" PRIx64
+		     " target=0x%016" PRIx64 "\n",
+		     object->id, object->capacity, capacity);
+	}
+}
+
+AnonymousSharedMemoryLease::~AnonymousSharedMemoryLease() {
+	const auto previous = object->mappings.fetch_sub(1, std::memory_order_acq_rel);
+	EXIT_IF(previous == 0);
+#if defined(KYTY_SHM_ANON_TESTS)
+	g_test_mappings.fetch_sub(1, std::memory_order_relaxed);
+#endif
+	if (previous == 1) {
+		std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+		TrimAnonymousSharedMemory(object);
+	}
 }
 
 std::shared_ptr<AnonymousSharedMemory> CreateAnonymousSharedMemory(uint16_t mode) {
@@ -3874,16 +4287,119 @@ std::shared_ptr<AnonymousSharedMemory> CreateAnonymousSharedMemory(uint16_t mode
 		return {};
 	}
 }
+
 uint64_t GetAnonymousSharedMemoryId(const std::shared_ptr<AnonymousSharedMemory>& object) {
 	return object ? object->id : 0;
 }
+
 uint64_t GetAnonymousSharedMemorySize(const std::shared_ptr<AnonymousSharedMemory>& object) {
 	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
 	return object ? object->size : 0;
 }
+
 uint16_t GetAnonymousSharedMemoryMode(const std::shared_ptr<AnonymousSharedMemory>& object) {
 	return object ? object->mode : 0;
 }
+
+static bool AllocateAnonymousSharedMemoryBacking(uint64_t search_start, uint64_t search_end,
+                                                 uint64_t size, uint64_t* offset) {
+	if (offset == nullptr || size == 0 || (size & 0x3fffu) != 0) {
+		return false;
+	}
+	uint64_t allocated = 0;
+	if (!g_physical_memory->Alloc(search_start, search_end, size, 0x4000, &allocated, 0,
+	                              PhysicalMemory::AllocationKind::Anonymous)) {
+		return false;
+	}
+	if (!g_guest_address_space->ZeroBacking(allocated, size)) {
+		EXIT_IF(ReleaseDirectMemoryInternal(static_cast<int64_t>(allocated), size, true) != OK);
+		return false;
+	}
+	*offset = allocated;
+	return true;
+}
+
+int ResizeAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& object,
+                                uint64_t                                      size) {
+	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
+	if (!object || g_memory_shutdown || g_physical_memory == nullptr ||
+	    size > UINT64_MAX - 0x3fffu) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (size == object->size) {
+		return OK;
+	}
+	const auto old_size     = object->size;
+	const auto old_capacity = object->capacity;
+	const auto new_capacity = (size + 0x3fffu) & ~0x3fffull;
+#if defined(KYTY_SHM_ANON_TESTS)
+	if (new_capacity > old_capacity &&
+	    g_test_fail_next_anonymous_allocation.exchange(false, std::memory_order_acq_rel)) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+#endif
+
+	if (size < old_size) {
+		if (!g_guest_address_space->ZeroBacking(object->physical_offset + size, old_size - size)) {
+			return KERNEL_ERROR_EIO;
+		}
+		object->size = size;
+		if (object->mappings.load(std::memory_order_acquire) == 0) {
+			TrimAnonymousSharedMemory(object);
+		}
+		return OK;
+	}
+
+	if (new_capacity <= old_capacity) {
+		if (!g_guest_address_space->ZeroBacking(object->physical_offset + old_size,
+		                                        size - old_size)) {
+			return KERNEL_ERROR_EIO;
+		}
+		object->size = size;
+		return OK;
+	}
+
+	if (old_capacity != 0) {
+		uint64_t tail = 0;
+		if (AllocateAnonymousSharedMemoryBacking(object->physical_offset + old_capacity,
+		                                         object->physical_offset + new_capacity,
+		                                         new_capacity - old_capacity, &tail)) {
+			EXIT_IF(tail != object->physical_offset + old_capacity);
+			object->capacity = new_capacity;
+			UpdateAnonymousBackingStats(old_capacity, new_capacity);
+			object->size = size;
+			return OK;
+		}
+	}
+
+	if (object->mappings.load(std::memory_order_acquire) != 0) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+
+	uint64_t replacement = 0;
+	if (!AllocateAnonymousSharedMemoryBacking(0, PhysicalMemory::Size(), new_capacity,
+	                                          &replacement)) {
+		return KERNEL_ERROR_ENOMEM;
+	}
+	if (old_size != 0) {
+		auto* backing = reinterpret_cast<uint8_t*>(g_guest_address_space->GetBackingBase());
+		std::memcpy(backing + replacement, backing + object->physical_offset,
+		            static_cast<size_t>(old_size));
+	}
+	if (old_capacity != 0 &&
+	    ReleaseDirectMemoryInternal(static_cast<int64_t>(object->physical_offset), old_capacity,
+	                                true) != OK) {
+		EXIT_IF(ReleaseDirectMemoryInternal(static_cast<int64_t>(replacement), new_capacity,
+		                                    true) != OK);
+		return KERNEL_ERROR_EIO;
+	}
+	object->physical_offset = replacement;
+	object->capacity        = new_capacity;
+	object->size            = size;
+	UpdateAnonymousBackingStats(old_capacity, new_capacity);
+	return OK;
+}
+
 int MapAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& object, void** addr,
                              size_t len, int prot, int flags) {
 	std::lock_guard<MemoryOperationMutex> lock(g_memory_operation_mutex);
@@ -3919,6 +4435,7 @@ int MapAnonymousSharedMemory(const std::shared_ptr<AnonymousSharedMemory>& objec
 	*addr = mapped;
 	return OK;
 }
+
 #if defined(KYTY_SHM_ANON_TESTS)
 AnonymousSharedMemoryTestStats TestGetAnonymousSharedMemoryStats() {
 	return {g_test_objects.load(std::memory_order_relaxed),
@@ -3931,6 +4448,7 @@ void TestFailNextAnonymousSharedMemoryAllocation() {
 	g_test_fail_next_anonymous_allocation.store(true, std::memory_order_release);
 }
 #endif
+
 int KYTY_SYSV_ABI KernelMapDirectMemory2(void** addr, size_t len, int type, int prot, int flags,
                                          int64_t direct_memory_start, size_t alignment) {
 	PRINT_NAME();
@@ -4124,12 +4642,15 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			const bool range_restored = g_virtual_ranges->Add(
 			    chunk.range.start, chunk.range.size, chunk.range.offset, chunk.range.protection,
 			    chunk.range.memory_type, chunk.range.type, chunk.range.name,
-			    chunk.range.disallow_merge);
+			    chunk.range.disallow_merge, chunk.range.owner_token, chunk.range.lifetime);
 			ok = range_restored && ok;
 		}
 		if (ok) {
 			for (const auto& chunk: chunks) {
-				if (IsCommittedRangeType(chunk.range.type)) {
+				if (chunk.range.type == VirtualRangeType::Direct) {
+					MapGpuDirectRange(chunk.range.start, chunk.range.offset, chunk.range.size,
+					                  chunk.gpu_mode);
+				} else if (IsCommittedRangeType(chunk.range.type)) {
 					MapGpuRange(chunk.range.start, chunk.range.size);
 				}
 			}
@@ -4371,7 +4892,9 @@ static int KernelVirtualQueryLocked(uint64_t vaddr, int flags, VirtualQueryInfo*
 	info->is_committed = (IsCommittedRangeType(candidate.type) ? 1 : 0);
 	info->is_gpu_prt   = IsInPrtAperture(vaddr);
 	CopyVirtualRangeName(info->name, candidate.name);
+	return OK;
 }
+
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {
 	PRINT_NAME();
@@ -4542,8 +5065,14 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 }
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
-                               const char* name) {
-	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
+                               const char* name, bool fixed) {
+	if (fixed && !g_guest_address_space->ReserveStaticProgram(search_addr, size)) {
+		LOGF("FIRST_FRAME_AUDIT STATIC_EXEC_FIXED_RESERVE_FAILED addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     search_addr, size);
+		return 0;
+	}
+	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, fixed);
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -4638,6 +5167,7 @@ static int UnlockHostMemory(uint64_t start, uint64_t size) {
 	return Posix::POSIX_ENOSYS;
 #endif
 }
+
 static int LockMemoryRange(const void* addr, size_t len, bool lock) {
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
 	constexpr uint64_t                    PageSize = 0x4000;
@@ -4699,6 +5229,17 @@ static int LockMemoryRange(const void* addr, size_t len, bool lock) {
 	}
 	return failure(error);
 }
+
+int KYTY_SYSV_ABI KernelMlock(const void* addr, size_t len) {
+	PRINT_NAME();
+	return LockMemoryRange(addr, len, true);
+}
+
+int KYTY_SYSV_ABI KernelMunlock(const void* addr, size_t len) {
+	PRINT_NAME();
+	return LockMemoryRange(addr, len, false);
+}
+
 int KYTY_SYSV_ABI KernelMunlockAll() {
 	PRINT_NAME();
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
@@ -4720,8 +5261,15 @@ int KYTY_SYSV_ABI KernelMunlockAll() {
 	}
 	return OK;
 }
+
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	PRINT_NAME();
+	if (std::getenv("KYTY_DIAGNOSTIC_MPROTECT_ORIGIN") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT MPROTECT_ORIGIN caller=0x%016" PRIx64 " addr=0x%016" PRIx64
+		     " len=0x%016" PRIx64 " prot=0x%x\n",
+		     reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+		     reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(len), prot);
+	}
 
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -4752,30 +5300,86 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	}
 	std::vector<VirtualRanges::Range> old_ranges;
 	if (!g_virtual_ranges->QuerySpan(aligned_addr, aligned_len, &old_ranges) ||
-	    std::any_of(old_ranges.begin(), old_ranges.end(),
-	                [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
-		EXIT("memory-protection range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
+	    std::any_of(old_ranges.begin(), old_ranges.end(), [](const auto& range) {
+		    return IsReservedRangeType(range.type) && range.type != VirtualRangeType::Reserved;
+	    })) {
+		// guest ENOMEM: Mono probes large spans during arena init and recovers
+		LOGF("memory-protection range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " (guest ENOMEM)\n",
 		     aligned_addr, aligned_len);
+		return KERNEL_ERROR_ENOMEM;
 	}
+
+	// mprotect commits reserved chunks (flex.probe), which only now count against the budget.
+	// Committed chunks keep their type
+	struct ProtectChunk {
+		uint64_t         start;
+		uint64_t         size;
+		VirtualRangeType type;
+	};
+	std::vector<ProtectChunk>         chunks;
+	std::vector<VirtualRanges::Range> committed_new;
+	for (const auto& range: old_ranges) {
+		const auto chunk_start = std::max(aligned_addr, range.start);
+		const auto chunk_len =
+		    std::min(aligned_addr + aligned_len, range.start + range.size) - chunk_start;
+		if (range.type != VirtualRangeType::Reserved) {
+			chunks.push_back({chunk_start, chunk_len, range.type});
+			continue;
+		}
+		if (prot == 0) {
+			continue;
+		}
+		if (!g_flexible_memory->Map(chunk_start, chunk_len, prot, mode, gpu_mode, range.name)) {
+			for (auto it = committed_new.rbegin(); it != committed_new.rend(); ++it) {
+				GpuAccessMode rollback_gpu = GpuAccessMode::NoAccess;
+				EXIT_IF(!g_flexible_memory->Unmap(it->start, it->size, &rollback_gpu));
+				EXIT_IF(!g_virtual_ranges->ReplaceSpan(it->start, it->size,
+				                                       VirtualRangeType::Flexible, 0, 0, 0,
+				                                       VirtualRangeType::Reserved, it->name));
+			}
+			return KERNEL_ERROR_ENOMEM;
+		}
+		EXIT_IF(!g_virtual_ranges->ReplaceSpan(chunk_start, chunk_len, VirtualRangeType::Reserved,
+		                                       0, prot, 0, VirtualRangeType::Flexible, range.name));
+		MapGpuRange(chunk_start, chunk_len);
+		auto chunk  = range;
+		chunk.start = chunk_start;
+		chunk.size  = chunk_len;
+		committed_new.push_back(chunk);
+		chunks.push_back({chunk_start, chunk_len, VirtualRangeType::Flexible});
+	}
+	if (chunks.empty()) {
+		return OK;
+	}
+
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
-	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
-
-	if (!ok) {
-		EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " prot=0x%08x\n",
-		     aligned_addr, aligned_len, prot);
+	for (const auto& chunk: chunks) {
+		if (!g_guest_address_space->Protect(chunk.start, chunk.size, mode)) {
+			EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " prot=0x%08x\n",
+			     chunk.start, chunk.size, prot);
+		}
 	}
 	for (const auto& old_range: old_ranges) {
 		if (old_range.type == VirtualRangeType::Direct) {
+			VirtualMemory::Mode old_direct_mode     = VirtualMemory::Mode::NoAccess;
+			GpuAccessMode       old_direct_gpu_mode = GpuAccessMode::NoAccess;
+			EXIT_IF(!DecodeMemoryProtection(old_range.protection, &old_direct_mode,
+			                                &old_direct_gpu_mode));
+			(void)old_direct_mode;
 			g_physical_memory->ProtectMapping(old_range.start, old_range.size, prot, mode,
 			                                  gpu_mode);
+			UpdateGpuDirectCrossProcessRange(old_range.start, old_range.offset, old_range.size,
+			                                 old_direct_gpu_mode, gpu_mode);
 		} else if (old_range.type == VirtualRangeType::Flexible) {
 			g_flexible_memory->Protect(old_range.start, old_range.size, prot, mode, gpu_mode);
 		}
 	}
-	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
+	for (const auto& chunk: chunks) {
+		g_virtual_ranges->Protect(chunk.start, chunk.size, prot);
+	}
 
 	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 

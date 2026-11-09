@@ -120,6 +120,48 @@ int RunPhyshmChild(int argc, char** argv) {
   const int other = open(path, 0x202, 0600, 12);
   Check(other >= 3 && truncate(other, 0x4000) == 0,
         "a distinct valid name and mode create an independent physical object");
+  void* other_map = mmap(nullptr, 0x4000, 3, 1, other, 0);
+  Check(other_map != reinterpret_cast<void*>(static_cast<intptr_t>(-1)) &&
+            static_cast<volatile uint8_t*>(other_map)[0] == 0,
+        "the distinct physical object starts with independent zeroed backing");
+  static_cast<volatile uint8_t*>(other_map)[0] = 0x22;
+  Check(second_bytes[0] == 0x41,
+        "writes to a distinct physical object do not alias the AudioIn object");
+
+  set_path("/shmAinBusBuffer");
+  Check(open(path, 0xa02, 0666, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EEXIST,
+        "exclusive duplicate creation returns EEXIST");
+  set_path("/shmAinBusMissing");
+  Check(open(path, 2, 0, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOENT,
+        "opening a missing physical object without O_CREAT returns ENOENT");
+  Check(open(path, 0x102, 0666, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "unsupported open flags are rejected without a descriptor");
+  Check(open(path, 0x202, 0x8000, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "non-permission mode bits are rejected");
+  Check(open(path, 0x202, 0666, 11) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENOTSUP,
+        "an unverified physical memory type is not silently admitted");
+  set_path("shmAinBusRelative");
+  Check(open(path, 0x202, 0666, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "a relative physical-shm name is rejected");
+  Check(open(nullptr, 0x202, 0666, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EFAULT &&
+            open(reinterpret_cast<const char*>(1), 0x202, 0666, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EFAULT,
+        "null and unreadable path pointers return EFAULT without a string read");
+  path[0] = '/';
+  std::memset(path + 1, 'x', 60);
+  path[61] = '\0';
+  Check(open(path, 0x202, 0666, 12) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
+        "a name that cannot fit the bounded scope key returns ENAMETOOLONG");
+
+  *Libs::Posix::GetErrorAddr() = 0;
   Check(truncate(-1, 0x4000) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "the ftruncate import preserves POSIX failure translation");
@@ -161,5 +203,54 @@ int RunPhyshmChild(int argc, char** argv) {
   (void)argc;
   (void)argv;
   return -1;
+#endif
+}
+
+void CheckPhyshm(const std::filesystem::path& root) {
+#if defined(_WIN32)
+  const auto evidence = root / "physhm_child.log";
+  const auto scope = "ph" + std::to_string(GetCurrentProcessId() % 100000) + "_" +
+                     std::to_string(GetTickCount64() % 1000000);
+  std::wstring executable(32768, L'\0');
+  const auto length = GetModuleFileNameW(nullptr, executable.data(),
+                                         static_cast<DWORD>(executable.size()));
+  Check(length > 0 && length < executable.size(), "locate the physical-shm fixture executable");
+  executable.resize(length);
+  const std::wstring wscope(scope.begin(), scope.end());
+  auto command = L"\"" + executable + L"\" --physhm-child \"" +
+                 evidence.native() + L"\" " + wscope;
+  HANDLE job = CreateJobObjectW(nullptr, nullptr);
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  Check(job != nullptr &&
+            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                                    sizeof(limits)),
+        "contain the physical-shm fixture in a kill-on-close job");
+  STARTUPINFOW startup {};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process {};
+  Check(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr,
+                       &startup, &process),
+        "start the isolated physical-shm production-path fixture");
+  Check(AssignProcessToJobObject(job, process.hProcess) &&
+            ResumeThread(process.hThread) != static_cast<DWORD>(-1),
+        "assign and resume the physical-shm fixture");
+  Check(WaitForSingleObject(process.hProcess, 30000) == WAIT_OBJECT_0,
+        "physical-shm fixture completes within 30 seconds");
+  DWORD exit_code = 0;
+  Check(GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0,
+        "physical-shm fixture exits successfully");
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  CloseHandle(job);
+  Common::File output(evidence, Common::File::Mode::Read);
+  Check(!output.IsInvalid(), "open physical-shm fixture evidence");
+  const auto bytes = output.ReadWholeBuffer();
+  const std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  Check(text.find("PHYSHM_FIXTURE_PASS exact_nid=1 descriptor=1 shared_backing=1 namespace_separate=1 errors=1 descriptor_cleanup=1") != std::string::npos,
+        "physical-shm fixture retains the exact success marker");
+#else
+  (void)root;
 #endif
 }

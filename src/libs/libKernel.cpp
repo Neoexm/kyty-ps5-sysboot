@@ -5791,12 +5791,16 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("DGMG3JshrZU", Memory::KernelSetVirtualRangeName);
 	LIB_FUNC("mkgXxsoxWHg", Memory::KernelClearVirtualRangeName);
 	// 6xx
-	LIB_FUNC("4h6F1LLbTiw", Memory::KernelMapFlexibleMemory);
+	LIB_FUNC("4h6F1LLbTiw", Memory::KernelMapNamedFlexibleMemory);
+	LIB_FUNC("kc+LEEIYakc", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("cQke9UuBQOk", Memory::KernelMunmap);
 	LIB_FUNC("pO96TwzOm5E", Memory::KernelGetDirectMemorySize);
 	LIB_FUNC("C0f7TJcbfac", Memory::KernelAvailableDirectMemorySize);
 	LIB_FUNC("tZ2yplY8MBY", Memory::KernelGetPageTableStats);
 	LIB_FUNC("rTXw65xmLIA", Memory::KernelAllocateDirectMemory);
+	// ForApp draws from the same single pool here, so the compositor's follow-up
+	// ProtectDirectMemory on the returned offset finds it
+	LIB_FUNC("fNoviuIwykc", Memory::KernelAllocateDirectMemory);
 	LIB_FUNC("B+vc2AO2Zrc", Memory::KernelAllocateMainDirectMemory);
 	LIB_FUNC("rVjRvHJ0X6c", Memory::KernelVirtualQuery);
 	LIB_FUNC("yDBwVAolDgg", Memory::KernelIsStack);
@@ -5808,12 +5812,16 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("L0v2Go5jOuM", Memory::KernelGetPrtAperture);
 	LIB_FUNC("hwVSPCmp5tM", Memory::KernelCheckedReleaseDirectMemory);
 	LIB_FUNC("MBuItvba6z8", Memory::KernelReleaseDirectMemory);
+	LIB_FUNC("k1jIkFHa9OU", Memory::KernelProtectDirectMemory);
+	LIB_FUNC("cBp0Ad-24LA", Memory::KernelProtectDirectMemoryForPID);
 	LIB_FUNC("jh+8XiK4LeE", Memory::KernelIsAddressSanitizerEnabled);
 	LIB_FUNC("WFcfL2lzido", Memory::KernelQueryMemoryProtection);
 	LIB_FUNC("BHouLQzh0X0", Memory::KernelDirectMemoryQuery);
 	LIB_FUNC("aNz11fnnzi4", Memory::KernelAvailableFlexibleMemorySize);
 	LIB_FUNC("n1-v6FgU7MQ", Memory::KernelConfiguredFlexibleMemorySize);
 	LIB_FUNC("vSMAm3cxYTY", Memory::KernelMprotect);
+	LIB_FUNC("3k6kx-zOOSQ", Memory::KernelMlock);
+	LIB_FUNC("xQIIfJ860sk", Memory::KernelMunlock);
 	LIB_FUNC("9bfdLIyuwCY", Memory::KernelMtypeprotect);
 	LIB_FUNC("2SKEx6bSq-4", Memory::KernelBatchMap);
 	LIB_FUNC("kBJzF8x4SyE", Memory::KernelBatchMap2);
