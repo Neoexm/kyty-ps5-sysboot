@@ -4099,6 +4099,29 @@ int main(int argc, char** argv) {
     TriggerGuestExecFatalSignalUd2(Common::PathFromUtf8(argv[3]));
     return 4;
   }
+  if (exec_fatal_classifier_child) {
+    TempDirectory fatal_signal_temporary;
+    RunGuestExecFatalSignalClassifier(fatal_signal_temporary.Path());
+    subsystems.Destroy();
+    return 0;
+  }
+  if (!readonly_providers_only && !readonly_provider_child && !guest_wait7_frontier_only && !auth_info_scope_only && !app_mount_contract_only && !app_registration_state_only && !local_socket_policy_only && !compositor_sockets_only && !sysav_audio_shm_only && !physhm_only && !audiod_extended_mmap_only && !host_exception_provenance_only && !psm_audio_openex_only && !psm_native_mutex_only && !psm_native_thread_rename_only && !psm_sched_range_only && !sysav_raw_syscall_trap_only && !app_classification_only && !envelope_only)
+    CheckGuestExecFatalSignalClassifier();
+  if (exec_fatal_signal_only) {
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: exec-child fatal signal cases passed\n");
+    return 0;
+  }
+
+  if (app_classification_only) {
+    FileSystem::Initialize();
+    CheckOriginalAppClassification(Common::PathFromUtf8(argv[2]));
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: original app-classification cases passed\n");
+    return 0;
+  }
+
   if (argc == 1 || audiod_extended_mmap_only) {
     CheckAudiodExtendedMmap();
     TempDirectory audiod_extended_mmap_temporary;
@@ -4406,6 +4429,31 @@ int main(int argc, char** argv) {
     subsystems.Destroy();
     return result;
   }
+  if (native_font_glyph || native_font_system || native_font_file) {
+    char* end = nullptr;
+    const auto codepoint = std::strtoull(argv[4], &end, 0);
+    Check(end != argv[4] && *end == '\0' && codepoint <= UINT32_MAX, "parse explicit glyph codepoint");
+    const int result = AuditNativeFontGlyph(Common::PathFromUtf8(argv[2]), Common::PathFromUtf8(argv[3]),
+        static_cast<uint32_t>(codepoint), Common::PathFromUtf8(argv[6]), native_font_system, native_font_file);
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return result;
+  }
+  if (native_font_create) {
+    const int result = AuditNativeFontCreate(Common::PathFromUtf8(argv[2]));
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return result;
+  }
+  if (native_font_routing) {
+    const int result = AuditNativeFontRouting(Common::PathFromUtf8(argv[2]), temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return result;
+  }
   if (argc == 5 && std::strcmp(argv[1], "--resource-arbitrator-capture-audit") == 0) {
     AuditResourceArbitratorCapture(Common::PathFromUtf8(argv[2]),
                                    Common::PathFromUtf8(argv[3]), argv[4]);
@@ -4426,6 +4474,29 @@ int main(int argc, char** argv) {
     FileSystem::Shutdown();
     graphics.reset();
     subsystems.Destroy();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--captured-root-only") == 0) {
+    CheckCapturedRootMetadata(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sysmodule-dependencies-only") == 0) {
+    CheckSysmoduleDependencies(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: sysmodule dependency cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sysmodule-font-only") == 0) {
+    CheckSysmoduleFontProviders(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: sysmodule font cases passed\n");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-metadbg-only") == 0) {
