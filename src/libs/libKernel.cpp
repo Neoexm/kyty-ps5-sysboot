@@ -2512,6 +2512,15 @@ static int KYTY_SYSV_ABI KernelSetProcessProperty(const char* name, const void* 
 
 static int64_t KYTY_SYSV_ABI read(int d, void* buf, uint64_t nbytes) {
 	// PRINT_NAME();
+	if (std::getenv("KYTY_DIAGNOSTIC_PIPE_READ") != nullptr && d >= 0 && d <= 9) {
+		static std::atomic<uint32_t> trace_count {0};
+		if (trace_count.fetch_add(1) < 48) {
+			LOGF("PIPE_READ_TRACE caller=0x%016" PRIx64 " fd=%d buf=0x%016" PRIx64 " count=%" PRIu64
+			     "\n",
+			     reinterpret_cast<uint64_t>(__builtin_return_address(0)), d,
+			     reinterpret_cast<uint64_t>(buf), nbytes);
+		}
+	}
 
 	if (buf == nullptr) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
@@ -3706,6 +3715,11 @@ int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	return Network::Net::Socket(family, type, protocol);
 }
 
+int KYTY_SYSV_ABI socketex(const char* name, int family, int type, int protocol) {
+	PRINT_NAME();
+	LOGF("\t name = %s\n", name != nullptr ? name : "(null)");
+	return Network::Net::SocketEx(name, family, type, protocol);
+}
 
 int KYTY_SYSV_ABI bind(int s, const void* addr, uint32_t addrlen) {
 	PRINT_NAME();
@@ -3750,6 +3764,9 @@ int KYTY_SYSV_ABI select(int nfds, void* readfds, void* writefds, void* exceptfd
 
 int64_t KYTY_SYSV_ABI send(int s, const void* buf, uint64_t len, int flags) {
 	PRINT_NAME();
+	if (!Network::Net::IsSocket(s)) {
+		return POSIX_N_CALL(LibKernel::FileSystem::SendGuestSocket(s, buf, len, flags));
+	}
 	return Network::Net::Send(s, buf, len, flags);
 }
 
@@ -3761,6 +3778,9 @@ int64_t KYTY_SYSV_ABI sendto(int s, const void* buf, uint64_t len, int flags, co
 
 int64_t KYTY_SYSV_ABI recv(int s, void* buf, uint64_t len, int flags) {
 	PRINT_NAME();
+	if (!Network::Net::IsSocket(s)) {
+		return POSIX_N_CALL(LibKernel::FileSystem::RecvGuestSocket(s, buf, len, flags));
+	}
 	return Network::Net::Recv(s, buf, len, flags);
 }
 
@@ -3963,6 +3983,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("UqDGjXA5yUM", LibKernel::Memory::KernelMunmap);
 	LIB_FUNC("AqBioC2vF3I", LibKernel::read);
 	LIB_FUNC("TU-d9PfIHPM", Posix::socket);
+	LIB_FUNC("pG70GT5yRo4", Posix::socketex);
 	LIB_FUNC("KuOmgKoqCdY", Posix::bind);
 	LIB_FUNC("XVL8So3QJUk", Posix::connect);
 	LIB_FUNC("pxnCmagrtao", Posix::listen);

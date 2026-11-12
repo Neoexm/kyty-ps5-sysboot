@@ -132,6 +132,8 @@ public:
 	                        bool is_auto_proxy_conf);
 	bool HttpDeleteTemplate(Id tmpl_id);
 	bool HttpSetNonblock(Id id, bool enable);
+	bool HttpEnableOption(Id id, uint32_t flags);
+	bool HttpDisableOption(Id id, uint32_t flags);
 	bool HttpsSetSslCallback(Id id, HttpsCallback cbfunc, void* user_arg);
 	bool HttpsSetMinSslVersion(Id id, uint32_t ssl_version);
 	bool HttpsDisableOption(Id id, uint32_t ssl_flags);
@@ -153,6 +155,7 @@ public:
 	bool HttpSetConnectTimeOut(Id id, uint32_t usec);
 	bool HttpSetSendTimeOut(Id id, uint32_t usec);
 	bool HttpSetRecvTimeOut(Id id, uint32_t usec);
+	bool HttpSetCookieEnabled(Id id, int enable);
 	bool HttpSetAutoRedirect(Id id, int enable);
 	bool HttpSetAuthEnabled(Id id, int enable);
 	bool HttpMarkRequestSent(Id req_id, int result);
@@ -193,8 +196,10 @@ private:
 		std::vector<HttpHeader> headers;
 		bool                    used            = false;
 		bool                    nonblock        = false;
+		bool                    cookie_enabled  = true;
 		bool                    auto_redirect   = true;
 		bool                    auth_enabled    = true;
+		uint32_t                options         = 0;
 		HttpsCallback           ssl_cbfunc      = nullptr;
 		void*                   ssl_user_arg    = nullptr;
 		uint32_t                ssl_flags       = 0xA7;
@@ -234,15 +239,14 @@ private:
 
 	HttpBase* FindHttpBase(Id id, bool include_request);
 
-	static constexpr int POOLS_MAX     = 32;
+	static constexpr int POOLS_MAX     = 129;
 	static constexpr int RESOLVERS_MAX = 32;
-	static constexpr int SSL_MAX       = 32;
 	static constexpr int HTTP_MAX      = 32;
 
 	Common::Mutex               m_mutex;
 	Pool                        m_pools[POOLS_MAX];
 	Resolver                    m_resolvers[RESOLVERS_MAX];
-	Ssl                         m_ssl[SSL_MAX];
+	std::vector<Ssl>            m_ssl;
 	Http                        m_http[HTTP_MAX];
 	std::vector<HttpTemplate>   m_templates;
 	std::vector<HttpConnection> m_connections;
@@ -330,13 +334,22 @@ bool Network::ResolverValid(int rid) {
 Network::Id Network::SslInit(uint64_t pool_size) {
 	Common::LockGuard lock(m_mutex);
 
-	for (int id = 0; id < SSL_MAX; id++) {
-		if (!m_ssl[id].used) {
-			m_ssl[id].used = true;
-			m_ssl[id].size = pool_size;
-
+	int id = 0;
+	for (auto& ssl: m_ssl) {
+		if (!ssl.used) {
+			ssl.used = true;
+			ssl.size = pool_size;
 			return Id::Create(id, Id::Type::Ssl);
 		}
+		id++;
+	}
+
+	if (id < Id::MAX_ID) {
+		Ssl ssl {};
+		ssl.used = true;
+		ssl.size = pool_size;
+		m_ssl.push_back(ssl);
+		return Id::Create(id, Id::Type::Ssl);
 	}
 
 	return Id::Invalid();
@@ -346,7 +359,7 @@ bool Network::SslTerm(Id ssl_ctx_id) {
 	Common::LockGuard lock(m_mutex);
 
 	if (ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
-	    ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used) {
+	    static_cast<size_t>(ssl_ctx_id.GetId()) < m_ssl.size() && m_ssl[ssl_ctx_id.GetId()].used) {
 		m_ssl[ssl_ctx_id.GetId()].used = false;
 
 		return true;
@@ -359,20 +372,23 @@ bool Network::SslValid(Id ssl_ctx_id) {
 	Common::LockGuard lock(m_mutex);
 
 	return ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
-	       ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used;
+	       static_cast<size_t>(ssl_ctx_id.GetId()) < m_ssl.size() && m_ssl[ssl_ctx_id.GetId()].used;
 }
 
 Network::Id Network::HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size) {
 	Common::LockGuard lock(m_mutex);
 
-	if (ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
-	    ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used && memid >= 0 &&
-	    memid < POOLS_MAX && m_pools[memid].used) {
+	const bool no_ssl    = ssl_ctx_id.ToInt() == 0;
+	const bool valid_ssl = ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
+	                       static_cast<size_t>(ssl_ctx_id.GetId()) < m_ssl.size() &&
+	                       m_ssl[ssl_ctx_id.GetId()].used;
+
+	if ((no_ssl || valid_ssl) && memid >= 0 && memid < POOLS_MAX && m_pools[memid].used) {
 		for (int id = 0; id < HTTP_MAX; id++) {
 			if (!m_http[id].used) {
 				m_http[id].used       = true;
 				m_http[id].size       = pool_size;
-				m_http[id].ssl_ctx_id = ssl_ctx_id.GetId();
+				m_http[id].ssl_ctx_id = no_ssl ? 0 : ssl_ctx_id.GetId();
 				m_http[id].memid      = memid;
 
 				return Id::Create(id, Id::Type::Http);
@@ -462,7 +478,7 @@ Network::Id Network::HttpCreateTemplate(Id http_ctx_id, const char* user_agent, 
 		HttpTemplate tn {};
 		tn.used               = true;
 		tn.http_ver           = http_ver;
-		tn.user_agent         = std::string(user_agent);
+		tn.user_agent         = user_agent != nullptr ? user_agent : "libhttp (PlayStation 5)";
 		tn.is_auto_proxy_conf = is_auto_proxy_conf;
 		tn.http_ctx_id        = http_ctx_id.GetId();
 		tn.nonblock           = false;
@@ -684,6 +700,30 @@ bool Network::HttpSetNonblock(Id id, bool enable) {
 	return false;
 }
 
+bool Network::HttpEnableOption(Id id, uint32_t flags) {
+	Common::LockGuard lock(m_mutex);
+
+	HttpBase* base = FindHttpBase(id, true);
+	if (base == nullptr) {
+		return false;
+	}
+
+	base->options |= flags;
+	return true;
+}
+
+bool Network::HttpDisableOption(Id id, uint32_t flags) {
+	Common::LockGuard lock(m_mutex);
+
+	HttpBase* base = FindHttpBase(id, true);
+	if (base == nullptr) {
+		return false;
+	}
+
+	base->options &= ~flags;
+	return true;
+}
+
 bool Network::HttpsSetSslCallback(Id id, HttpsCallback cbfunc, void* user_arg) {
 	Common::LockGuard lock(m_mutex);
 
@@ -811,6 +851,19 @@ bool Network::HttpSetRecvTimeOut(Id id, uint32_t usec) {
 	return false;
 }
 
+bool Network::HttpSetCookieEnabled(Id id, int enable) {
+	Common::LockGuard lock(m_mutex);
+
+	HttpBase* base = FindHttpBase(id, true);
+
+	if (base != nullptr) {
+		base->cookie_enabled = (enable != 0);
+		return true;
+	}
+
+	return false;
+}
+
 bool Network::HttpSetAutoRedirect(Id id, int enable) {
 	Common::LockGuard lock(m_mutex);
 
@@ -858,6 +911,49 @@ using SocketIoLength                                = size_t;
 #endif
 
 using LocalCredentials = LibKernel::SocketPolicy::Credentials;
+
+static LocalCredentials CurrentLocalCredentials() {
+	LocalCredentials                   credentials;
+	LibKernel::AuthInfo::ImageIdentity first_identity;
+	LibKernel::AuthInfo::ImageIdentity current_identity;
+	if (!LibKernel::Process::GetVerifiedOriginalSelfIdentity(&first_identity)) return credentials;
+	const auto facts = LibKernel::Process::GetCurrentAuthorizationFacts();
+	if (!LibKernel::Process::GetVerifiedOriginalSelfIdentity(&current_identity) ||
+	    first_identity.authority_id != current_identity.authority_id ||
+	    first_identity.self_size != current_identity.self_size ||
+	    first_identity.elf_size != current_identity.elf_size ||
+	    first_identity.self_sha256 != current_identity.self_sha256 ||
+	    first_identity.elf_sha256 != current_identity.elf_sha256 || !facts.has_authority ||
+	    facts.authority_id != current_identity.authority_id)
+		return {};
+	constexpr uint64_t capability62 = 1ull << 62;
+	if ((facts.known_capability0 & capability62) != 0) {
+		credentials.capability62 = (facts.capability0 & capability62) != 0
+		                               ? LibKernel::SocketPolicy::Fact::Set
+		                               : LibKernel::SocketPolicy::Fact::Clear;
+	}
+	LibKernel::AuthInfo::Capture capture;
+	if (LibKernel::Process::GetVerifiedAuthInfoForImage(current_identity, &capture)) {
+		LibKernel::AuthInfo::ImageIdentity final_identity;
+		if (!LibKernel::Process::GetVerifiedOriginalSelfIdentity(&final_identity) ||
+		    current_identity.authority_id != final_identity.authority_id ||
+		    current_identity.self_size != final_identity.self_size ||
+		    current_identity.elf_size != final_identity.elf_size ||
+		    current_identity.self_sha256 != final_identity.self_sha256 ||
+		    current_identity.elf_sha256 != final_identity.elf_sha256 ||
+		    (facts.known_capability0 & capability62) == 0 ||
+		    ((facts.capability0 ^ LibKernel::AuthInfo::Capability0(capture.record)) &
+		     capability62) != 0)
+			return {};
+		uint64_t word68 = 0;
+		std::memcpy(&word68, capture.record.data() + 0x10, sizeof(word68));
+		credentials.word68_bit57 = (word68 & (1ull << 57)) != 0
+		                               ? LibKernel::SocketPolicy::Fact::Set
+		                               : LibKernel::SocketPolicy::Fact::Clear;
+	}
+	return credentials;
+}
+
 #if defined(_WIN32)
 struct LocalPolicyRecord {
 	uint32_t         magic      = 0;
@@ -871,6 +967,7 @@ struct LocalPolicyRecord {
 	LocalCredentials credentials;
 	uint8_t          reserved[6] {};
 };
+
 struct LocalPolicyLock {
 	HANDLE mutex;
 	bool   acquired;
@@ -884,11 +981,24 @@ struct LocalPolicyLock {
 		if (acquired) ReleaseMutex(mutex);
 	}
 };
+
 static uint64_t LocalProcessBirth(HANDLE process) {
 	FILETIME birth {}, exit {}, kernel {}, user {};
 	if (!GetProcessTimes(process, &birth, &exit, &kernel, &user)) return 0;
 	return (static_cast<uint64_t>(birth.dwHighDateTime) << 32) | birth.dwLowDateTime;
 }
+
+static bool LocalOwnerAlive(const LocalPolicyRecord& record) {
+	if (!record.host_pid) return false;
+	const auto process =
+	    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, record.host_pid);
+	if (!process) return GetLastError() != ERROR_INVALID_PARAMETER;
+	const auto status = WaitForSingleObject(process, 0);
+	const auto birth  = LocalProcessBirth(process);
+	CloseHandle(process);
+	return status != WAIT_OBJECT_0 && (!birth || !record.birth || birth == record.birth);
+}
+
 struct LocalPolicyEndpoint {
 	HANDLE             mutex   = nullptr;
 	HANDLE             file    = INVALID_HANDLE_VALUE;
@@ -940,6 +1050,29 @@ struct LocalPolicyEndpoint {
 	void Flush() { FlushViewOfFile(record, sizeof(*record)); }
 };
 #endif
+
+enum class CompositorEndpoint : uint8_t { None, Gnm, Spp, Gnmr };
+enum class CompositorRole : uint8_t { None, Listener, Client, Server };
+enum class GnmCommand3000Phase : uint8_t { Request, ResponseHeader, ResponseBody, Disabled };
+
+static const char* CompositorEndpointName(CompositorEndpoint endpoint) {
+	switch (endpoint) {
+		case CompositorEndpoint::Gnm: return "gnm";
+		case CompositorEndpoint::Spp: return "spp";
+		case CompositorEndpoint::Gnmr: return "gnmr";
+		default: return "none";
+	}
+}
+
+static const char* CompositorRoleName(CompositorRole role) {
+	switch (role) {
+		case CompositorRole::Listener: return "listener";
+		case CompositorRole::Client: return "client";
+		case CompositorRole::Server: return "server";
+		default: return "none";
+	}
+}
+
 struct SocketTransport {
 	SocketTransport(NativeSocket value, int socket_type): socket(value), type(socket_type) {}
 	~SocketTransport() { Close(); }
@@ -977,17 +1110,61 @@ struct SocketTransport {
 		if (value == INVALID_NATIVE_SOCKET) {
 			return 0;
 		}
+		std::lock_guard policy_lock(local_policy_mutex);
 #if defined(_WIN32)
-		return closesocket(value);
-#else
-		return ::close(value);
+		LocalPolicyLock endpoint_lock(local_policy ? local_policy->mutex : nullptr);
 #endif
+#if defined(_WIN32)
+		const int result = closesocket(value);
+#else
+		const int result = ::close(value);
+#endif
+		bool owns_path = !local_unix_bind_path.empty();
+#if defined(_WIN32)
+		if (local_policy) {
+			owns_path = endpoint_lock.acquired &&
+			            local_policy->record->host_pid == GetCurrentProcessId() &&
+			            local_policy->record->generation == local_generation &&
+			            local_policy->record->birth == LocalProcessBirth(GetCurrentProcess());
+		}
+#endif
+		if (owns_path) {
+			std::error_code ec;
+			std::filesystem::remove(std::filesystem::u8path(local_unix_bind_path), ec);
+			if (ec) {
+				LOGF("PSM_LOCAL_UNIX_CLEANUP path=%s error=%d\n", local_unix_bind_path.c_str(),
+				     ec.value());
+			}
+			local_unix_bind_path.clear();
+#if defined(_WIN32)
+			if (local_policy) {
+				local_policy->record->host_pid  = 0;
+				local_policy->record->flags     = 0;
+				local_policy->record->listening = 0;
+				local_policy->Flush();
+			}
+#endif
+		}
+		return result;
 	}
 	std::atomic<NativeSocket> socket;
 	const int                type;
 	bool                      local_unix = false;
+	std::atomic<int>          local_unix_no_sigpipe {0};
+	std::string               local_unix_bind_path;
 	std::mutex                local_policy_mutex;
 	uint32_t                  local_policy_flags = 0;
+	LocalCredentials          local_credentials;
+	std::atomic_bool          nonblocking         = false;
+	CompositorEndpoint        compositor_endpoint = CompositorEndpoint::None;
+	CompositorRole            compositor_role     = CompositorRole::None;
+	std::mutex                compositor_trace_mutex;
+	GnmCommand3000Phase       compositor_trace_phase = GnmCommand3000Phase::Request;
+	std::array<uint8_t, 16>   compositor_trace_buffer {};
+	uint32_t                  compositor_trace_buffer_used = 0;
+	uint32_t                  compositor_trace_bytes       = 0;
+	uint32_t                  compositor_trace_records     = 0;
+	std::atomic_uint32_t      compositor_header_trace_records {0};
 #if defined(_WIN32)
 	std::shared_ptr<LocalPolicyEndpoint> local_policy;
 	uint64_t                             local_generation = 0;
@@ -997,6 +1174,155 @@ struct SocketTransport {
 	std::atomic_bool   receive_shutdown = false;
 #endif
 };
+
+static void TraceGnmHeader16(SocketTransport& transport, int guest_fd, const void* data,
+                             size_t bytes, bool sending) {
+	if (std::getenv("KYTY_DIAGNOSTIC_GNM_COMMAND3000_SEMANTICS") == nullptr || data == nullptr ||
+	    bytes != 16 || transport.compositor_endpoint != CompositorEndpoint::Gnm) {
+		return;
+	}
+	constexpr uint32_t per_socket_cap = 8;
+	constexpr uint32_t process_cap    = 64;
+	const uint32_t     socket_record =
+	    transport.compositor_header_trace_records.fetch_add(1, std::memory_order_relaxed);
+	if (socket_record >= per_socket_cap) return;
+	static std::atomic_uint32_t process_records {0};
+	const uint32_t process_record = process_records.fetch_add(1, std::memory_order_relaxed);
+	if (process_record >= process_cap) return;
+	uint32_t words[4] {};
+	std::memcpy(words, data, sizeof(words));
+	LOGF("GNM_HEADER16_DIAGNOSTIC endpoint=%s role=%s guest_pid=%d fd=%d direction=%s bytes=16"
+	     " word0=0x%08x word1=0x%08x word2=0x%08x word3=0x%08x"
+	     " socket_record=%u process_record=%u per_socket_cap=%u process_cap=%u"
+	     "\n",
+	     CompositorEndpointName(transport.compositor_endpoint),
+	     CompositorRoleName(transport.compositor_role), Libs::LibKernel::Process::GetPid(),
+	     guest_fd, sending ? "send" : "recv", words[0], words[1], words[2], words[3], socket_record,
+	     process_record, per_socket_cap, process_cap);
+}
+
+static void TraceGnmCommand3000(SocketTransport& transport, const void* data, size_t bytes,
+                                bool sending) {
+	if (std::getenv("KYTY_DIAGNOSTIC_GNM_COMMAND3000_SEMANTICS") == nullptr || data == nullptr ||
+	    bytes == 0 || transport.compositor_endpoint != CompositorEndpoint::Gnm) {
+		return;
+	}
+	std::lock_guard lock(transport.compositor_trace_mutex);
+	if (transport.compositor_trace_phase == GnmCommand3000Phase::Disabled) return;
+	bool request_sending = false;
+	if (transport.compositor_role == CompositorRole::Client) {
+		request_sending = true;
+	} else if (transport.compositor_role != CompositorRole::Server) {
+		return;
+	}
+	const auto         direction        = sending ? "send" : "recv";
+	const auto         endpoint         = CompositorEndpointName(transport.compositor_endpoint);
+	const auto         role             = CompositorRoleName(transport.compositor_role);
+	constexpr uint32_t byte_cap         = 4096;
+	auto               emit_unavailable = [&](const char* phase, const char* reason) {
+		if (transport.compositor_trace_records++ < 16) {
+			LOGF("GNM_COMMAND3000 kind=unavailable endpoint=%s role=%s direction=%s"
+			     " phase=%s reason=%s\n",
+			     endpoint, role, direction, phase, reason);
+		}
+	};
+	auto disable = [&] {
+		transport.compositor_trace_phase = GnmCommand3000Phase::Disabled;
+		transport.compositor_trace_buffer.fill(0);
+		transport.compositor_trace_buffer_used = 0;
+	};
+	auto reset = [&] {
+		transport.compositor_trace_phase = GnmCommand3000Phase::Request;
+		transport.compositor_trace_buffer.fill(0);
+		transport.compositor_trace_buffer_used = 0;
+	};
+	const auto* cursor = static_cast<const uint8_t*>(data);
+	while (bytes != 0) {
+		const bool expected_sending =
+		    transport.compositor_trace_phase == GnmCommand3000Phase::Request ? request_sending
+			                                                                 : !request_sending;
+		if (sending != expected_sending) {
+			emit_unavailable(transport.compositor_trace_phase == GnmCommand3000Phase::Request
+			                     ? "request"
+								 : "response",
+			                 "unexpected_direction");
+			disable();
+			return;
+		}
+		if (transport.compositor_trace_bytes >= byte_cap) {
+			emit_unavailable("stream", "byte_cap");
+			disable();
+			return;
+		}
+		const size_t capacity =
+		    transport.compositor_trace_buffer.size() - transport.compositor_trace_buffer_used;
+		const size_t remaining_cap = byte_cap - transport.compositor_trace_bytes;
+		const size_t take          = std::min({bytes, capacity, remaining_cap});
+		std::memcpy(transport.compositor_trace_buffer.data() +
+		                transport.compositor_trace_buffer_used,
+		            cursor, take);
+		transport.compositor_trace_buffer_used += static_cast<uint32_t>(take);
+		transport.compositor_trace_bytes += static_cast<uint32_t>(take);
+		cursor += take;
+		bytes -= take;
+		if (transport.compositor_trace_buffer_used != transport.compositor_trace_buffer.size()) {
+			if (transport.compositor_trace_bytes == byte_cap) {
+				emit_unavailable("stream", "byte_cap");
+				disable();
+			}
+			return;
+		}
+		uint32_t words[4] {};
+		std::memcpy(words, transport.compositor_trace_buffer.data(), sizeof(words));
+		switch (transport.compositor_trace_phase) {
+			case GnmCommand3000Phase::Request:
+				if (words[0] != 1 || words[1] != 0x3000 || words[2] != 0) {
+					emit_unavailable("request", "mismatch");
+					disable();
+					return;
+				}
+				if (transport.compositor_trace_records++ < 16) {
+					LOGF("GNM_COMMAND3000 kind=request endpoint=%s role=%s direction=%s"
+					     " version=1 command=0x3000 reserved=0 request_size=%u\n",
+					     endpoint, role, direction, words[3]);
+				}
+				transport.compositor_trace_phase = GnmCommand3000Phase::ResponseHeader;
+				transport.compositor_trace_buffer.fill(0);
+				transport.compositor_trace_buffer_used = 0;
+				break;
+			case GnmCommand3000Phase::ResponseHeader:
+				if (transport.compositor_trace_records++ < 16) {
+					LOGF("GNM_COMMAND3000 kind=response_header endpoint=%s role=%s direction=%s"
+					     " body_size=%u server_result=0x%08x\n",
+					     endpoint, role, direction, words[2], words[3]);
+				}
+				transport.compositor_trace_buffer.fill(0);
+				transport.compositor_trace_buffer_used = 0;
+				if (words[2] == 0) {
+					reset();
+				} else if (words[2] == 16) {
+					transport.compositor_trace_phase = GnmCommand3000Phase::ResponseBody;
+				} else {
+					emit_unavailable("response_header", "unsupported_body_size");
+					disable();
+					return;
+				}
+				break;
+			case GnmCommand3000Phase::ResponseBody: {
+				uint64_t qwords[2] {};
+				std::memcpy(qwords, transport.compositor_trace_buffer.data(), sizeof(qwords));
+				const uint32_t mask = (qwords[0] != 0 ? 1u : 0u) | (qwords[1] != 0 ? 2u : 0u);
+				if (transport.compositor_trace_records++ < 16) {
+					LOGF("GNM_COMMAND3000 kind=response_body endpoint=%s role=%s direction=%s"
+					     " bytes=16 qword_nonzero_mask=0x%x\n",
+					     endpoint, role, direction, mask);
+				}
+				reset();
+			} break;
+			case GnmCommand3000Phase::Disabled: return;
+		}
+	}
+}
 
 struct P2pEndpoint {
 	bool     bound          = false;
@@ -1172,10 +1498,53 @@ static int SetHostSocketError() {
 
 static int ConvertFamily(int family) {
 	switch (family) {
+		case 1:
+			// ShellUI compositor's AF_LOCAL SOCK_STREAM socket. Opt-in, sockaddr_un translation
+			// isn't settled.
+			if (std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") != nullptr) {
+				return 1;
+			}
+			return -1;
 		case 2: return AF_INET;
 		case 28: return AF_INET6;
 		default: return -1;
 	}
+}
+
+// Three 106-byte compositor/SISR addresses, each mapped to a short temp path. Process-local unless
+// KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE lets a peer process bind the same name.
+static bool GuestCompositorSocketPath(std::string* host_path, const char* endpoint) {
+	if (host_path == nullptr || std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") == nullptr) {
+		return false;
+	}
+	std::string scope;
+	if (const char* shared = std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE");
+	    shared != nullptr && shared[0] != 0) {
+		scope = shared;
+		if (scope.size() > 20 || !std::all_of(scope.begin(), scope.end(), [](char ch) {
+			    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+				       (ch >= '0' && ch <= '9') || ch == '_';
+		    })) {
+			return false;
+		}
+	}
+#if defined(_WIN32)
+	char        temp[MAX_PATH + 1] {};
+	const DWORD n = GetTempPathA(MAX_PATH, temp);
+	if (n == 0 || n >= MAX_PATH) {
+		return false;
+	}
+	if (scope.empty()) {
+		scope = fmt::format("{}", GetCurrentProcessId());
+	}
+	*host_path = fmt::format("{}kyty_ps5_{}_{}.sock", temp, scope, endpoint);
+#else
+	if (scope.empty()) {
+		scope = fmt::format("{}", static_cast<int>(getpid()));
+	}
+	*host_path = fmt::format("/tmp/kyty_ps5_{}_{}.sock", scope, endpoint);
+#endif
+	return host_path->size() < sizeof(sockaddr_un::sun_path);
 }
 
 static int ConvertSocketOptionLevel(int level) {
@@ -1229,9 +1598,11 @@ static int ConvertMessageFlags(int flags) {
 }
 
 static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_storage* out,
-                                SocketLength* out_len) {
+                                SocketLength*       out_len,
+                                CompositorEndpoint* compositor_endpoint = nullptr) {
 	EXIT_IF(out == nullptr);
 	EXIT_IF(out_len == nullptr);
+	if (compositor_endpoint != nullptr) *compositor_endpoint = CompositorEndpoint::None;
 
 	if (addr == nullptr) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
@@ -1245,6 +1616,68 @@ static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_sto
 	}
 
 	const int family = ConvertFamily(bytes[1]);
+	if (family == 1 && std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") != nullptr) {
+		static std::atomic<uint32_t> trace_count {0};
+		if (trace_count.fetch_add(1) < 16) {
+			const uint32_t n = std::min<uint32_t>(addrlen, 110);
+			std::string    hex;
+			for (uint32_t i = 0; i < n; ++i) {
+				hex += fmt::format("{:02x}", bytes[i]);
+			}
+			const char*    unix_path = reinterpret_cast<const char*>(bytes + 2);
+			const uint32_t max_path  = n > 2 ? n - 2 : 0;
+			const auto*    end  = static_cast<const char*>(std::memchr(unix_path, 0, max_path));
+			const auto path_len = end != nullptr ? static_cast<size_t>(end - unix_path) : max_path;
+			LOGF("PSM_UNIX_SOCKADDR_TRACE guest_len=%u reported_len=%u "
+			     "guest_family=%u path=%s raw=%s\n",
+			     addrlen, bytes[0], bytes[1], std::string(unix_path, path_len).c_str(),
+			     hex.c_str());
+		}
+	}
+	if (family == 1) {
+		// [sun_len,sun_family]; sun_len 0 is allowed, bind passes the 106-byte size
+		if (addrlen < 3 || addrlen > 106) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EINVAL;
+			return -1;
+		}
+		const char*  path       = reinterpret_cast<const char*>(bytes + 2);
+		const size_t room       = addrlen - 2;
+		const void*  terminator = std::memchr(path, 0, room);
+		if (terminator == nullptr) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
+			return -1;
+		}
+		const std::string_view guest_path(path, static_cast<const char*>(terminator) - path);
+		const auto             endpoint =
+		    guest_path == "/system_tmp/GnmCompositor"             ? CompositorEndpoint::Gnm
+			: guest_path == "/system_tmp/AgcCompositorSppSocket"  ? CompositorEndpoint::Spp
+			: guest_path == "/system_tmp/GnmCompositorRestricted" ? CompositorEndpoint::Gnmr
+			                                                      : CompositorEndpoint::None;
+		if (endpoint == CompositorEndpoint::None) {
+			*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
+			return -1;
+		}
+		std::string local_path;
+		if (!GuestCompositorSocketPath(&local_path, CompositorEndpointName(endpoint))) {
+			*Posix::GetErrorAddr() = Posix::POSIX_ENAMETOOLONG;
+			return -1;
+		}
+		// byte-copy, a reinterpreted store breaks strict aliasing
+		sockaddr_un local {};
+		local.sun_family = AF_UNIX;
+		std::memcpy(local.sun_path, local_path.c_str(), local_path.size() + 1);
+		std::memset(out, 0, sizeof(*out));
+		std::memcpy(out, &local, sizeof(local));
+		*out_len = sizeof(sockaddr_un);
+		if (compositor_endpoint != nullptr) *compositor_endpoint = endpoint;
+		LOGF("PSM_LOCAL_UNIX_CONVERT guest=%.*s host=%s "
+		     "family_storage=%d bytes0=%02x,%02x\n",
+		     static_cast<int>(guest_path.size()), guest_path.data(), local_path.c_str(),
+		     static_cast<int>(out->ss_family),
+		     static_cast<unsigned>(reinterpret_cast<const uint8_t*>(out)[0]),
+		     static_cast<unsigned>(reinterpret_cast<const uint8_t*>(out)[1]));
+		return 0;
+	}
 	if (family != AF_INET) {
 		*Posix::GetErrorAddr() = (family < 0 ? Posix::POSIX_EAFNOSUPPORT : Posix::POSIX_EOPNOTSUPP);
 		return -1;
@@ -1375,6 +1808,7 @@ int KYTY_SYSV_ABI SocketReadReady(int s, int64_t* pending, bool* eof) {
 	*eof = ready != 0 && *pending == 0;
 	return 0;
 }
+
 static bool TakeSocketBackend(int guest_fd, SocketSlot* out) {
 	EXIT_IF(out == nullptr);
 
@@ -1964,6 +2398,7 @@ int KYTY_SYSV_ABI SocketClose(int s) {
 		return NET_ERROR_EBADF;
 	}
 	RemoveSocketFromEpolls(s);
+	LibKernel::EventQueue::KernelDeleteReadEventForAll(s);
 
 	bool close_transport = slot.transport.use_count() == 1;
 #if defined(_WIN32)
@@ -2006,6 +2441,8 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 	}
 
 	auto transport = std::make_shared<SocketTransport>(socket, p2p ? SOCK_DGRAM : type);
+	transport->local_unix = (family == 1);
+	if (transport->local_unix) transport->local_credentials = CurrentLocalCredentials();
 	if (p2p) {
 		// Logical sockets keep their own blocking mode; the shared transport never blocks.
 #if defined(_WIN32)
@@ -2028,6 +2465,21 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 	return fd;
 }
 
+int KYTY_SYSV_ABI SocketEx(const char* name, int family, int type, int protocol) {
+	const int guest_fd = Socket(family, type, protocol);
+	if (guest_fd < 0) {
+		return guest_fd;
+	}
+
+	Common::LockGuard lock(g_socket_mutex);
+	auto&             slot = g_sockets[static_cast<size_t>(guest_fd)];
+	if (!slot.transport) {
+		return SetGuestSocketError(Posix::POSIX_EBADF);
+	}
+	slot.name = name != nullptr ? name : "";
+	return guest_fd;
+}
+
 int SetLocalSocketPolicy(int s, int32_t value) {
 	NativeSocket                     socket = INVALID_NATIVE_SOCKET;
 	std::shared_ptr<SocketTransport> transport;
@@ -2044,6 +2496,7 @@ int SetLocalSocketPolicy(int s, int32_t value) {
 	LOGF("PSM_LOCAL_UNIX_POLICY fd=%d flags=0x%x\n", s, transport->local_policy_flags);
 	return 0;
 }
+
 int KYTY_SYSV_ABI Ioctl(int s, uint64_t request, void* arg) {
 	if (request == 0x80049301u) {
 		int32_t value = 0;
@@ -2103,8 +2556,12 @@ int KYTY_SYSV_ABI Ioctl(int s, uint64_t request, void* arg) {
 			return SetGuestSocketError(Posix::POSIX_ENOTTY);
 	}
 }
+
 int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 	PRINT_NAME();
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") != nullptr) {
+		LOGF("PSM_NET_OPERATION=bind fd=%d guest_len=%u\n", s, addrlen);
+	}
 
 	LOGF("\t s       = %d\n"
 	     "\t addr    = 0x%016" PRIx64 "\n"
@@ -2122,8 +2579,29 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = 0;
-	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
+	CompositorEndpoint compositor_endpoint = CompositorEndpoint::None;
+	const int          converted =
+	    ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen, &compositor_endpoint);
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") != nullptr && addrlen >= 2 &&
+	    static_cast<const uint8_t*>(addr)[1] == 1) {
+		LOGF("PSM_UNIX_BIND_CONVERTED fd=%d rc=%d ss_family=%d AF_UNIX=%d "
+		     "len=%d p2p=%d errno=%d\n",
+		     s, converted, static_cast<int>(host_addr.ss_family), AF_UNIX,
+		     static_cast<int>(host_addrlen), state.p2p.has_value(), *Posix::GetErrorAddr());
+		std::fprintf(stderr,
+		             "PSM_UNIX_BIND_HOST_TRACE fd=%d rc=%d family=%d AF_UNIX=%d "
+		             "len=%d p2p=%d\n",
+		             s, converted, static_cast<int>(host_addr.ss_family), AF_UNIX,
+		             static_cast<int>(host_addrlen), state.p2p.has_value());
+	}
+	if (converted != 0) {
 		return -1;
+	}
+
+	if (host_addr.ss_family == AF_UNIX) {
+		LOGF("PSM_LOCAL_UNIX_BIND_ENTRY fd=%d native_socket=%" PRIu64 " p2p=%d family=%d len=%d\n",
+		     s, static_cast<uint64_t>(socket), state.p2p.has_value(),
+		     static_cast<int>(host_addr.ss_family), static_cast<int>(host_addrlen));
 	}
 
 	if (state.p2p) {
@@ -2187,8 +2665,70 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 		return 0;
 	}
 
+	std::unique_lock<std::mutex> policy_lock(state.transport->local_policy_mutex, std::defer_lock);
+#if defined(_WIN32)
+	std::shared_ptr<LocalPolicyEndpoint> endpoint;
+	if (host_addr.ss_family == AF_UNIX) {
+		policy_lock.lock();
+		if (state.transport->socket.load() != socket)
+			return SetGuestSocketError(Posix::POSIX_EBADF);
+		if (state.transport->local_policy) return SetGuestSocketError(Posix::POSIX_EINVAL);
+		endpoint = LocalPolicyEndpoint::Open(
+		    reinterpret_cast<const sockaddr_un*>(&host_addr)->sun_path, true);
+		if (!endpoint) return SetGuestSocketError(Posix::POSIX_EIO);
+	}
+	LocalPolicyLock endpoint_lock(endpoint ? endpoint->mutex : nullptr);
+	if (endpoint) {
+		if (!endpoint_lock.acquired) return SetGuestSocketError(Posix::POSIX_EIO);
+		auto& record = *endpoint->record;
+		if (record.host_pid) {
+			if (LocalOwnerAlive(record)) return SetGuestSocketError(Posix::POSIX_EADDRINUSE);
+			std::error_code ec;
+			std::filesystem::remove(std::filesystem::u8path(endpoint->path), ec);
+			if (ec) return SetGuestSocketError(Posix::POSIX_EIO);
+			record.host_pid = 0;
+		}
+	}
+#else
+	if (host_addr.ss_family == AF_UNIX) return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+#endif
+
 	if (::bind(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
+		if (host_addr.ss_family == AF_UNIX) {
+#if defined(_WIN32)
+			const int host_error = WSAGetLastError();
+#else
+			const int host_error = errno;
+#endif
+			const auto* local = reinterpret_cast<const sockaddr_un*>(&host_addr);
+			LOGF("PSM_LOCAL_UNIX_BIND_FAILURE fd=%d host_error=%d "
+			     "host_len=%d family=%d path=%s\n",
+			     s, host_error, static_cast<int>(host_addrlen),
+			     static_cast<int>(host_addr.ss_family), local->sun_path);
+		}
 		return SetHostSocketError();
+	}
+
+	if (host_addr.ss_family == AF_UNIX) {
+		const auto* unix_addr                 = reinterpret_cast<const sockaddr_un*>(&host_addr);
+		state.transport->local_unix_bind_path = unix_addr->sun_path;
+		state.transport->compositor_endpoint  = compositor_endpoint;
+		state.transport->compositor_role      = CompositorRole::Listener;
+#if defined(_WIN32)
+		auto& record = *endpoint->record;
+		record.birth = LocalProcessBirth(GetCurrentProcess());
+		record.generation += 1;
+		if (!record.generation) record.generation = 1;
+		record.flags       = state.transport->local_policy_flags;
+		record.type        = state.transport->type;
+		record.listening   = 0;
+		record.credentials = state.transport->local_credentials;
+		record.host_pid    = GetCurrentProcessId();
+		endpoint->Flush();
+		state.transport->local_generation = record.generation;
+		state.transport->local_policy     = endpoint;
+#endif
+		LOGF("PSM_LOCAL_UNIX_BOUND fd=%d path=%s\n", s, unix_addr->sun_path);
 	}
 
 	return 0;
@@ -2196,6 +2736,9 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 
 int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 	PRINT_NAME();
+	if (std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") != nullptr) {
+		LOGF("PSM_NET_OPERATION=connect fd=%d guest_len=%u\n", s, addrlen);
+	}
 
 	LOGF("\t s       = %d\n"
 	     "\t addr    = 0x%016" PRIx64 "\n"
@@ -2203,21 +2746,142 @@ int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
 	     s, reinterpret_cast<uint64_t>(addr), addrlen);
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
+	if (addrlen > 255) return SetGuestSocketError(Posix::POSIX_ENAMETOOLONG);
+	if (addrlen < 2) return SetGuestSocketError(Posix::POSIX_EINVAL);
 	if (addr == nullptr) {
 		return SetGuestSocketError(Posix::POSIX_EFAULT);
 	}
-	if (!GetSocketBackend(s, &socket)) {
+#if defined(_WIN32)
+	std::array<uint8_t, 255> copied_address {};
+	const auto               address_value = reinterpret_cast<uint64_t>(addr);
+	SIZE_T                   copied        = 0;
+	if (address_value >= 0x800000000000ull || addrlen > 0x800000000000ull - address_value ||
+	    !ReadProcessMemory(GetCurrentProcess(), addr, copied_address.data(), addrlen, &copied) ||
+	    copied != addrlen)
+		return SetGuestSocketError(Posix::POSIX_EFAULT);
+	copied_address[0] = static_cast<uint8_t>(addrlen);
+	addr              = copied_address.data();
+#endif
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
 		return -1;
 	}
+
+#if defined(_WIN32)
+	if (transport->local_unix) {
+		std::lock_guard lock(transport->local_policy_mutex);
+		if (transport->socket.load() != socket) return SetGuestSocketError(Posix::POSIX_EBADF);
+		int          listening = 0;
+		SocketLength length    = sizeof(listening);
+		if (::getsockopt(socket, SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<char*>(&listening),
+		                 &length) != 0)
+			return SetHostSocketError();
+		if (listening) return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+		sockaddr_storage peer {};
+		length = sizeof(peer);
+		if (::getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &length) == 0)
+			return SetGuestSocketError(Posix::POSIX_EISCONN);
+		if (copied_address[1] != 1) return SetGuestSocketError(Posix::POSIX_EAFNOSUPPORT);
+	}
+#endif
 
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = 0;
-	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen) != 0) {
+	CompositorEndpoint compositor_endpoint = CompositorEndpoint::None;
+	if (ConvertGuestSockaddr(addr, addrlen, &host_addr, &host_addrlen, &compositor_endpoint) != 0) {
 		return -1;
 	}
 
+#if defined(_WIN32)
+	if (host_addr.ss_family == AF_UNIX) {
+		if (!transport->local_unix) return SetGuestSocketError(Posix::POSIX_EAFNOSUPPORT);
+		{
+			std::lock_guard lock(transport->local_policy_mutex);
+			if (transport->socket.load() != socket) return SetGuestSocketError(Posix::POSIX_EBADF);
+			if ((transport->local_policy_flags & 0x10u) != 0)
+				return SetGuestSocketError(Posix::POSIX_EALREADY);
+			if (!transport->StoreLocalPolicyFlags(transport->local_policy_flags | 0x10u))
+				return SetGuestSocketError(Posix::POSIX_EIO);
+		}
+		struct ClearConnecting {
+			SocketTransport& transport;
+			~ClearConnecting() {
+				std::lock_guard lock(transport.local_policy_mutex);
+				if (!transport.StoreLocalPolicyFlags(transport.local_policy_flags & ~0x10u))
+					LOGF("PSM_LOCAL_UNIX_POLICY_CLEAR_FAILED\n");
+			}
+		} clear {*transport};
+		const auto* local    = reinterpret_cast<const sockaddr_un*>(&host_addr);
+		auto        endpoint = LocalPolicyEndpoint::Open(local->sun_path);
+		if (!endpoint) return SetGuestSocketError(Posix::POSIX_ECONNREFUSED);
+		int result     = 0;
+		int host_error = 0;
+		{
+			LocalPolicyLock lock(endpoint->mutex);
+			if (!lock.acquired) return SetGuestSocketError(Posix::POSIX_EIO);
+			const auto& record = *endpoint->record;
+			if (!record.host_pid || !LocalOwnerAlive(record))
+				return SetGuestSocketError(Posix::POSIX_ECONNREFUSED);
+			if (record.type != transport->type) return SetGuestSocketError(Posix::POSIX_EPROTOTYPE);
+			const auto admission = LibKernel::SocketPolicy::Check(record.flags, record.credentials,
+			                                                      CurrentLocalCredentials());
+			LOGF("PSM_LOCAL_UNIX_ADMISSION fd=%d generation=%" PRIu64 " flags=0x%x result=%d\n", s,
+			     record.generation, record.flags, static_cast<int>(admission));
+			if (admission == LibKernel::SocketPolicy::Admission::Deny)
+				return SetGuestSocketError(Posix::POSIX_EPERM);
+			if (admission == LibKernel::SocketPolicy::Admission::Unknown)
+				return SetGuestSocketError(Posix::POSIX_ENOSYS);
+			if (!record.listening) return SetGuestSocketError(Posix::POSIX_ECONNREFUSED);
+			u_long mode = 1;
+			if (ioctlsocket(socket, FIONBIO, &mode) != 0) return SetHostSocketError();
+			result = ::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen);
+			host_error = result != 0 ? WSAGetLastError() : 0;
+			mode       = transport->nonblocking.load() ? 1 : 0;
+			if (ioctlsocket(socket, FIONBIO, &mode) != 0) return SetHostSocketError();
+		}
+		if (result != 0 && host_error == WSAEWOULDBLOCK && !transport->nonblocking.load()) {
+			fd_set writable, failed;
+			FD_ZERO(&writable);
+			FD_ZERO(&failed);
+			FD_SET(socket, &writable);
+			FD_SET(socket, &failed);
+			if (::select(0, nullptr, &writable, &failed, nullptr) == SOCKET_ERROR)
+				return SetHostSocketError();
+			SocketLength length = sizeof(host_error);
+			if (::getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&host_error),
+			                 &length) != 0)
+				return SetHostSocketError();
+			result = host_error ? -1 : 0;
+		}
+		if (result != 0) {
+			if (host_error == WSAEWOULDBLOCK) return SetGuestSocketError(Posix::POSIX_EINPROGRESS);
+			WSASetLastError(host_error);
+			return SetHostSocketError();
+		}
+		transport->compositor_endpoint = compositor_endpoint;
+		transport->compositor_role     = CompositorRole::Client;
+		LOGF("PSM_LOCAL_UNIX_CONNECTED fd=%d\n", s);
+		return 0;
+	}
+#else
+	if (host_addr.ss_family == AF_UNIX) return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+#endif
+
 	if (::connect(socket, reinterpret_cast<const sockaddr*>(&host_addr), host_addrlen) != 0) {
+		if (host_addr.ss_family == AF_UNIX) {
+#if defined(_WIN32)
+			const int host_error = WSAGetLastError();
+#else
+			const int host_error = errno;
+#endif
+			const auto* local = reinterpret_cast<const sockaddr_un*>(&host_addr);
+			LOGF("PSM_LOCAL_UNIX_CONNECT_FAILURE fd=%d host_error=%d path=%s\n", s, host_error,
+			     local->sun_path);
+		}
 		return SetHostSocketError();
+	}
+	if (host_addr.ss_family == AF_UNIX) {
+		LOGF("PSM_LOCAL_UNIX_CONNECTED fd=%d\n", s);
 	}
 
 	return 0;
@@ -2231,14 +2895,42 @@ int KYTY_SYSV_ABI Listen(int s, int backlog) {
 	     s, backlog);
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
 		return -1;
 	}
 
+	std::lock_guard policy_lock(transport->local_policy_mutex);
+	if (transport->local_unix && transport->local_unix_bind_path.empty()) {
+		sockaddr_storage peer {};
+		SocketLength     length = sizeof(peer);
+		return SetGuestSocketError(
+		    ::getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &length) == 0
+		        ? Posix::POSIX_EINVAL
+				: Posix::POSIX_EDESTADDRREQ);
+	}
+#if defined(_WIN32)
+	LocalPolicyLock endpoint_lock(transport->local_policy ? transport->local_policy->mutex
+	                                                      : nullptr);
+	if (transport->local_policy &&
+	    (!endpoint_lock.acquired ||
+	     transport->local_policy->record->host_pid != GetCurrentProcessId() ||
+	     transport->local_policy->record->generation != transport->local_generation)) {
+		return SetGuestSocketError(Posix::POSIX_EIO);
+	}
+#endif
 	if (::listen(socket, backlog) != 0) {
 		return SetHostSocketError();
 	}
 
+#if defined(_WIN32)
+	if (transport->local_policy) {
+		transport->local_policy->record->listening = 1;
+		transport->local_policy->Flush();
+		LOGF("PSM_LOCAL_UNIX_LISTENING fd=%d generation=%" PRIu64 " flags=0x%x\n", s,
+		     transport->local_generation, transport->local_policy_flags);
+	}
+#endif
 	return 0;
 }
 
@@ -2250,8 +2942,9 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	     "\t addrlen = 0x%016" PRIx64 "\n",
 	     s, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addrlen));
 
-	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	NativeSocket                     socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> listener;
+	if (!GetSocketBackend(s, &socket, nullptr, &listener)) {
 		return -1;
 	}
 
@@ -2263,8 +2956,12 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 		return SetHostSocketError();
 	}
 
-	auto      transport = std::make_shared<SocketTransport>(accepted, SOCK_STREAM);
-	const int fd        = AllocSocketFd(transport);
+	auto transport                 = std::make_shared<SocketTransport>(accepted, SOCK_STREAM);
+	transport->local_unix          = listener->local_unix;
+	transport->local_credentials   = listener->local_credentials;
+	transport->compositor_endpoint = listener->compositor_endpoint;
+	transport->compositor_role     = CompositorRole::Server;
+	const int fd                   = AllocSocketFd(transport);
 	if (fd < 0) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
 		return -1;
@@ -2276,7 +2973,15 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 			*Posix::GetErrorAddr() = Posix::POSIX_EFAULT;
 			return -1;
 		}
-		if (ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen) != 0) {
+		if (transport->local_unix &&
+		    reinterpret_cast<const sockaddr_un*>(&host_addr)->sun_path[0] == '\0') {
+			// An unbound local peer has the 16-byte unnamed address, and the kernel cuts it to the
+			// caller's length instead of failing.
+			const uint8_t  unnamed[16] = {16, 1};
+			const uint32_t copied      = std::min<uint32_t>(*addrlen, sizeof(unnamed));
+			std::memcpy(addr, unnamed, copied);
+			*addrlen = copied;
+		} else if (ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen) != 0) {
 			SocketClose(fd);
 			return -1;
 		}
@@ -2364,6 +3069,18 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	if (optval == nullptr || optlen == nullptr) {
 		return SetGuestSocketError(Posix::POSIX_EFAULT);
 	}
+	if (level == 0xffff && optname == 0x800 &&
+	    std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") != nullptr && state.transport &&
+	    state.transport->local_unix) {
+		if (*optlen < sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		const int enabled = state.transport->local_unix_no_sigpipe.load();
+		std::memcpy(optval, &enabled, sizeof(enabled));
+		*optlen = sizeof(enabled);
+		LOGF("PSM_LOCAL_UNIX_GET_NOSIGPIPE fd=%d value=%d\n", s, enabled);
+		return 0;
+	}
 	if (state.p2p) {
 		const auto* value = level == 0xffff ? P2pSocketOption(*state.p2p, optname) : nullptr;
 		if (value == nullptr) {
@@ -2417,6 +3134,23 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 	if (!GetSocketBackend(s, &socket, &state)) {
 		return -1;
 	}
+	// Orbis SO_NOSIGPIPE=0x800. Winsock send() never raises SIGPIPE, so just keep the option state.
+	if (level == 0xffff && optname == 0x800 &&
+	    std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") != nullptr && state.transport &&
+	    state.transport->local_unix) {
+		if (optlen != sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		int enabled = 0;
+		std::memcpy(&enabled, optval, sizeof(enabled));
+		if (enabled != 0 && enabled != 1) {
+			LOGF("PSM_LOCAL_UNIX_SET_NOSIGPIPE rejected invalid=%d\n", enabled);
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		state.transport->local_unix_no_sigpipe.store(enabled);
+		LOGF("PSM_LOCAL_UNIX_SET_NOSIGPIPE fd=%d enabled=%d\n", s, enabled);
+		return 0;
+	}
 	if (state.p2p) {
 		Common::LockGuard lock(g_socket_mutex);
 		auto&             slot = g_sockets[static_cast<size_t>(s)];
@@ -2456,6 +3190,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		    flags < 0 ||
 		    ::fcntl(socket, F_SETFL, enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) != 0;
 #endif
+		if (!failed && state.transport) state.transport->nonblocking.store(enabled);
 		return failed ? SetHostSocketError() : 0;
 	}
 #if !defined(_WIN32)
@@ -2493,11 +3228,12 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 	     reinterpret_cast<uint64_t>(addr), addrlen);
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
 	if (buf == nullptr) {
 		return SetGuestSocketError(Posix::POSIX_EFAULT);
 	}
 	// UDPP2P requires protocol framing; the native-only lookup rejects raw sends.
-	if (!GetSocketBackend(s, &socket)) {
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
 		return -1;
 	}
 
@@ -2522,6 +3258,10 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 	}
 	if (result < 0) {
 		return SetHostSocketError();
+	}
+	if (result > 0 && transport) {
+		TraceGnmHeader16(*transport, s, buf, static_cast<size_t>(result), true);
+		TraceGnmCommand3000(*transport, buf, static_cast<size_t>(result), true);
 	}
 
 	return result;
@@ -2670,6 +3410,10 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	if (addr != nullptr && ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen) != 0) {
 		return -1;
 	}
+	if (result > 0 && transport && (host_flags & MSG_PEEK) == 0) {
+		TraceGnmHeader16(*transport, s, buf, static_cast<size_t>(result), false);
+		TraceGnmCommand3000(*transport, buf, static_cast<size_t>(result), false);
+	}
 
 	return result;
 }
@@ -2714,6 +3458,8 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
 	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
+	std::vector<std::pair<int, std::shared_ptr<LibKernel::FileSystem::GuestSocketReadSource>>>
+	    guest_reads;
 	int host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
 		const bool read = GuestFdIsSet(readfds, fd);
@@ -2721,6 +3467,16 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		const bool except = GuestFdIsSet(exceptfds, fd);
 		if (!read && !write && !except) {
 			continue;
+		}
+		if (!IsSocket(fd)) {
+			auto source = LibKernel::FileSystem::PinGuestSocketReadSource(fd);
+			if (source) {
+				if (write || except) {
+					return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
+				}
+				guest_reads.emplace_back(fd, std::move(source));
+				continue;
+			}
 		}
 		NativeSocket                    socket = INVALID_NATIVE_SOCKET;
 		std::shared_ptr<SocketTransport> transport;
@@ -2775,8 +3531,65 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	}
 
 	int result = 0;
+	std::vector<int> guest_ready;
+	if (!guest_reads.empty()) {
+		const auto                                           requested_read   = host_read;
+		const auto                                           requested_write  = host_write;
+		const auto                                           requested_except = host_except;
+		std::optional<std::chrono::steady_clock::time_point> deadline;
+		if (timeout != nullptr) {
+			const auto* guest_timeout = static_cast<const NetTimeval*>(timeout);
+			const auto  now           = std::chrono::steady_clock::now();
+			const auto  maximum       = std::chrono::duration_cast<std::chrono::microseconds>(
+			                                std::chrono::steady_clock::time_point::max() - now)
+			                                .count();
+			deadline = guest_timeout->tv_sec > (maximum - guest_timeout->tv_usec) / 1'000'000
+			               ? std::chrono::steady_clock::time_point::max()
+			               : now + std::chrono::seconds(guest_timeout->tv_sec) +
+			                     std::chrono::microseconds(guest_timeout->tv_usec);
+		}
+		for (;;) {
+			host_read   = requested_read;
+			host_write  = requested_write;
+			host_except = requested_except;
+			result      = 0;
+			if (!descriptors.empty()) {
+				timeval poll {};
+				result = SelectSockets(host_nfds, readfds != nullptr ? &host_read : nullptr,
+				                       writefds != nullptr ? &host_write : nullptr,
+				                       exceptfds != nullptr ? &host_except : nullptr, &poll,
+				                       stream_reads);
+				if (result < 0) {
+					return SetHostSocketError();
+				}
+			}
+			guest_ready.clear();
+			for (const auto& [fd, source]: guest_reads) {
+				int64_t   pending = 0;
+				bool      eof     = false;
+				const int queried =
+				    LibKernel::FileSystem::QueryGuestSocketReadSource(source, &pending, &eof);
+				if (queried != OK) {
+					return SetGuestSocketError(LibKernel::KernelToPosix(queried));
+				}
+				if (pending > 0 || eof) {
+					guest_ready.push_back(fd);
+				}
+			}
+			const auto now = std::chrono::steady_clock::now();
+			if (result > 0 || !guest_ready.empty() || (deadline && now >= *deadline)) {
+				break;
+			}
+			auto wait = std::chrono::microseconds(10'000);
+			if (deadline) {
+				wait = std::min(
+				    wait, std::chrono::duration_cast<std::chrono::microseconds>(*deadline - now));
+			}
+			Common::Thread::SleepMicro(static_cast<uint32_t>(wait.count()));
+		}
+	} else
 #if defined(_WIN32)
-	if (descriptors.empty()) {
+	    if (descriptors.empty()) {
 		Sleep(host_timeout_ptr == nullptr ? INFINITE :
 		      static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
 	} else
@@ -2795,6 +3608,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	GuestFdZero(writefds, nfds);
 	GuestFdZero(exceptfds, nfds);
 	result = 0;
+	for (int fd: guest_ready) {
+		GuestFdSet(readfds, fd);
+		result++;
+	}
 	for (const auto& [fd, socket]: descriptors) {
 		if (FD_ISSET(socket, &host_read)) {
 			GuestFdSet(readfds, fd);
@@ -2974,16 +3791,18 @@ int KYTY_SYSV_ABI HttpTerm(int http_ctx_id) {
 int KYTY_SYSV_ABI HttpCreateTemplate(int http_ctx_id, const char* user_agent, int http_ver,
                                      int is_auto_proxy_conf) {
 	PRINT_NAME();
+	const char* normalized_user_agent =
+	    user_agent != nullptr ? user_agent : "libhttp (PlayStation 5)";
 
 	LOGF("\t http_ctx_id        = %d\n"
 	     "\t user_agent         = %s\n"
 	     "\t http_ver           = %d\n"
 	     "\t is_auto_proxy_conf = %d\n",
-	     http_ctx_id, user_agent, http_ver, is_auto_proxy_conf);
+	     http_ctx_id, normalized_user_agent, http_ver, is_auto_proxy_conf);
 
 	EXIT_IF(g_net == nullptr);
 
-	auto id = g_net->HttpCreateTemplate(Network::Id(http_ctx_id), user_agent, http_ver,
+	auto id = g_net->HttpCreateTemplate(Network::Id(http_ctx_id), normalized_user_agent, http_ver,
 	                                    is_auto_proxy_conf != 0);
 
 	if (!id.IsValid()) {
@@ -3013,6 +3832,42 @@ int KYTY_SYSV_ABI HttpSetNonblock(int id, int enable) {
 	     id, enable);
 
 	if (!g_net->HttpSetNonblock(Network::Id(id), enable != 0)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpEnableOption(int id, uint32_t flags) {
+	PRINT_NAME();
+
+	LOGF("\t id    = %d\n"
+	     "\t flags = 0x%08" PRIx32 "\n",
+	     id, flags);
+
+	if ((flags & 0xffffd200u) != 0) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	if (!g_net->HttpEnableOption(Network::Id(id), flags)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpDisableOption(int id, uint32_t flags) {
+	PRINT_NAME();
+
+	LOGF("\t id    = %d\n"
+	     "\t flags = 0x%08" PRIx32 "\n",
+	     id, flags);
+
+	if ((flags & 0xffffd200u) != 0) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	if (!g_net->HttpDisableOption(Network::Id(id), flags)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3123,6 +3978,20 @@ int KYTY_SYSV_ABI HttpSetRecvTimeOut(int id, uint32_t usec) {
 	     id, usec);
 
 	if (!g_net->HttpSetRecvTimeOut(Network::Id(id), usec)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpSetCookieEnabled(int id, int enable) {
+	PRINT_NAME();
+
+	LOGF("\t id     = %d\n"
+	     "\t enable = %d\n",
+	     id, enable);
+
+	if (!g_net->HttpSetCookieEnabled(Network::Id(id), enable)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 

@@ -1322,6 +1322,36 @@ Reply SysctlPageSize(const SyscallRequest& request) {
 		return {LibKernel::KERNEL_ERROR_EFAULT, 0};
 	}
 	std::string name;
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && input != nullptr && input_len > 0 &&
+	    input_len <= 64) {
+		name.resize(static_cast<size_t>(input_len));
+		if (!ReadSysctlMemory(input, name.data(), input_len)) {
+			return {LibKernel::KERNEL_ERROR_EFAULT, 0};
+		}
+	}
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "machdep.tsc_freq") {
+		const uint32_t oid[2] = {7, 0x100};
+		const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_TSC_NAMETOMIB"
+			     " name=machdep.tsc_freq derived_oid=7.256\n");
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 7 && mib[1] == 0x100 && input == nullptr && input_len == 0) {
+		const uint64_t frequency = LibKernel::KernelGetTscFrequency();
+		if (frequency == 0) {
+			return {-1, Libs::Posix::POSIX_ENOENT};
+		}
+		const Reply result =
+		    PublishSysctlValue(output, length, capacity, &frequency, sizeof(frequency));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_TSC_FREQUENCY"
+			     " hertz=%" PRIu64 " from_guest_clock\n",
+			     frequency);
+		}
+		return result;
+	}
 	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "kern.smp.cpus") {
 		LOGF("FIRST_FRAME_AUDIT SYSAV_SYSCTL_NAME_MISSING"
 		     " name=kern.smp.cpus result=ENOENT\n");
@@ -1707,6 +1737,138 @@ Reply SysctlPageSize(const SyscallRequest& request) {
 		}
 		return result;
 	}
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && name == "kern.crashdump.dumpmode" &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSAV_CRASHDUMP_DUMPMODE_PRESENT") != nullptr &&
+	    output != nullptr && input != nullptr && input_len > 0 && input_len <= 64) {
+		// sysctlbyname wrapper sub_46db50 does NAME_TO_MIB then OID; the OID is Kyty-local
+		const uint32_t oid[2] = {1, 0x7ffffeb0};
+		const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_CRASHDUMP_DUMPMODE_NAMETOMIB"
+			     " name=kern.crashdump.dumpmode oid=1.0x7ffffeb0 NON_AUTHENTIC env_gated\n");
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 1 && static_cast<uint32_t>(mib[1]) == 0x7ffffeb0 &&
+	    std::getenv("KYTY_DIAGNOSTIC_SYSAV_CRASHDUMP_DUMPMODE_PRESENT") != nullptr &&
+	    output != nullptr && input == nullptr && input_len == 0) {
+		// read twice: pre-fsck gate 0x403af3 wants >0, epilogue 0x403efc wants <=0 to skip RB_HALT.
+		// 1 first, 0 after
+		static int     call_index = 0;
+		const uint32_t dumpmode   = (call_index == 0) ? 1 : 0;
+		const Reply    result =
+		    PublishSysctlValue(output, length, capacity, &dumpmode, sizeof(dumpmode));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_CRASHDUMP_DUMPMODE_PRESENT value=%u call_index=%d"
+			     " NON_AUTHENTIC env_gated_stand_in\n",
+			     dumpmode, call_index);
+			call_index++;
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 1 && mib[1] == 46 && output != nullptr && input == nullptr &&
+	    input_len == 0) {
+		// kern.sdk_version (1.46), 0x13600007 on 13.60
+		const uint32_t system_sdk_version = 0x13600007;
+		const Reply    result = PublishSysctlValue(output, length, capacity, &system_sdk_version,
+		                                           sizeof(system_sdk_version));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSCTL_KERN_SDK_VERSION value=0x%08x\n",
+			     static_cast<unsigned>(system_sdk_version));
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 1 && mib[1] == 38 && output != nullptr && input == nullptr &&
+	    input_len == 0) {
+		const uint32_t ps4_sdk_version = 0x13590001;
+		const Reply    result =
+		    PublishSysctlValue(output, length, capacity, &ps4_sdk_version, sizeof(ps4_sdk_version));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSCTL_KERN_PS4_SDK_VERSION value=0x%08x\n",
+			     static_cast<unsigned>(ps4_sdk_version));
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 7 && mib[1] == 0x8000000cu && output != nullptr &&
+	    input == nullptr && input_len == 0) {
+		// machdep.auto_update_version (7.0x8000000c): zero u32
+		const uint32_t auto_update_version = 0;
+		const Reply    result = PublishSysctlValue(output, length, capacity, &auto_update_version,
+		                                           sizeof(auto_update_version));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSCTL_AUTO_UPDATE_VERSION value=0x%08x\n",
+			     static_cast<unsigned>(auto_update_version));
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 7 && mib[1] == 0x7ffffbecu && output != nullptr &&
+	    input == nullptr && input_len == 0) {
+		// machdep.curr_manumode for sysKernelGetManufacturingMode; 0 on retail
+		const uint32_t manumode = 0;
+		const Reply    result =
+		    PublishSysctlValue(output, length, capacity, &manumode, sizeof(manumode));
+		if (result.value == 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSCTL_CURR_MANUMODE value=0x%08x\n",
+			     static_cast<unsigned>(manumode));
+		}
+		return result;
+	}
+	if (count == 2 && mib[0] == 0 && mib[1] == 3 && input != nullptr && input_len > 0 &&
+	    input_len <= 64) {
+		if (name == "machdep.curr_manumode" && output != nullptr) {
+			const uint32_t oid[2] = {7, 0x7ffffbecu};
+			const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+			if (result.value == 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSCTL_CURR_MANUMODE_NAMETOMIB oid=7.2147482604\n");
+			}
+			return result;
+		}
+		if (name == "kern.sdk_version" && output != nullptr) {
+			const uint32_t oid[2] = {1, 46};
+			const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+			if (result.value == 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSCTL_KERN_SDK_VERSION_NAMETOMIB oid=1.46\n");
+			}
+			return result;
+		}
+		if (name == "kern.ps4_sdk_version" && output != nullptr) {
+			const uint32_t oid[2] = {1, 38};
+			const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+			if (result.value == 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSCTL_KERN_PS4_SDK_VERSION_NAMETOMIB oid=1.38\n");
+			}
+			return result;
+		}
+		if (name == "machdep.auto_update_version" && output != nullptr) {
+			const uint32_t oid[2] = {7, 0x8000000cu};
+			const Reply    result = PublishSysctlValue(output, length, capacity, oid, sizeof(oid));
+			if (result.value == 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSCTL_AUTO_UPDATE_VERSION_NAMETOMIB oid=7.2147483596\n");
+			}
+			return result;
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_UNAVAILABLE_NATIVE_SYSCTL_NAME"
+		     " name=%s result=ENOENT\n",
+		     name.c_str());
+		return {-1, Libs::Posix::POSIX_ENOENT};
+	}
+	if (count != 2 || !((mib[0] == 9 && mib[1] == 20) || (mib[0] == 6 && mib[1] == 7)) ||
+	    input != nullptr || input_len != 0) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1) < 32) {
+			LOGF("FIRST_FRAME_AUDIT SYSCTL_UNMODELED reason=no_provider namelen=%u mib=%d.%d.%d.%d "
+			     "op=%s out_capacity=%" PRIu64 " new_len=%" PRIu64
+			     " caller_pid=%d caller_tid=%d result=EINVAL\n",
+			     count, mib[0], mib[1], mib[2], mib[3],
+			     input != nullptr    ? "write"
+			     : output != nullptr ? "read"
+			                         : "size",
+			     capacity, new_len, LibKernel::Process::GetPid(), LibKernel::PthreadGetthreadid());
+		}
+		return {LibKernel::KERNEL_ERROR_EINVAL, 0};
+	}
+	const int32_t page_size = static_cast<int32_t>(kGuestPageSize);
+	return PublishSysctlValue(output, length, capacity, &page_size, sizeof(page_size));
 }
 
 Reply SysAvOriginalVirtualQuery(const SyscallRequest& request) {
@@ -4708,7 +4870,56 @@ Reply SysAvGuestSocketSelect(const SyscallRequest& request) {
 	return {ready, 0};
 }
 
+Reply SysAvGuestSocketRecvfrom(const SyscallRequest& request) {
+	if (request.args[0] > INT32_MAX || request.args[4] != 0 || request.args[5] != 0 ||
+	    !LibKernel::FileSystem::PinGuestSocketReadSource(static_cast<int>(request.args[0]))) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	if (request.args[2] > INT64_MAX) return {-1, Libs::Posix::POSIX_EINVAL};
+	const auto length = static_cast<size_t>(std::min<uint64_t>(request.args[2], 65536));
+	auto*      output = reinterpret_cast<void*>(request.args[1]);
+	if (!LibKernel::Memory::CanWriteGuest(output, length)) return {-1, Libs::Posix::POSIX_EFAULT};
+	std::vector<uint8_t> buffer(length);
+	const auto           received =
+	    LibKernel::FileSystem::RecvGuestSocket(static_cast<int>(request.args[0]), buffer.data(),
+		                                       length, static_cast<int>(request.args[3]));
+	if (received < 0) return {-1, LibKernel::KernelToPosix(static_cast<int>(received))};
+	if (received != 0 && !LibKernel::Memory::CopyToGuest(output, buffer.data(), received)) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1) < 32) {
+		LOGF("FIRST_FRAME_AUDIT SYSAV_GUEST_SOCKET_RECVFROM fd=%" PRIu64 " requested=%" PRIu64
+		     " received=%" PRId64 "\n",
+		     request.args[0], request.args[2], received);
+	}
+	return {received, 0};
+}
 
+Reply SysAvGuestSocketSendto(const SyscallRequest& request) {
+	if (request.args[0] > INT32_MAX || request.args[4] != 0 || request.args[5] != 0 ||
+	    !LibKernel::FileSystem::PinGuestSocketReadSource(static_cast<int>(request.args[0]))) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	if (request.args[2] > INT64_MAX) return {-1, Libs::Posix::POSIX_EINVAL};
+	const auto           length = static_cast<size_t>(std::min<uint64_t>(request.args[2], 65536));
+	std::vector<uint8_t> buffer(length);
+	if (!LibKernel::Memory::CopyFromGuest(buffer.data(),
+	                                      reinterpret_cast<const void*>(request.args[1]), length)) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	const auto sent =
+	    LibKernel::FileSystem::SendGuestSocket(static_cast<int>(request.args[0]), buffer.data(),
+		                                       length, static_cast<int>(request.args[3]));
+	if (sent < 0) return {-1, LibKernel::KernelToPosix(static_cast<int>(sent))};
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1) < 32) {
+		LOGF("FIRST_FRAME_AUDIT SYSAV_GUEST_SOCKET_SENDTO fd=%" PRIu64 " requested=%" PRIu64
+		     " sent=%" PRId64 " flags=0x%" PRIx64 "\n",
+		     request.args[0], request.args[2], sent, request.args[3]);
+	}
+	return {sent, 0};
+}
 
 
 Reply SysAvEmptyMprotect(const SyscallRequest& request) {
@@ -5446,6 +5657,144 @@ Reply DispatchSyscall(const SyscallRequest& request) {
 			}
 		}
 	}
+	switch (request.number) {
+		case 0x01:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_LIVE_RFORK") != nullptr &&
+			    LibKernel::Process::IsTrackedRforkChild(LibKernel::Process::GetPid()) &&
+			    !LibKernel::Process::IsExecChild()) {
+				LOGF("MINI_RFORK_CHILD_EXIT pid=%d status=%u\n", LibKernel::Process::GetPid(),
+				     static_cast<unsigned>(request.args[0] & 0xffu));
+				LibKernel::PthreadExit(reinterpret_cast<void*>(request.args[0]));
+			}
+			if (LibKernel::Process::IsExecChild()) {
+				const auto code = static_cast<uint32_t>(request.args[0]) & 0xffu;
+				LibKernel::Process::RecordExecChildExitStatus(code << 8);
+				std::fflush(nullptr);
+				std::quick_exit(static_cast<int>(code));
+			}
+			break;
+		case 0x04:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr &&
+			    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr) {
+				result = MiniSyscoreWrite(request);
+			}
+			break;
+		case 0x87:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr) {
+				result = MiniSyscoreSocketpair(request);
+			}
+			break;
+		case 0x5a:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr) {
+				if (request.args[0] > INT32_MAX || request.args[1] > INT32_MAX) {
+					result = {-1, Libs::Posix::POSIX_EBADF};
+				} else {
+					const int rc = LibKernel::FileSystem::KernelDup2(
+					    static_cast<int>(request.args[0]), static_cast<int>(request.args[1]));
+					result = rc >= 0 ? Reply {rc, 0} : Reply {-1, LibKernel::KernelToPosix(rc)};
+				}
+			}
+			break;
+		case 0x21a:
+			result = UseNativeEventFlags() ? NativeEventFlagOperation(request)
+			                               : SysAvCreateOriginalAvEventFlag(request);
+			break;
+		case 0x21b:
+		case 0x221:
+			if (UseNativeEventFlags()) result = NativeEventFlagOperation(request);
+			break;
+		case 0x225:
+		case 0x226:
+		case 0x227:
+		case 0x228:
+		case 0x229:
+		case 0x22b:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr) {
+				result = MiniSyscoreSemaphore(request);
+			}
+			break;
+		case 0x21c:
+			result = UseNativeEventFlags() ? NativeEventFlagOperation(request)
+			                               : SysAvOpenOriginalBootStatusFlag(request);
+			break;
+		case 0x21d:
+			result = UseNativeEventFlags() ? NativeEventFlagOperation(request)
+			                               : SysAvCloseOriginalEventFlag(request);
+			break;
+		case 0x21e:
+			result = UseNativeEventFlags() ? NativeEventFlagOperation(request)
+			                               : SysAvWaitOriginalAvEventFlag(request);
+			break;
+		case 0x21f:
+			result = UseNativeEventFlags() ? NativeEventFlagOperation(request)
+			                               : SysAvPollOriginalBootEventFlag(request);
+			break;
+		case 0x220:
+			result = UseNativeEventFlags() ? NativeEventFlagOperation(request)
+			                               : SysAvSetOriginalAvEventFlag(request);
+			break;
+		case 0x24a: result = SysAvDmemContainer(request); break;
+		case 0x28d: result = SysAvBlockpoolOpen(request); break;
+		case 0x36: result = SysAvDceIoctl(request); break;
+		case 0x37: {
+			uint32_t kind      = 3;
+			uint32_t exit_code = 1;
+			LibKernel::Process::ClassifyMiniSyscoreRebootOptions(request.args[0], &kind,
+			                                                     &exit_code);
+			LOGF("MINI_SYSCORE_REBOOT_CLASSIFY pid=%d options=0x%016" PRIx64
+			     " kind=%u exit_code=%u is_exec_child=%u site=bridge\n",
+			     LibKernel::Process::GetPid(), request.args[0], kind, exit_code,
+			     LibKernel::Process::IsExecChild() ? 1u : 0u);
+			if (std::getenv("KYTY_DIAGNOSTIC_REBOOT_SESSION_EXIT") != nullptr) {
+				LOGF("GUEST_REBOOT_SESSION_BOUNDARY_REQUESTED guest_pid=%d options=0x%016" PRIx64
+				     " kind=%u exit_code=%u bridge_return_unused=1\n",
+				     LibKernel::Process::GetPid(), request.args[0], kind, exit_code);
+			} else {
+				LOGF("GUEST_REBOOT_UNSUPPORTED guest_pid=%d options=0x%016" PRIx64
+				     " kind=%u result=ENOSYS session_reset=0\n",
+				     LibKernel::Process::GetPid(), request.args[0], kind);
+			}
+			break;
+		}
+		case 0xca: result = SysctlPageSize(request); break;
+		case 0x3b:
+			if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_EXECVE_AUDIT") != nullptr ||
+			    std::getenv("KYTY_DIAGNOSTIC_GUEST_EXECVE") != nullptr) {
+				result = PreflightSyscoreExecve(request);
+				if (result.value == 0) LibKernel::PthreadRequestRetireRforkChildForExec();
+			}
+			break;
+		case 0x3a: result = ReadlinkSyscall(request); break;
+		case 0x21: result = AccessGuestPath(request); break;
+		case 0x214: result = RegMgrCall(request); break;
+		case 0x25a: result = RandomizedPath(request); break;
+		// must match the getpid export, libkernel feeds it into sysctl {1,14,x,pid}
+		case 0x14: result = {LibKernel::Process::GetPid(), 0}; break;
+		case 0x17a: result = NativeNmount(request); break;
+		case 0x1db: result = MiniSyscorePread(request); break;
+		case 0x1dc: result = NativePwrite(request); break;
+		case 0x1dd: result = NativeAnonymousMmap(request); break;
+		case 0x2d5: result = AudiodExtendedMmap(request); break;
+		case 0x23c: result = SysAvOriginalVirtualQuery(request); break;
+		case 0x24c:
+			result =
+			    request.args[1] == 0x2000      ? SysAvNameOriginalSharedMemory(request)
+				: request.args[1] == 0x6000000 ? SysAvNameScaninBuffer(request)
+				: (request.args[1] == 0x4000 && SysAvGuestNameIs(request.args[2], "/SceAo2TVCorP"))
+			        ? SysAvNameAudioSharedMemory(request)
+			        : SysAvNameStackGuard(request);
+			break;
+		case 0x5d: result = SysAvGuestSocketSelect(request); break;
+		case 0x1d: result = SysAvGuestSocketRecvfrom(request); break;
+		case 0x85: result = SysAvGuestSocketSendto(request); break;
+		case 0x49: result = SysAvNativeMunmap(request); break;
+		case 0x145: result = SysAvNativeMunlockAll(request); break;
+		case 0x4a: result = SysAvEmptyMprotect(request); break;
+		case 0x22d:
+		case 0x22e: result = NamedObject(request); break;
+		// TODO: an instruction trap would also have to set the PS5 return status/CF
+		default: break;
+	}
 	static std::atomic<uint32_t> traces {0};
 	if (traces.fetch_add(1) < 32) {
 		LOGF("PS5_SYSCALL_BACKEND number=0x%016" PRIx64 " result=0x%016" PRIx64 " supported=%d\n",
@@ -5633,6 +5982,33 @@ bool RunSelfTests() {
 		const Reply absent_event  = NativeEventFlagOperation({0x21c, {event_name}});
 		const Reply created_event = NativeEventFlagOperation({0x21a, {event_name, 0x121, 0}});
 		const Reply opened_event  = NativeEventFlagOperation({0x21c, {event_name}});
+		if (created_event.value > 0 && opened_event.value > 0) {
+			const auto  creator = static_cast<uint64_t>(created_event.value);
+			const auto  alias   = static_cast<uint64_t>(opened_event.value);
+			const Reply zero    = NativeEventFlagOperation({0x21f, {alias, 2, 1, event_pattern}});
+			const bool  initial_zero = zero.value == -1 &&
+			                           zero.posix_errno == Libs::Posix::POSIX_EBUSY &&
+			                           *reinterpret_cast<uint64_t*>(event_pattern) == 0;
+			const Reply signaled     = NativeEventFlagOperation({0x220, {creator, 2}});
+			const Reply filled    = NativeEventFlagOperation({0x21f, {alias, 2, 1, event_pattern}});
+			const Reply duplicate = NativeEventFlagOperation({0x21a, {event_name, 0x121, 0}});
+			const Reply retained  = NativeEventFlagOperation({0x21f, {alias, 2, 1, event_pattern}});
+			const bool  actual_signal =
+			    signaled.value == 0 && filled.value == 0 && duplicate.value == -1 &&
+			    duplicate.posix_errno == Libs::Posix::POSIX_EEXIST && retained.value == 0 &&
+			    *reinterpret_cast<uint64_t*>(event_pattern) == 2;
+			const Reply cleared = NativeEventFlagOperation({0x221, {creator, ~uint64_t(2)}});
+			const Reply empty   = NativeEventFlagOperation({0x21f, {alias, 2, 1, event_pattern}});
+			const Reply closed  = NativeEventFlagOperation({0x21d, {alias}});
+			const Reply deleted = NativeEventFlagOperation({0x21b, {creator}});
+			const Reply stale   = NativeEventFlagOperation({0x220, {creator, 2}});
+			event_flag_passed =
+			    absent_event.value == -1 && absent_event.posix_errno == Libs::Posix::POSIX_ESRCH &&
+			    initial_zero && actual_signal && cleared.value == 0 && empty.value == -1 &&
+			    empty.posix_errno == Libs::Posix::POSIX_EBUSY && closed.value == 0 &&
+			    deleted.value == 0 && stale.value == -1 &&
+			    stale.posix_errno == Libs::Posix::POSIX_ESRCH;
+		}
 		std::memset(mutex_object, 0, 80);
 		const Reply opaque_mutex = NativeNamedObjectOperation(
 		    {0x22d, {reinterpret_cast<uint64_t>(mutex_name), UINT64_MAX, 0x101}});
@@ -5778,6 +6154,64 @@ bool RunSelfTests() {
 		                        reinterpret_cast<uint64_t>(socket_output), kGuestPageSize) == 0 &&
 		                    socketpair_passed;
 	}
+	LOGF("MINI_NATIVE_SOCKETPAIR_SELFTEST %s\n", socketpair_passed ? "PASS" : "FAIL");
+	LOGF("NATIVE_EVENTFLAG_SELFTEST %s absent_name=1 initial_zero=1 set=1 clear=1 stale_handle=1\n",
+	     event_flag_passed ? "PASS" : "FAIL");
+	LOGF("MINI_NATIVE_NAMED_MUTEX_SELFTEST %s opaque_object_retained=1 wrong_type_rejected=1 "
+	     "stale_id_rejected=1\n",
+	     named_mutex_passed ? "PASS" : "FAIL");
+	LOGF("MINI_NATIVE_PROC_EVENT_SELFTEST %s empty_poll=1 recorded_exit=1 status_preserved=1 "
+	     "reaped_record_removed=1\n",
+	     proc_event_passed ? "PASS" : "FAIL");
+	LOGF("MINI_NATIVE_OPEN_MODE_SELFTEST %s noncreate_mode_ignored=1 "
+	     "absent_file_errno_preserved=1\n",
+	     ignored_open_mode_passed ? "PASS" : "FAIL");
+	LOGF("MINI_NATIVE_SEMA_SELFTEST %s strict_absent_name=1 zero_count_wait=1 signal=1 "
+	     "alias_close=1 owner_isolation=1\n",
+	     sema_passed ? "PASS" : "FAIL");
+	bool execve_invalid_arguments_passed = true;
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_EXECVE_AUDIT") != nullptr) {
+		const Reply null_execve         = DispatchSyscall({0x3b, {}});
+		const Reply invalid_execve      = DispatchSyscall({0x3b, {UINT64_MAX}});
+		execve_invalid_arguments_passed = null_execve.value == LibKernel::KERNEL_ERROR_EFAULT &&
+		                                  invalid_execve.value == LibKernel::KERNEL_ERROR_EFAULT;
+		LOGF("SYSCORE_GUEST_EXECVE_INVALID_INPUT_SELFTEST %s"
+		     " null_path=%016" PRIx64 " invalid_path=%016" PRIx64 " no_guest_image_changed\n",
+		     execve_invalid_arguments_passed ? "PASS" : "FAIL",
+		     static_cast<uint64_t>(null_execve.value), static_cast<uint64_t>(invalid_execve.value));
+	}
+	bool peer_flag_passed = true;
+	if (const auto* name = std::getenv("KYTY_DIAGNOSTIC_NATIVE_EVENTFLAG_PEER_SELFTEST")) {
+		LibKernel::EventFlag::KernelEventFlag flag = nullptr;
+		const int opened = LibKernel::EventFlag::KernelOpenExistingEventFlag(&flag, name);
+		uint64_t  bits   = UINT64_MAX;
+		const int polled =
+		    opened == 0 ? LibKernel::EventFlag::KernelPollEventFlag(flag, 2, 1, &bits) : opened;
+		const int closed = opened == 0 ? LibKernel::EventFlag::KernelCloseEventFlag(flag) : opened;
+		peer_flag_passed =
+		    opened == 0 && polled == LibKernel::KERNEL_ERROR_EBUSY && bits == 0 && closed == 0;
+		LOGF("NATIVE_EVENTFLAG_PEER_SELFTEST %s name=%s actual=0x%llx no_bits_changed=1\n",
+		     peer_flag_passed ? "PASS" : "FAIL", name, static_cast<unsigned long long>(bits));
+		Log::Flush();
+	}
+	const bool passed =
+	    page.value == 0x4000 && page.posix_errno == 0 && bad_page.value == -1 &&
+	    bad_page.posix_errno == Libs::Posix::POSIX_EINVAL &&
+	    bad_map.value == LibKernel::KERNEL_ERROR_EINVAL && bad_map.posix_errno == 0 &&
+	    bad_link.value == -1 && bad_link.posix_errno == Libs::Posix::POSIX_EFAULT &&
+	    unknown.value == LibKernel::KERNEL_ERROR_ENOSYS && unknown.posix_errno == 0 &&
+	    size_query.value == 0 && output == 0x4000 && length == sizeof(int32_t) &&
+	    unknown_syscall.value == LibKernel::KERNEL_ERROR_ENOSYS && null_readlink.value == -1 &&
+	    null_readlink.posix_errno == Libs::Posix::POSIX_EFAULT &&
+	    null_access.value == LibKernel::KERNEL_ERROR_EFAULT && null_mini_open.value == -1 &&
+	    null_mini_open.posix_errno == Libs::Posix::POSIX_EFAULT && invalid_mini_open.value == -1 &&
+	    invalid_mini_open.posix_errno == Libs::Posix::POSIX_EFAULT && null_socketpair.value == -1 &&
+	    null_socketpair.posix_errno == Libs::Posix::POSIX_EFAULT && socketpair_passed &&
+	    sema_passed && named_mutex_passed && event_flag_passed && proc_event_passed &&
+	    ignored_open_mode_passed && execve_invalid_arguments_passed && peer_flag_passed &&
+	    extended_app_passed && app_buffer_passed;
+	LOGF("PS5_NATIVE_KERNEL_BRIDGE_SELFTEST %s\n", passed ? "PASS" : "FAIL");
+	return passed;
 }
 
 } // namespace Libs::NativeKernelBridge

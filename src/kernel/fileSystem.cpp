@@ -1531,7 +1531,25 @@ static int ReferenceGuestPipe(const std::shared_ptr<GuestPipe>& pipe, bool read,
 	return OK;
 }
 
+static void CloseGuestSocketReadSource(File* file) {
+	if (const auto source = file->socket_read_source) {
+		std::lock_guard lock(source->mutex);
+		source->closed = true;
+		source->pipe.reset();
+	}
+}
 
+static void ReleaseSocketEndpoint(File* file) {
+	CloseGuestSocketReadSource(file);
+	if (file->pipe) {
+		ReferenceGuestPipe(file->pipe, true, -1);
+	}
+	if (file->socket_send) {
+		ReferenceGuestPipe(file->socket_send, false, -1);
+	}
+	file->pipe.reset();
+	file->socket_send.reset();
+}
 
 static int64_t ReadGuestPipe(const std::shared_ptr<GuestPipe>& pipe, void* buf, size_t size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2808,6 +2826,7 @@ void FileDescriptors::DeleteDescriptor(int d) {
 	m_files[index]->f.Close();
 #endif
 
+	CloseGuestSocketReadSource(m_files[index]);
 	delete m_files[index];
 	m_files[index] = nullptr;
 }
@@ -3844,6 +3863,34 @@ void EmergencyShutdown() {
 
 void Shutdown() {
 	EmergencyShutdown();
+	ReleasePsmShellUiApplicationLeases();
+	{
+		std::lock_guard lock(g_lvd_mutex);
+		g_lvd_devices.clear();
+	}
+	{
+		std::lock_guard lock(g_sector_payload_mutex);
+		g_sector_payloads.clear();
+	}
+	{
+		std::lock_guard standard_lock(g_standard_pipe_mutex);
+		for (auto& p: g_standard_pipes) {
+			if (p) {
+				std::lock_guard lock(p->mutex);
+				const auto      index = static_cast<size_t>(&p - &g_standard_pipes[0]);
+				if (g_standard_pipe_types[index] == SpecialFile::PipeRead && p->readers != 0) {
+					--p->readers;
+				} else if (g_standard_pipe_types[index] == SpecialFile::PipeWrite &&
+				           p->writers != 0) {
+					--p->writers;
+				}
+				p->cv.notify_all();
+				p.reset();
+				g_standard_pipe_types[index] = SpecialFile::None;
+			}
+		}
+	}
+	g_diagnostic_gc_device_ready = false;
 	delete g_files;
 	delete g_mount_points;
 	Tmpfs::Shutdown();
@@ -6311,6 +6358,93 @@ int KYTY_SYSV_ABI KernelPipe(int* fds) {
 
 int KYTY_SYSV_ABI KernelDup2(int oldd, int newd) {
 	PRINT_NAME();
+	if (std::getenv("KYTY_DIAGNOSTIC_PIPE_DESCRIPTOR") != nullptr) {
+		auto* old_file = oldd >= DESCRIPTOR_MIN ? g_files->GetFile(oldd) : nullptr;
+		auto* new_file = newd >= DESCRIPTOR_MIN ? g_files->GetFile(newd) : nullptr;
+		LOGF("FIRST_FRAME_AUDIT PIPE_DUP2 input old=%d new=%d old_registered=%d"
+		     " old_open=%d old_type=%d new_registered=%d new_open=%d new_type=%d\n",
+		     oldd, newd, old_file != nullptr, old_file != nullptr && old_file->opened,
+		     old_file != nullptr ? static_cast<int>(old_file->special) : -1, new_file != nullptr,
+		     new_file != nullptr && new_file->opened,
+		     new_file != nullptr ? static_cast<int>(new_file->special) : -1);
+	}
+
+	if (oldd < 0 || newd < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (oldd >= DESCRIPTOR_MIN) {
+		auto* file = g_files->GetFile(oldd);
+		if (file == nullptr || !file->opened) {
+			return KERNEL_ERROR_EBADF;
+		}
+	} else if (oldd > 2 ||
+	           (g_files->HasExplicitStandardTable() && !g_files->HasStandardDeci(oldd))) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (oldd == newd) {
+		if (oldd < DESCRIPTOR_MIN && g_files->HasExplicitStandardTable() &&
+		    !g_files->HasStandardDeci(oldd)) {
+			return KERNEL_ERROR_EBADF;
+		}
+		return newd;
+	}
+	if (IsTmpfsDescriptor(oldd)) return KERNEL_ERROR_ENOTSUP;
+	if (IsSectorPayloadDescriptor(oldd) || IsIccnvs4SnapshotDescriptor(oldd))
+		return KERNEL_ERROR_ENOTSUP;
+
+	if (newd <= 2) {
+		const bool console_source = oldd < DESCRIPTOR_MIN
+		                                ? g_files->HasStandardConsole(oldd)
+		                                : g_files->GetFile(oldd)->special == SpecialFile::Console;
+		if (console_source) {
+			g_files->BindStandardConsole(newd);
+			LOGF("SCOPED_CONSOLE_DUP2 pid=%d source=%d target=%d host_stdio=1\n", Process::GetPid(),
+			     oldd, newd);
+			return newd;
+		}
+		if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr &&
+		    (g_files->HasExplicitStandardTable() || oldd < DESCRIPTOR_MIN ||
+		     !g_files->GetFile(oldd)->pipe)) {
+			return KERNEL_ERROR_ENOSYS;
+		}
+		if (oldd >= DESCRIPTOR_MIN) {
+			auto* file = g_files->GetFile(oldd);
+			if (file->special == SpecialFile::GuestSocketPair) {
+				return KERNEL_ERROR_ENOSYS;
+			}
+			if (file->pipe) {
+				std::lock_guard standard_lock(g_standard_pipe_mutex);
+				auto&           destination = g_standard_pipes[newd];
+				if (destination) {
+					std::lock_guard prior_lock(destination->mutex);
+					if (g_standard_pipe_types[newd] == SpecialFile::PipeRead &&
+					    destination->readers != 0) {
+						--destination->readers;
+					} else if (g_standard_pipe_types[newd] == SpecialFile::PipeWrite &&
+					           destination->writers != 0) {
+						--destination->writers;
+					}
+					destination->cv.notify_all();
+				}
+				destination                 = file->pipe;
+				g_standard_pipe_types[newd] = file->special;
+				std::lock_guard pipe_lock(destination->mutex);
+				if (file->special == SpecialFile::PipeRead) {
+					++destination->readers;
+				} else {
+					++destination->writers;
+				}
+				LOGF("GUEST_PIPE_DUP2 source=%d target=%d role=%s\n", oldd, newd,
+				     file->special == SpecialFile::PipeRead ? "read" : "write");
+			}
+		}
+		LOGF("\tdup2: %d -> %d\n", oldd, newd);
+		return newd;
+	}
+
+	return KERNEL_ERROR_EINVAL;
 }
 
 // Windows-only. Guest ranges must be committed before memcpy or a VideoOut flip
@@ -7688,6 +7822,51 @@ static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {
 	}
 
 	EXIT_IF(!file->opened);
+	if (file->exfat) {
+		if (file->directory) {
+			if (nbytes > INT_MAX) return KERNEL_ERROR_EINVAL;
+			return KernelGetdirentries(d, static_cast<char*>(buf), static_cast<int>(nbytes),
+			                           nullptr);
+		}
+		return TransferExfat(file, buf, nbytes, 0, true);
+	}
+	if (file->bfs) {
+		if (file->directory) {
+			if (nbytes > INT_MAX) return KERNEL_ERROR_EINVAL;
+			return KernelGetdirentries(d, static_cast<char*>(buf), static_cast<int>(nbytes),
+			                           nullptr);
+		}
+		return TransferBfs(file, buf, nbytes, 0, true);
+	}
+	if (file->passthrough) {
+		if (file->directory) {
+			if (nbytes > INT_MAX) return KERNEL_ERROR_EINVAL;
+			return KernelGetdirentries(d, static_cast<char*>(buf), static_cast<int>(nbytes),
+			                           nullptr);
+		}
+		return TransferPassthrough(file, buf, nbytes, 0, true);
+	}
+	if (file->tmpfs) {
+		if (file->directory) {
+			if (nbytes > INT_MAX) return KERNEL_ERROR_EINVAL;
+			return KernelGetdirentries(d, static_cast<char*>(buf), static_cast<int>(nbytes),
+			                           nullptr);
+		}
+		return TransferTmpfs(file, buf, nbytes, 0, true, false);
+	}
+	if (file->iccnvs4_snapshot) return TransferIccnvs4Snapshot(file, buf, nbytes, 0, true, false);
+	if (file->sector_backing) {
+		Common::LockGuard lock(file->mutex);
+		const auto result = TransferSectorPayload(file, file->sector_position, buf, nbytes, false);
+		if (result >= 0) file->sector_position += static_cast<uint64_t>(result);
+		return result;
+	}
+	if (file->lvd) {
+		Common::LockGuard lock(file->mutex);
+		const auto result = TransferLvd(file->lvd, buf, nbytes, file->sector_position, false);
+		if (result >= 0) file->sector_position += static_cast<uint64_t>(result);
+		return result;
+	}
 
 	if (nbytes > INT_MAX) {
 		return KERNEL_ERROR_EINVAL;
@@ -7700,6 +7879,17 @@ static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {
 		return static_cast<int64_t>(bytes);
 	}
 
+	if (file->special == SpecialFile::DeciStdin) {
+		if (!file->readable) {
+			return KERNEL_ERROR_EBADF;
+		}
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), nbytes);
+		const size_t actual = std::fread(buf, 1, nbytes, stdin);
+		return std::ferror(stdin) != 0 ? KERNEL_ERROR_EIO : static_cast<int64_t>(actual);
+	}
+	if (file->special == SpecialFile::DeciStdout || file->special == SpecialFile::DeciStderr) {
+		return KERNEL_ERROR_EBADF;
+	}
 	if (file->special == SpecialFile::Random) {
 		FillRandomBuffer(buf, nbytes);
 
@@ -7709,23 +7899,18 @@ static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {
 		return static_cast<int64_t>(nbytes);
 	}
 
-	file->mutex.Lock();
-
-	bool       is_invalid = file->f.IsInvalid();
+	if (!file->readable) return KERNEL_ERROR_EBADF;
+	Common::LockGuard lock(file->mutex);
+	if (file->f.IsInvalid()) return KERNEL_ERROR_EIO;
 	const auto pos        = file->f.Tell();
 	const auto file_size  = file->f.Size();
 	const auto remaining  = pos < file_size ? file_size - pos : 0;
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
-	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
-
-	file->mutex.Unlock();
-
-	if (is_invalid) {
-		LOGF("\tfile is invalid\n");
-		return KERNEL_ERROR_EIO;
-	}
+	std::error_code host_error;
+	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read, &host_error);
+	if (host_error && read_error != nullptr) *read_error = KERNEL_ERROR_EIO;
 
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
 
@@ -7754,6 +7939,30 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
+	if (g_files != nullptr &&
+	    (g_files->HasStandardConsole(d) || ((d == 1 || d == 2) && g_files->HasStandardDeci(d)))) {
+		FILE*        stream = g_files->HasStandardConsole(d) || d == 1 ? stdout : stderr;
+		const size_t bytes  = std::fwrite(buf, 1, nbytes, stream);
+		return bytes == nbytes && std::fflush(stream) == 0 ? static_cast<int64_t>(bytes)
+		                                                   : KERNEL_ERROR_EIO;
+	}
+	if (d < DESCRIPTOR_MIN && g_files != nullptr && g_files->HasExplicitStandardTable()) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (d == 1 || d == 2) {
+		std::shared_ptr<GuestPipe> pipe;
+		SpecialFile                role;
+		{
+			std::lock_guard lock(g_standard_pipe_mutex);
+			pipe = g_standard_pipes[d];
+			role = g_standard_pipe_types[d];
+		}
+		if (pipe) {
+			return role == SpecialFile::PipeWrite ? WriteGuestPipe(pipe, buf, nbytes)
+			                                      : KERNEL_ERROR_EBADF;
+		}
+	}
+
 	if (d == 1 || d == 2) {
 		auto*      out      = (d == 1 ? stdout : stderr);
 		const auto written  = std::fwrite(buf, 1, nbytes, out);
@@ -7780,6 +7989,65 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
+	if (file->tmpfs) return TransferTmpfs(file, const_cast<void*>(buf), nbytes, 0, true, true);
+	if (file->passthrough) return WritePassthrough(file, buf, nbytes, 0, true);
+	if (file->iccnvs4_snapshot)
+		return TransferIccnvs4Snapshot(file, const_cast<void*>(buf), nbytes, 0, true, true);
+	if (file->sector_backing) {
+		Common::LockGuard lock(file->mutex);
+		const auto        result = TransferSectorPayload(file, file->sector_position,
+		                                                 const_cast<void*>(buf), nbytes, true);
+		if (result >= 0) file->sector_position += static_cast<uint64_t>(result);
+		return result;
+	}
+	if (file->lvd) {
+		Common::LockGuard lock(file->mutex);
+		const auto        result =
+		    TransferLvd(file->lvd, const_cast<void*>(buf), nbytes, file->sector_position, true);
+		if (result >= 0) file->sector_position += static_cast<uint64_t>(result);
+		return result;
+	}
+
+	if (file->special == SpecialFile::DeciStdin) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (file->special == SpecialFile::DeciStdout || file->special == SpecialFile::DeciStderr) {
+		FILE*      stream = file->special == SpecialFile::DeciStderr ? stderr : stdout;
+		const auto actual = std::fwrite(buf, 1, nbytes, stream);
+		return (actual == nbytes && std::fflush(stream) == 0) ? static_cast<int64_t>(actual)
+		                                                      : KERNEL_ERROR_EIO;
+	}
+	if (file->special == SpecialFile::Console) {
+		const auto written  = std::fwrite(buf, 1, nbytes, stdout);
+		const auto flush_ok = std::fflush(stdout) == 0;
+		return written == nbytes && flush_ok ? static_cast<int64_t>(written) : KERNEL_ERROR_EIO;
+	}
+	if (file->special == SpecialFile::PipeWrite) {
+		return WriteGuestPipe(file->pipe, buf, nbytes);
+	}
+	if (file->special == SpecialFile::PipeRead) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (file->special == SpecialFile::GuestSocketPair) {
+		return WriteGuestPipe(file->socket_send, buf, nbytes);
+	}
+	if (file->special == SpecialFile::NativeS3da) {
+		return KERNEL_ERROR_ENOSYS;
+	}
+	if (file->special == SpecialFile::NativeMetadbg) return KERNEL_ERROR_ENODEV;
+	if (file->special == SpecialFile::NativeSystemMbus) {
+		if (!file->writable) return KERNEL_ERROR_EBADF;
+		if (nbytes < 80) return KERNEL_ERROR_EWOULDBLOCK;
+		std::array<uint8_t, 80> bytes {};
+		if (!Memory::CopyFromGuest(bytes.data(), buf, bytes.size())) return KERNEL_ERROR_EFAULT;
+		return KERNEL_ERROR_ENOSYS;
+	}
+	if (file->special == SpecialFile::NativeMbus || file->special == SpecialFile::NativeAvDevice) {
+		return KERNEL_ERROR_ENOSYS;
+	}
+	// devctl_cdevsw has no d_write, so the devfs default answers ENODEV.
+	if (file->special == SpecialFile::Devctl)
+		return file->writable ? KERNEL_ERROR_ENODEV : KERNEL_ERROR_EBADF;
 
 	EXIT_NOT_IMPLEMENTED(file->directory);
 	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
@@ -7819,6 +8087,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	if (::Libs::Network::Net::IsSocket(d)) return KERNEL_ERROR_ESPIPE;
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr || !file->opened || !file->readable) {
@@ -7844,11 +8113,24 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		return file->readable ? KERNEL_ERROR_ENOSYS : KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
-
-	EXIT_IF(!file->opened);
-
-	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
+	if (file->directory) return KERNEL_ERROR_EISDIR;
+	if (nbytes > UINT_MAX) return KERNEL_ERROR_EINVAL;
+	switch (file->special) {
+		case SpecialFile::PipeRead:
+		case SpecialFile::PipeWrite:
+		case SpecialFile::GuestSocketPair:
+		case SpecialFile::Console:
+		case SpecialFile::DeciStdin:
+		case SpecialFile::DeciStdout:
+		case SpecialFile::DeciStderr:
+		case SpecialFile::NativeKqueue:
+		case SpecialFile::NativeEqueueDescriptor: return KERNEL_ERROR_ESPIPE;
+		case SpecialFile::None:
+		case SpecialFile::Random: break;
+		default: return KERNEL_ERROR_ENOTSUP;
+	}
+	if (!GuestSocketBufferAccessible(buf, nbytes, true)) return KERNEL_ERROR_EFAULT;
+	if (nbytes == 0) return 0;
 
 	if (file->special == SpecialFile::Random) {
 		FillRandomBuffer(buf, nbytes);
@@ -7992,6 +8274,26 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 	    file->passthrough)
 		return KERNEL_ERROR_ENOTSUP;
 
+	switch (file->special) {
+		case SpecialFile::PipeRead:
+		case SpecialFile::PipeWrite:
+		case SpecialFile::GuestSocketPair:
+		case SpecialFile::Console:
+		case SpecialFile::DeciStdin:
+		case SpecialFile::DeciStdout:
+		case SpecialFile::DeciStderr:
+		case SpecialFile::NativeKqueue:
+		case SpecialFile::NativeEqueueDescriptor:
+		case SpecialFile::NativeMbus:
+		case SpecialFile::NativeSystemMbus:
+		case SpecialFile::NativeAvDevice: return KERNEL_ERROR_ESPIPE;
+		default: break;
+	}
+	for (const auto& buffer: buffers) {
+		if (!GuestSocketBufferAccessible(buffer.iov_base, buffer.iov_len, true)) {
+			return KERNEL_ERROR_EFAULT;
+		}
+	}
 	Common::LockGuard lock(file->mutex);
 	if (file->directory) {
 		return KERNEL_ERROR_EISDIR;
@@ -8061,6 +8363,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	if (offset < 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
+	if (::Libs::Network::Net::IsSocket(d)) return KERNEL_ERROR_ESPIPE;
 
 	auto* file = g_files->GetFile(d);
 
@@ -8086,8 +8389,20 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	}
 	if (file->special == SpecialFile::NativeMetadbg) return KERNEL_ERROR_ENODEV;
 
-	EXIT_NOT_IMPLEMENTED(file->directory);
-	EXIT_NOT_IMPLEMENTED(file->special != SpecialFile::None);
+	if (file->directory) return KERNEL_ERROR_EISDIR;
+	switch (file->special) {
+		case SpecialFile::PipeRead:
+		case SpecialFile::PipeWrite:
+		case SpecialFile::GuestSocketPair:
+		case SpecialFile::Console:
+		case SpecialFile::DeciStdin:
+		case SpecialFile::DeciStdout:
+		case SpecialFile::DeciStderr:
+		case SpecialFile::NativeKqueue:
+		case SpecialFile::NativeEqueueDescriptor: return KERNEL_ERROR_ESPIPE;
+		case SpecialFile::None: break;
+		default: return KERNEL_ERROR_ENOTSUP;
+	}
 
 	if (g_mount_points->IsReadOnly(file->real_name)) return KERNEL_ERROR_EROFS;
 	if (nbytes > UINT_MAX) return KERNEL_ERROR_EINVAL;
@@ -8132,6 +8447,50 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	auto* file = g_files->GetFile(d);
 	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
+	}
+	if (file->tmpfs) return TransferTmpfsVector(file, buffers, total, offset, true);
+	if (file->sector_backing || file->iccnvs4_snapshot) return KERNEL_ERROR_ENOTSUP;
+	if (file->passthrough) {
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len != 0 &&
+			    !GuestSocketBufferAccessible(buffer.iov_base, buffer.iov_len, false))
+				return KERNEL_ERROR_EFAULT;
+		}
+		if (total == 0) return 0;
+		std::vector<uint8_t> data;
+		try {
+			data.resize(total);
+		} catch (const std::bad_alloc&) {
+			return KERNEL_ERROR_ENOMEM;
+		}
+		size_t position = 0;
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len != 0)
+				std::memcpy(data.data() + position, buffer.iov_base, buffer.iov_len);
+			position += buffer.iov_len;
+		}
+		return DirectoryPassthrough::Pwrite(file->passthrough, data.data(), data.size(),
+		                                    static_cast<uint64_t>(offset));
+	}
+	switch (file->special) {
+		case SpecialFile::PipeRead:
+		case SpecialFile::PipeWrite:
+		case SpecialFile::GuestSocketPair:
+		case SpecialFile::Console:
+		case SpecialFile::DeciStdin:
+		case SpecialFile::DeciStdout:
+		case SpecialFile::DeciStderr:
+		case SpecialFile::NativeKqueue:
+		case SpecialFile::NativeEqueueDescriptor:
+		case SpecialFile::NativeMbus:
+		case SpecialFile::NativeSystemMbus:
+		case SpecialFile::NativeAvDevice: return KERNEL_ERROR_ESPIPE;
+		default: break;
+	}
+	for (const auto& buffer: buffers) {
+		if (!GuestSocketBufferAccessible(buffer.iov_base, buffer.iov_len, false)) {
+			return KERNEL_ERROR_EFAULT;
+		}
 	}
 	Common::LockGuard lock(file->mutex);
 	if (file->directory) {
@@ -8927,6 +9286,10 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 
 	if (!file->directory || nbytes < static_cast<int>(DIR_BLOCK_SIZE)) {
 		return KERNEL_ERROR_EINVAL;
+	}
+	if (!GuestSocketBufferAccessible(buf, static_cast<uint64_t>(nbytes), true) ||
+	    (basep != nullptr && !GuestSocketBufferAccessible(basep, sizeof(*basep), true))) {
+		return KERNEL_ERROR_EFAULT;
 	}
 
 	EXIT_IF(!file->opened);

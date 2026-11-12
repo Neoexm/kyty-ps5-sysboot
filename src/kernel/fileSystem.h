@@ -198,6 +198,8 @@ int KYTY_SYSV_ABI     KernelClose(int d);
 int KYTY_SYSV_ABI     KernelDup2(int oldd, int newd);
 int KYTY_SYSV_ABI     KernelPipe(int* fds);
 int                   CreateGuestSocketPair(int* fds);
+int64_t               SendGuestSocket(int fd, const void* buf, uint64_t len, int flags);
+int64_t               RecvGuestSocket(int fd, void* buf, uint64_t len, int flags);
 int KYTY_SYSV_ABI     KernelIoctl(int d, uint64_t request, void* arg);
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
 int64_t               ReadWithStatus(int d, void* buf, size_t nbytes, int* read_error);

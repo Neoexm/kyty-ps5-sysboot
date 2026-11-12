@@ -7679,6 +7679,104 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 
 			if (m_symbols != nullptr) {
 				rec = m_symbols->Find(sr);
+				if (trace_userevt) {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("USEREVT resolve lookup: importer=%s lib=%s module=%s exact=%s "
+					     "exact_vaddr=%016" PRIx64
+					     " exact_dbg=%s by_nid=%s by_nid_vaddr=%016" PRIx64 "\n",
+					     Common::PathToString(program->file_name).c_str(), sr.library.c_str(),
+					     sr.module.c_str(), rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     rec != nullptr ? rec->dbg_name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
+				if (std::getenv("KYTY_DIAGNOSTIC_SHELLUI_PIPE_HLE") != nullptr &&
+				    program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+				    (sr.name == "-Jp7F+pXxNg" || sr.name == "wdUufa9g-D8") &&
+				    (sr.library == "libkernel" || sr.library == "Posix") &&
+				    type == SymbolType::Func) {
+					if (const auto* hle = m_symbols->FindByNid(sr.name, type); hle != nullptr) {
+						*out_info = *hle;
+						LOGF("FIRST_FRAME_AUDIT SHELLUI_PIPE_HLE DIAGNOSTIC"
+						     " NID=%s native=0x%016" PRIx64 " HLE=0x%016" PRIx64 "\n",
+						     sr.name.c_str(), rec != nullptr ? rec->vaddr : 0, out_info->vaddr);
+						return;
+					}
+					EXIT("SHELLUI_PIPE_HLE requested NID unavailable: %s\n", sr.name.c_str());
+				}
+				if (sr.name == "Xru92wHJRmg") {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("VIDEOOUT_VBLANK_RESOLVE importer=%s requested=%s lib=%s module=%s "
+					     "exact=%s addr=0x%016" PRIx64 " by_nid=%s addr=0x%016" PRIx64 "\n",
+					     Common::PathToString(program->file_name).c_str(), sr.name.c_str(),
+					     sr.library.c_str(), sr.module.c_str(),
+					     rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
+				if (trace_mutex) {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("mutex resolve: importer=%s lib=%s module=%s exact=%s "
+					     "exact_vaddr=%016" PRIx64 " by_nid=%s by_nid_vaddr=%016" PRIx64 "\n",
+					     Common::PathToString(program->file_name).c_str(), sr.library.c_str(),
+					     sr.module.c_str(), rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
+				if (trace_app) {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("AppMgr lookup: nid=%s importer=%s lib=%s module=%s type=%s exact=%s "
+					     "exact_vaddr=%016" PRIx64 " by_nid=%s by_nid_vaddr=%016" PRIx64 "\n",
+					     sr.name.c_str(), Common::PathToString(program->file_name).c_str(),
+					     sr.library.c_str(), sr.module.c_str(), magic_enum::enum_name(type).data(),
+					     rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
+				if (trace_z7) {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("Z7 resolve: importer=%s lib=%s module=%s exact=%s exact_vaddr=%016" PRIx64
+					     " by_nid=%s by_nid_vaddr=%016" PRIx64 "\n",
+					     Common::PathToString(program->file_name).c_str(), sr.library.c_str(),
+					     sr.module.c_str(), rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
+				if (trace_pf) {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("PF resolve lookup: importer=%s lib=%s module=%s exact=%s "
+					     "exact_vaddr=%016" PRIx64 " by_nid=%s by_nid_vaddr=%016" PRIx64 "\n",
+					     Common::PathToString(program->file_name).c_str(), sr.library.c_str(),
+					     sr.module.c_str(), rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
+				if (trace_net_config) {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("NETCFG resolve lookup: importer=%s lib=%s module=%s exact=%s "
+					     "exact_vaddr=%016" PRIx64 " by_nid=%s by_nid_vaddr=%016" PRIx64 "\n",
+					     Common::PathToString(program->file_name).c_str(), sr.library.c_str(),
+					     sr.module.c_str(), rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
+				if (trace_net_pool) {
+					const auto* by_nid = m_symbols->FindByNid(sr.name, type);
+					LOGF("NETPOOL resolve lookup: importer=%s lib=%s module=%s exact=%s "
+					     "exact_vaddr=%016" PRIx64 " by_nid=%s by_nid_vaddr=%016" PRIx64 "\n",
+					     Common::PathToString(program->file_name).c_str(), sr.library.c_str(),
+					     sr.module.c_str(), rec != nullptr ? rec->name.c_str() : "(null)",
+					     rec != nullptr ? rec->vaddr : 0,
+					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
+					     by_nid != nullptr ? by_nid->vaddr : 0);
+				}
 			}
 
 			if (rec == nullptr && m_symbols != nullptr) {

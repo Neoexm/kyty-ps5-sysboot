@@ -57,6 +57,7 @@ bool KYTY_SYSV_ABI        IsSocket(int s);
 int KYTY_SYSV_ABI         SocketReadReady(int s, int64_t* pending, bool* eof);
 int KYTY_SYSV_ABI         SocketClose(int s);
 int KYTY_SYSV_ABI         Socket(int family, int type, int protocol);
+int KYTY_SYSV_ABI         SocketEx(const char* name, int family, int type, int protocol);
 int KYTY_SYSV_ABI         Ioctl(int s, uint64_t request, void* arg);
 int                       SetLocalSocketPolicy(int s, int32_t value);
 int KYTY_SYSV_ABI         Bind(int s, const void* addr, uint32_t addrlen);
@@ -102,6 +103,8 @@ int KYTY_SYSV_ABI HttpCreateTemplate(int http_ctx_id, const char* user_agent, in
                                      int is_auto_proxy_conf);
 int KYTY_SYSV_ABI HttpDeleteTemplate(int tmpl_id);
 int KYTY_SYSV_ABI HttpSetNonblock(int id, int enable);
+int KYTY_SYSV_ABI HttpEnableOption(int id, uint32_t flags);
+int KYTY_SYSV_ABI HttpDisableOption(int id, uint32_t flags);
 int KYTY_SYSV_ABI HttpCreateEpoll(int http_ctx_id, HttpEpollHandle* eh);
 int KYTY_SYSV_ABI HttpDestroyEpoll(int http_ctx_id, HttpEpollHandle eh);
 int KYTY_SYSV_ABI HttpCreateConnection(int tmpl_id, const char* server_name, const char* scheme,
@@ -135,6 +138,7 @@ int KYTY_SYSV_ABI HttpSetResolveRetry(int id, int32_t retry);
 int KYTY_SYSV_ABI HttpSetConnectTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetSendTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetRecvTimeOut(int id, uint32_t usec);
+int KYTY_SYSV_ABI HttpSetCookieEnabled(int id, int enable);
 int KYTY_SYSV_ABI HttpSetAutoRedirect(int id, int enable);
 int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable);
 

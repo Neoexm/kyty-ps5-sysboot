@@ -3926,6 +3926,75 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+#include "TmpfsMountTests.inc"
+#include "LibcExitTests.inc"
+#include "ModuleLifetimeTests.inc"
+#include "ThreadAtexitLifetimeTests.inc"
+#include "WeakRelocationTests.inc"
+#include "FontProviderRoutingTests.inc"
+#include "NativeFontCreateTests.inc"
+#include "NativeFontGlyphTests.inc"
+#include "GuestSignalMaskTests.inc"
+#include "GuestJumpTests.inc"
+#include "GuestPendingSignalTests.inc"
+#include "SandboxWordTests.inc"
+#include "GuestReadOnlyStdioTests.inc"
+#include "JemspaceRangeTests.inc"
+#include "SysmoduleFontTests.inc"
+#include "SysmoduleDependencyTests.inc"
+#include "CapturedRootMetadataTests.inc"
+#include "CapturedRootIntegrationTests.inc"
+#include "CompositorSocketTests.inc"
+#include "SocketPolicyTests.inc"
+#include "LocalSocketPolicyTests.inc"
+#include "CapturedDirectoryTests.inc"
+#include "RegistryTrapTests.inc"
+#include "SysAvAudioShmTests.inc"
+#include "PhyshmTests.inc"
+#include "AudiodExtendedMmapTests.inc"
+#include "UnhandledHostExceptionDiagnosticsTests.inc"
+#include "SysAvRawSyscallTrapTests.inc"
+#include "NativeNamedObjectTests.inc"
+#include "NativeIpmiTests.inc"
+#include "ImportedMountTests.inc"
+#include "ImportedIpmiTests.inc"
+#include "NativeAvControlTests.inc"
+#include "NativeMbusTests.inc"
+#include "EventReadRegistrationTests.inc"
+#include "NativeKeventSafetyTests.inc"
+#include "SysAvKeventUmdTests.inc"
+#include "PositionedIoTests.inc"
+#include "WriteErrorTests.inc"
+#include "ExfatMountTests.inc"
+#include "DirectoryPassthroughTests.inc"
+#include "NullfsExecTests.inc"
+#include "PosixOpenTests.inc"
+#include "NativeAvDeviceTests.inc"
+#include "NativeDceLeaseTests.inc"
+#include "NativeS3daTests.inc"
+#include "NativeMetadbgTests.inc"
+#include "ProcessPidTests.inc"
+#include "AuthInfoScopeLifecycleTests.inc"
+#include "AppMountContractTests.inc"
+#include "BudgetContractTests.inc"
+#include "AppRegistrationStateTests.inc"
+#include "NativeAppMountTests.inc"
+#include "SysCoreSpawnAppMountTests.inc"
+#include "EventFlagLifetimeTests.inc"
+#include "SemaphoreLifetimeTests.inc"
+#include "SemaphoreCrossHostTests.inc"
+#include "NativeUmtxTests.inc"
+#include "GuestExecFatalSignalTests.inc"
+#include "GuestExecStartupDiagnosticsTests.inc"
+#include "GuestWait7FrontierTests.inc"
+#include "DecryptedModuleOverlayTests.inc"
+#include "Json2ResourceArbitratorTests.inc"
+#include "RegMgrSnapshotTests.inc"
+#include "DevctlTests.inc"
+#include "EnvelopeTests.inc"
+#include "DevfsRootTests.inc"
+#include "NativeSshotTests.inc"
+
 bool VerifyCompositorCommand3000Log(const std::filesystem::path& path) {
   std::ifstream diagnostic_log(path, std::ios::binary);
   const std::string text((std::istreambuf_iterator<char>(diagnostic_log)),
@@ -4126,6 +4195,26 @@ int main(int argc, char** argv) {
       !sysav_audio_shm_only && !physhm_only && !audiod_extended_mmap_only && !host_exception_provenance_only && !guest_sigaction_only && !posix_sem_setname_only && !mono_native_memory_only && !psm_audio_openex_only && !psm_native_mutex_only && !psm_native_thread_rename_only && !psm_sched_range_only && !sysav_raw_syscall_trap_only && !app_classification_only && !envelope_only && !exec_fatal_classifier_child && !exec_fatal_ud2_child) {
     CheckLibcFinalization();
     CheckLibcExitStatus();
+  }
+  subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+  subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
+  if (compositor_sockets_only) {
+    CheckSocketPolicy();
+    CheckCompositorSockets();
+    Log::Flush();
+    const bool semantic_pass = VerifyCompositorCommand3000Log(compositor_sockets_log);
+    subsystems.Destroy();
+    std::error_code ignored;
+    std::filesystem::remove(compositor_sockets_log, ignored);
+    Check(semantic_pass && !ignored && !std::filesystem::exists(compositor_sockets_log),
+          "command 0x3000 diagnostic classifies fragmented transport semantics and removes raw test logs");
+    return 0;
+  }
+  if (guest_sigaction_only) {
+    CheckGuestSigactionContract();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: guest sigaction cases passed\n");
+    return 0;
   }
   if (posix_sem_setname_only) {
     CheckPosixSemSetnameContract();
@@ -4569,6 +4658,36 @@ int main(int argc, char** argv) {
     subsystems.Destroy();
     return result;
   }
+  if (native_font_audit) {
+    const int result = AuditNativeFontProviders(Common::PathFromUtf8(argv[2]));
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return result;
+  }
+  if (local_socket_policy_only) {
+    CheckSocketPolicy();
+    CheckLocalSocketPolicy();
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: local socket policy cases passed\n");
+    return 0;
+  }
+  if ((argc == 2 && std::strcmp(argv[1], "--captured-directory-only") == 0) ||
+      (argc == 4 && std::strcmp(argv[1], "--captured-storage-audit") == 0)) {
+    if (argc == 2) {
+      CheckCapturedDirectory(temporary.Path());
+      CheckPassthroughUpperStore(temporary.Path());
+      CheckFactoryStorageView(temporary.Path());
+      CheckCapturedDirectoryLazyFiles(temporary.Path());
+      CheckCapturedDirectoryStartupCache(temporary.Path());
+    } else AuditCapturedStorage(Common::PathFromUtf8(argv[2]), argv[3]);
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return 0;
+  }
   if (argc == 5 && std::strcmp(argv[1], "--resource-arbitrator-capture-audit") == 0) {
     AuditResourceArbitratorCapture(Common::PathFromUtf8(argv[2]),
                                    Common::PathFromUtf8(argv[3]), argv[4]);
@@ -4804,6 +4923,15 @@ int main(int argc, char** argv) {
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();
   CheckSocketWakeup();
+  CheckCompositorSockets();
+  CheckSocketPolicy();
+  CheckLocalSocketPolicy();
+  CheckCapturedDirectory(temporary.Path());
+  CheckPassthroughUpperStore(temporary.Path());
+  CheckFactoryStorageView(temporary.Path());
+  CheckCapturedDirectoryLazyFiles(temporary.Path());
+  CheckCapturedDirectoryStartupCache(temporary.Path());
+  FileSystem::Shutdown();
   TestNpWebApi2Memory();
   TestNpWebApi2PushOwnership();
   TestJson2ArrayIteratorIncrement();
