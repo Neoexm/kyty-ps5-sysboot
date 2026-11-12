@@ -662,6 +662,10 @@ struct NativeMetadbgStream {
 	bool                    shutting_down = false;
 };
 
+struct NativeMetadbgOpen {
+	std::shared_ptr<NativeMetadbgStream> stream;
+	bool                                 readable = false;
+};
 
 static std::shared_ptr<NativeMetadbgStream>   g_native_metadbg_stream;
 static std::shared_ptr<NativeSystemMbusState> g_native_system_mbus;
@@ -889,6 +893,7 @@ struct NativeDceScope {
 	}
 #else
 	static std::shared_ptr<NativeDceScope> Open(const std::string&) { return nullptr; }
+	int Acquire(int, uint32_t, uint32_t, NativeDceLeaseIdentity*) { return KERNEL_ERROR_ENOSYS; }
 	int Validate(const NativeDceLeaseIdentity&) const { return KERNEL_ERROR_ENOSYS; }
 	int Release(const NativeDceLeaseIdentity&) const { return KERNEL_ERROR_ENOSYS; }
 #endif
@@ -985,6 +990,17 @@ struct DevctlSoftc {
 #endif
 };
 
+static std::shared_ptr<DevctlSoftc> DevctlShared() {
+	static std::mutex                   mutex;
+	static std::shared_ptr<DevctlSoftc> softc;
+	std::lock_guard                     lock(mutex);
+	if (softc == nullptr) {
+		std::string scope;
+		if (!Process::GetScope(&scope)) scope.clear();
+		softc = DevctlSoftc::Open(scope);
+	}
+	return softc;
+}
 
 // /dev/envelope, cdevsw K+0x2bfe5d8. Header and RSA-PSS checks (K+0xc37bb0) need only guest bytes,
 // so they run locally
@@ -1221,6 +1237,8 @@ struct NativeDceClient {
 };
 
 static std::mutex g_native_dce_client_mutex;
+static std::unordered_map<std::string, std::array<std::weak_ptr<NativeDceClient>, 7>>
+                                                                        g_native_dce_clients;
 static std::unordered_map<std::string, std::shared_ptr<NativeDceScope>> g_native_dce_scopes;
 static uint64_t g_native_dce_client_sequence = 1;
 
@@ -1285,6 +1303,7 @@ struct File {
 	std::shared_ptr<Memory::AnonymousSharedMemory> anonymous_shared;
 	std::shared_ptr<GuestPipe>                     socket_send;
 	std::shared_ptr<GuestSocketReadSource>         socket_read_source;
+	std::shared_ptr<NativeMetadbgOpen>             native_metadbg;
 	std::shared_ptr<NativeMbusReceiveQueue>        native_mbus_receive;
 	std::shared_ptr<SectorBacking>                 sector_backing;
 	std::shared_ptr<Tmpfs::Handle>                 tmpfs;
@@ -1309,6 +1328,8 @@ struct File {
 	uint64_t                                       native_dce_original_videoout_resource    = 0;
 	std::vector<std::shared_ptr<NativeDceClient>>  native_dce_clients;
 	uint64_t                                       native_dce_buffers[4] {};
+	uint64_t                                       native_dce_last_flip_sequence = 0;
+	bool                                           native_dce_has_flip_sequence  = false;
 	uint64_t                                       native_scanin_buffers[72] {};
 	uint64_t                                       native_scanin_base       = 0;
 	uint64_t                                       native_scanin_length     = 0;
@@ -1344,6 +1365,7 @@ public:
 	void  CloseAll();
 	std::shared_ptr<GuestSocketReadSource>  PinSocketReadSource(int fd);
 	bool                                    ResolveKqueue(int fd, int64_t* handle);
+	std::shared_ptr<NativeMetadbgOpen>      PinNativeMetadbg(int fd);
 	std::shared_ptr<NativeMbusReceiveQueue> PinNativeMbus(int fd);
 	int  AcquireSocketPipe(int fd, bool receive, std::shared_ptr<GuestPipe>* pipe);
 	int  GetFlags(int fd);
@@ -1946,6 +1968,16 @@ std::shared_ptr<GuestSocketReadSource> PinGuestSocketReadSource(int fd) {
 	return g_files == nullptr ? nullptr : g_files->PinSocketReadSource(fd);
 }
 
+std::shared_ptr<NativeMetadbgOpen> FileDescriptors::PinNativeMetadbg(int fd) {
+	if (fd < DESCRIPTOR_MIN) return {};
+	Common::LockGuard lock(m_mutex);
+	const auto        index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size()) return {};
+	const auto* file = m_files[index];
+	return file != nullptr && file->opened && file->special == SpecialFile::NativeMetadbg
+	           ? file->native_metadbg
+			   : nullptr;
+}
 
 std::shared_ptr<NativeMbusReceiveQueue> FileDescriptors::PinNativeMbus(int fd) {
 	if (fd < DESCRIPTOR_MIN) return {};
@@ -2872,6 +2904,49 @@ void FileDescriptors::CloseAll() {
 
 	for (auto& f: m_files) {
 		if (f != nullptr) {
+			if (f->special == SpecialFile::GuestSocketPair) {
+				ReleaseSocketEndpoint(f);
+			} else if (f->special == SpecialFile::PipeRead && f->pipe) {
+				ReferenceGuestPipe(f->pipe, true, -1);
+			} else if (f->special == SpecialFile::PipeWrite && f->pipe) {
+				ReferenceGuestPipe(f->pipe, false, -1);
+			}
+			if (f->special == SpecialFile::Devctl) {
+				if (const auto softc = DevctlShared(); softc != nullptr) softc->Close();
+			}
+			if (f->special == SpecialFile::NativeDce) {
+				for (const auto& client: f->native_dce_clients)
+					client->Close();
+				f->native_dce_clients.clear();
+				VideoOut::VideoOutNativeReleaseSplashHandle(&f->native_dce_display_handle,
+				                                            f->native_dce_display_generation);
+			}
+			if (f->special == SpecialFile::NativeSshot) {
+				Common::LockGuard sshot_lock(f->mutex);
+				LOGF("NATIVE_SSHOT_SESSION_CLOSE guest_pid=%d active=%u bulk=1\n",
+				     f->native_sshot_owner_pid, f->native_sshot_active ? 1u : 0u);
+				f->native_sshot_active     = false;
+				f->native_sshot_region     = 0;
+				f->native_sshot_size       = 0;
+				f->native_sshot_block_size = 0;
+				f->native_sshot_value      = 0;
+			}
+			if (f->native_mbus_receive) {
+				std::lock_guard inbox_lock(f->native_mbus_receive->GetMutex());
+				f->native_mbus_receive->closed       = true;
+				f->native_mbus_receive->tearing_down = true;
+				if (f->native_mbus_receive->system) f->native_mbus_receive->system->cv.notify_all();
+			}
+			if (f->special == SpecialFile::NativeKqueue) {
+				const int result = EventQueue::KernelDeleteEqueue(
+				    static_cast<EventQueue::KernelEqueue>(f->special_size));
+				if (result != OK) LOGF("NATIVE_KQUEUE_SHUTDOWN_CLOSE error=0x%x\n", result);
+			}
+			if (f->tmpfs) {
+				const int result = Tmpfs::Close(f->tmpfs);
+				if (result != OK)
+					LOGF("TMPFS_SHUTDOWN_CLOSE path=%s error=0x%x\n", f->name.c_str(), result);
+			}
 			if (f->opened) {
 				f->f.Close();
 			}
@@ -5310,6 +5385,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	Common::File::Mode rw_mode = Common::File::Mode::Read;
+	if ((std::strcmp(path, "/dev/s3da") == 0 || std::strcmp(path, "/dev/metadbg") == 0) &&
+	    flags_u == 3) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	switch (flags_u) {
 		case 0: rw_mode = Common::File::Mode::Read; break;
@@ -5461,6 +5540,33 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 		return descriptor;
 	}
+	if (!directory && file->name == "/dev/devctl") {
+		const auto softc = DevctlShared();
+		const int  acquired =
+		    softc != nullptr ? softc->Acquire(Process::GetPid()) : KERNEL_ERROR_EIO;
+		if (acquired != OK) {
+			g_files->DeleteDescriptor(descriptor);
+			return acquired;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::Devctl;
+		file->opened    = true;
+		LOGF("DEVCTL_OPEN guest_pid=%d fd=%d flags=%08x\n", Process::GetPid(), descriptor,
+		     static_cast<uint32_t>(flags));
+		return descriptor;
+	}
+	if (!directory && file->name == "/dev/rnps") {
+		if (!EnvelopeSecureProcessor::RnpsProviderReachable()) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENOENT;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::Rnps;
+		file->opened    = true;
+		LOGF("RNPS_DEVICE_OPEN guest_pid=%d fd=%d flags=0x%x provider_reachable=1\n",
+		     Process::GetPid(), descriptor, flags);
+		return descriptor;
+	}
 	// d_open (K+0xc38400) only tests caps bit 62 and keeps no per-open state.
 	if (!directory && file->name == "/dev/envelope") {
 		const auto         facts      = Process::GetCurrentAuthorizationFacts();
@@ -5544,6 +5650,30 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_MBUS_RX_QUEUE_CREATED"
 		     " fd=%d bytes_available=0\n",
 		     descriptor);
+		return descriptor;
+	}
+	if (!directory && file->name == "/dev/s3da" &&
+	    std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_S3DA_PROBE") != nullptr) {
+		if (flags != 2 || directory || creat || trunc) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::NativeS3daProbe;
+		file->opened    = true;
+		LOGF("FIRST_FRAME_AUDIT S3DA_PROBE_DESCRIPTOR"
+		     " fd=%d path=%s guest_access=readwrite"
+		     " NON_AUTHENTIC\n",
+		     descriptor, file->name.c_str());
+		return descriptor;
+	}
+	if (!directory && file->name == "/dev/gc" &&
+	    std::getenv("KYTY_DIAGNOSTIC_GC_STATUS_IOCTL") != nullptr) {
+		file->real_name = file->name;
+		file->special   = SpecialFile::GcDiagnostic;
+		file->opened    = true;
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_GC_DEVICE_OPEN fd=%d NON_AUTHENTIC\n", descriptor);
+		g_diagnostic_gc_device_ready = true;
 		return descriptor;
 	}
 	if (native_sshot_path) {
@@ -6151,6 +6281,45 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 		file->f.Close();
 	}
 
+	if (file->special == SpecialFile::GuestSocketPair) {
+		ReleaseSocketEndpoint(file);
+	}
+	if (file->special == SpecialFile::NativeKqueue) {
+		const auto rc = EventQueue::KernelDeleteEqueue(
+		    static_cast<EventQueue::KernelEqueue>(file->special_size));
+		if (rc != OK) {
+			return rc;
+		}
+	}
+	if (file->special == SpecialFile::Devctl) {
+		if (const auto softc = DevctlShared(); softc != nullptr) softc->Close();
+		LOGF("DEVCTL_CLOSE guest_pid=%d fd=%d\n", Process::GetPid(), d);
+	}
+	if (file->special == SpecialFile::NativeDce) {
+		Common::LockGuard dce_lock(file->mutex);
+		for (const auto& client: file->native_dce_clients)
+			client->Close();
+		file->native_dce_clients.clear();
+		VideoOut::VideoOutNativeReleaseSplashHandle(&file->native_dce_display_handle,
+		                                            file->native_dce_display_generation);
+		file->native_dce_display_generation = 0;
+	}
+	if (file->special == SpecialFile::NativeSshot) {
+		Common::LockGuard sshot_lock(file->mutex);
+		LOGF("NATIVE_SSHOT_SESSION_CLOSE guest_pid=%d fd=%d active=%u bulk=0\n",
+		     file->native_sshot_owner_pid, d, file->native_sshot_active ? 1u : 0u);
+		file->native_sshot_active     = false;
+		file->native_sshot_region     = 0;
+		file->native_sshot_size       = 0;
+		file->native_sshot_block_size = 0;
+		file->native_sshot_value      = 0;
+	}
+	if (file->native_mbus_receive) {
+		std::lock_guard lock(file->native_mbus_receive->GetMutex());
+		file->native_mbus_receive->closed = true;
+		if (file->native_mbus_receive->system) file->native_mbus_receive->system->cv.notify_all();
+	}
+
 	file->opened = false;
 
 	LOGF("\tClose: %s\n", EscapeLogPath(file->real_name).c_str());
@@ -6541,6 +6710,11 @@ struct NativeDceFlipPayload {
 	uint64_t zero38;
 	uint64_t zero40;
 };
+static_assert(sizeof(NativeDceFlipPayload) == 0x48);
+static_assert(offsetof(NativeDceFlipPayload, buffer_index) == 0x08);
+static_assert(offsetof(NativeDceFlipPayload, flip_mode) == 0x10);
+static_assert(offsetof(NativeDceFlipPayload, flip_arg) == 0x18);
+static_assert(offsetof(NativeDceFlipPayload, sequence) == 0x20);
 
 int NativeDceClient::Ioctl(const NativeDceEnvelope& envelope) {
 	Common::LockGuard lock(mutex);
@@ -6686,7 +6860,19 @@ static_assert(offsetof(NativeSshotRequest, size) == 0x18);
 static_assert(offsetof(NativeSshotRequest, block_size) == 0x1c);
 static_assert(offsetof(NativeSshotRequest, value) == 0x20);
 
+static bool NativeSshotRequestValid(const NativeSshotRequest& value) {
+	return value.status == 0 && value.reserved04 == 0 && value.region != 0 &&
+	       value.reserved10 == 0 && value.size == 0x0a200000 && value.block_size == 0x00200000 &&
+	       value.value == 0x60 && (value.region & (value.block_size - 1)) == 0 &&
+	       value.region <= UINT64_MAX - value.size &&
+	       std::all_of(value.reserved24.begin(), value.reserved24.end(),
+	                   [](uint8_t byte) { return byte == 0; });
+}
 
+static bool NativeSshotMappingValid(const NativeSshotRequest& value) {
+	return Memory::ValidateGrantedNamedDirectMemory(reinterpret_cast<const void*>(value.region),
+	                                                value.size, 3, "CompositorShmScreenshotMem");
+}
 
 struct HidPadOpenRequest {
 	int32_t  user_id;
@@ -6937,6 +7123,30 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 			case 0xc0188c04u: return KERNEL_ERROR_ENOSYS;
 			default: return KERNEL_ERROR_EINVAL;
 		}
+	}
+	if (file->special == SpecialFile::NativeMbus) {
+		return KERNEL_ERROR_ENODEV;
+	}
+	if (file->special == SpecialFile::NativeA53Io) {
+		if (request != 0x80046101u && request != 0x80046103u) return KERNEL_ERROR_ENOTTY;
+		if (!GuestSocketBufferAccessible(arg, sizeof(uint32_t), false)) return KERNEL_ERROR_EFAULT;
+		std::lock_guard lock(g_a53_controller.mutex);
+		if (request == 0x80046101u) {
+			uint32_t input = 0;
+			std::memcpy(&input, arg, sizeof(input));
+			g_a53_controller.nand_initialized = true;
+			LOGF("A53_STORAGE_NAND_INIT fd=%d input=0x%x force_format=%d"
+			     " result=0 NON_AUTHENTIC\n",
+			     d, input, (input & 0x10000u) != 0 ? 1 : 0);
+			return OK;
+		}
+		if (g_a53_controller.a53_enabled) return KERNEL_ERROR_EALREADY;
+		if (!g_a53_controller.nand_initialized) return KERNEL_ERROR_EINVAL;
+		g_a53_controller.a53_enabled = true;
+		LOGF("A53_STORAGE_A53_ENABLE fd=%d input_ignored=1"
+		     " result=0 NON_AUTHENTIC\n",
+		     d);
+		return OK;
 	}
 	if (file->special == SpecialFile::NativeNsidCtl) {
 		if (request != 0x20003102u) return KERNEL_ERROR_ENOTTY;
@@ -7661,6 +7871,371 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 				}
 			}
 		}
+		// command 10 sets the signal mode; staged here, committed at FINISH
+		if (request == 0x80208218u && NativeDceReadable(reinterpret_cast<uint64_t>(arg), 0x20)) {
+			uint64_t words[4] {};
+			std::memcpy(words, arg, sizeof(words));
+			if (static_cast<uint32_t>(words[0]) == 11) {
+				// FINISH_SET_MODE uses a separate /dev/dce fd, with the controller selector in the
+				// high DWORD.
+				const uint32_t selector = static_cast<uint32_t>(words[0] >> 32);
+				if (selector > 1 || words[1] != 0 || words[2] != 0 || words[3] != 0) {
+					return KERNEL_ERROR_EINVAL;
+				}
+				Common::LockGuard lock(file->mutex);
+				const int         rc = VideoOut::VideoOutNativeFinishDisplaySignal(
+				    selector, file->native_dce_display_generation);
+				if (rc != 0) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_FINISH_SET_MODE_REJECTED"
+					     " backend_error=0x%08x\n",
+					     static_cast<uint32_t>(rc));
+					return rc == VideoOut::VIDEO_OUT_ERROR_UNSUPPORTED_OPERATION
+					           ? KERNEL_ERROR_EOPNOTSUPP
+							   : KERNEL_ERROR_EINVAL;
+				}
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_FINISH_SET_MODE_CONFIRMED"
+				     " command=11 selector=0 diagnostic_HDMI_to_MAIN\n");
+				return OK;
+			}
+			if (words[0] == 10) {
+				const uint32_t id   = static_cast<uint32_t>(words[1]);
+				const uint32_t size = static_cast<uint32_t>(words[1] >> 32);
+				if (id != 0 || size != 0x54 || words[3] != 0) {
+					return KERNEL_ERROR_EINVAL;
+				}
+				if (!NativeDceReadable(words[2], size)) {
+					return KERNEL_ERROR_EFAULT;
+				}
+				uint32_t timing[21] {};
+				std::memcpy(timing, reinterpret_cast<const void*>(words[2]), sizeof(timing));
+				float refresh = 0.0f;
+				std::memcpy(&refresh, &timing[14], sizeof(refresh));
+				const bool original4k =
+				    timing[0] == 0 && timing[1] == 0 && timing[2] == 0 && timing[3] == 47 &&
+				    timing[4] == 59341 && timing[5] == 4399 && timing[6] == 2249 &&
+				    timing[7] == 3840 && timing[8] == 2160 && timing[9] == 0 && timing[10] == 1 &&
+				    timing[11] == 1 && timing[12] == 0 && timing[13] == 0 &&
+				    timing[14] == 0x426fc28fu && timing[15] == 0 && timing[16] == 24 &&
+				    timing[17] == 0x0bb50052u && timing[18] == 0x200 && timing[19] == 0 &&
+				    timing[20] == 0;
+				const bool original1080 =
+				    timing[0] == 1 && timing[1] == 1 && timing[2] == 0 && timing[3] == 8 &&
+				    timing[4] == 14836 && timing[5] == 2199 && timing[6] == 1124 &&
+				    timing[7] == 1920 && timing[8] == 1080 && timing[9] == 0 && timing[10] == 1 &&
+				    timing[11] == 14 && timing[12] == 0 && timing[13] == 0 &&
+				    timing[14] == 0x426fc28fu && timing[15] == 0 && timing[16] == 30 &&
+				    timing[17] == 0x0bb50029u && timing[18] == 32 && timing[19] == 0 &&
+				    timing[20] == 0;
+				const bool original480 =
+				    timing[0] == 0 && timing[1] == 0 && timing[2] == 0 && timing[3] == 0 &&
+				    timing[4] == 2700 && timing[5] == 857 && timing[6] == 524 && timing[7] == 720 &&
+				    timing[8] == 480 && timing[9] == 0 && timing[10] == 0 && timing[11] == 1 &&
+				    timing[12] == 0 && timing[13] == 0 && timing[14] == 0x426fc28fu &&
+				    timing[15] == 0 && timing[16] == 24 && timing[17] == 0x0bb50024u &&
+				    timing[18] == 0x200 && timing[19] == 0 && timing[20] == 0;
+				if (!original4k && !original1080 && !original480) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_MODE_UNMATCHED_INPUT"
+					     " width=%u height=%u pixel_clock_10khz=%u"
+					     " NO_UNVALIDATED_MODE_ACK\n",
+					     timing[7], timing[8], timing[4]);
+					return KERNEL_ERROR_EINVAL;
+				}
+				Common::LockGuard lock(file->mutex);
+				if (file->native_dce_display_id_set && file->native_dce_display_id != id) {
+					return KERNEL_ERROR_EINVAL;
+				}
+				const int rc = VideoOut::VideoOutNativeConfigureDisplaySignal(
+				    &file->native_dce_display_handle, timing[0], timing[7], timing[8],
+				    timing[5] + 1u, timing[6] + 1u, refresh, timing[4],
+				    &file->native_dce_display_generation);
+				if (rc != 0) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_MODE_BACKEND_REJECTED"
+					     " videoout_rc=0x%08x\n",
+					     static_cast<uint32_t>(rc));
+					return KERNEL_ERROR_EINVAL;
+				}
+				file->native_dce_display_id     = id;
+				file->native_dce_display_id_set = true;
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_MODE_PENDING"
+				     " command=10 display_id=%u selector=%u"
+				     " mode=%ux%u refresh_millihz=%u"
+				     " backing=independent_controller_pending_state"
+				     " NOT_HOST_MONITOR_SWITCH\n",
+				     id, timing[0], timing[7], timing[8],
+				     static_cast<uint32_t>(refresh * 1000.0f + 0.5f));
+				return OK;
+			}
+		}
+		if (request != 0x80308217u) {
+			return KERNEL_ERROR_ENOTTY;
+		}
+		if (!NativeDceReadable(reinterpret_cast<uint64_t>(arg), sizeof(NativeDceEnvelope))) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		NativeDceEnvelope envelope {};
+		std::memcpy(&envelope, arg, sizeof(envelope));
+		if (envelope.command == 0x38 || envelope.command == 0x37 || envelope.command == 0x36 ||
+		    envelope.command == 0x0a) {
+			std::shared_ptr<NativeDceClient> client;
+			{
+				Common::LockGuard lock(file->mutex);
+				const auto        found =
+				    std::find_if(file->native_dce_clients.begin(), file->native_dce_clients.end(),
+					             [&envelope](const auto& entry) {
+					                 return entry->cookie == envelope.display_id &&
+									        entry->pid == Process::GetPid();
+				                 });
+				if (found == file->native_dce_clients.end()) return KERNEL_ERROR_EINVAL;
+				client = *found;
+			}
+			return client->Ioctl(envelope);
+		}
+		if (envelope.command == 1 || envelope.command == 9) {
+			Common::LockGuard lock(file->mutex);
+			const auto        found =
+			    std::find_if(file->native_dce_clients.begin(), file->native_dce_clients.end(),
+				             [&envelope](const auto& client) {
+				                 return client->cookie == envelope.display_id &&
+								        client->pid == Process::GetPid();
+			                 });
+			if (found == file->native_dce_clients.end()) return KERNEL_ERROR_EINVAL;
+			if (envelope.index_or_zero != 0) return KERNEL_ERROR_EINVAL;
+			if (envelope.command == 1) {
+				if (envelope.payload_addr != 0 || envelope.payload_size != 0 ||
+				    envelope.result_addr != 0 || envelope.result_size != 0)
+					return KERNEL_ERROR_EINVAL;
+				const int rc = (*found)->Close();
+				if (rc != OK) return rc;
+				LOGF("NATIVE_DCE_CLIENT_CLOSED pid=%d fd=%d cookie=0x%x\n", (*found)->pid, d,
+				     (*found)->cookie);
+				file->native_dce_clients.erase(found);
+				return OK;
+			}
+			Common::LockGuard client_lock((*found)->mutex);
+			if (!(*found)->live) return KERNEL_ERROR_EINVAL;
+			if ((*found)->scope != nullptr) {
+				const int rc = (*found)->scope->Validate((*found)->lease);
+				if (rc != OK) return rc;
+			}
+			if (envelope.payload_size != 8 || envelope.result_size != 8) return KERNEL_ERROR_EINVAL;
+			if (!NativeDceReadable(envelope.payload_addr, 8, true) ||
+			    !NativeDceReadable(envelope.result_addr, 8, true) ||
+			    !NativeDceGuestFrameMapped(envelope.payload_addr, 8) ||
+			    !NativeDceGuestFrameMapped(envelope.result_addr, 8))
+				return KERNEL_ERROR_EFAULT;
+			const uint64_t address = reinterpret_cast<uint64_t>((*found)->shared);
+			if (!Memory::OwnsFlexibleMemory(address, 0x4000, (*found)->memory_token) ||
+			    !NativeDceGuestFrameMapped(address, 0x170))
+				return KERNEL_ERROR_EFAULT;
+			const uint64_t size = 0x170;
+			Memory::InvalidateMemory(envelope.payload_addr, sizeof(address));
+			std::memcpy(reinterpret_cast<void*>(envelope.payload_addr), &address, sizeof(address));
+			Memory::InvalidateMemory(envelope.result_addr, sizeof(size));
+			std::memcpy(reinterpret_cast<void*>(envelope.result_addr), &size, sizeof(size));
+			LOGF("NATIVE_DCE_CLIENT_SHARED_MAPPING pid=%d fd=%d cookie=0x%x"
+			     " guest_address=0x%" PRIx64 " bytes=0x170\n",
+			     (*found)->pid, d, (*found)->cookie, address);
+			return OK;
+		}
+		if (envelope.command == 0x0a && envelope.payload_size == 0x80 &&
+		    envelope.index_or_zero == 0 && envelope.result_addr == 0 && envelope.result_size == 0) {
+			if (!NativeDceReadable(envelope.payload_addr, 0x80, true)) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			Common::LockGuard dce_lock(file->mutex);
+			if (!file->native_dce_original_videoout_client_open ||
+			    file->native_dce_original_videoout_resource != 1 ||
+			    !file->native_dce_display_id_set ||
+			    file->native_dce_display_id != envelope.display_id ||
+			    file->native_dce_display_handle < 0) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			uint64_t  status[16] {};
+			const int rc = VideoOut::VideoOutNativeGetFlipStatus(
+			    file->native_dce_display_handle, status, std::size(status),
+			    file->native_dce_display_generation);
+			if (rc != 0) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			Memory::InvalidateMemory(envelope.payload_addr, sizeof(status));
+			std::memcpy(reinterpret_cast<void*>(envelope.payload_addr), status, sizeof(status));
+			return OK;
+		}
+		// sceVideoOutRegisterBuffers2: DCE command 0x38, 96-byte nested record
+		if (envelope.command == 0x38 && envelope.payload_size == 0x60 &&
+		    envelope.result_addr == 0 && envelope.result_size == 0 &&
+		    NativeDceReadable(envelope.payload_addr, 0x60)) {
+			uint64_t original[12] {};
+			std::memcpy(original, reinterpret_cast<const void*>(envelope.payload_addr),
+			            sizeof(original));
+			LOGF("FIRST_FRAME_AUDIT SYSAV_VIDEOOUT_REGISTERBUFFERS2_INPUT"
+			     " DCE_command=0x38 nested_guest_bytes=96"
+			     " display_id=%u index=%" PRIu64 " raw_qword00to05=%016" PRIx64 ",%016" PRIx64
+			     ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+			     " raw_qword06to11=%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64 ",%016" PRIx64
+			     ",%016" PRIx64 ",%016" PRIx64 "\n",
+			     envelope.display_id, envelope.index_or_zero, original[0], original[1], original[2],
+			     original[3], original[4], original[5], original[6], original[7], original[8],
+			     original[9], original[10], original[11]);
+			Log::Flush();
+		}
+		if (envelope.command == 0x38 && envelope.display_id == 0 && envelope.payload_size == 0x60 &&
+		    envelope.index_or_zero == 0 && envelope.result_addr == 0 && envelope.result_size == 0 &&
+		    std::getenv("KYTY_DIAGNOSTIC_SYSAV_NATIVE_SPLASH_ATTR_96") &&
+		    std::getenv("KYTY_DIAGNOSTIC_SYSAV_SPLASH_SHARE_DCE_HEAD") &&
+		    NativeDceReadable(envelope.payload_addr, 0x60)) {
+			uint64_t exact_sony[12] {};
+			std::memcpy(exact_sony, reinterpret_cast<const void*>(envelope.payload_addr),
+			            sizeof(exact_sony));
+			Common::LockGuard dce_lock(file->mutex);
+			if (!file->native_dce_original_videoout_client_open ||
+			    file->native_dce_original_videoout_resource != 1 ||
+			    file->native_dce_display_handle >= 0) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			const int configured = VideoOut::VideoOutNativeConfigureSplashAttributes(
+			    exact_sony, std::size(exact_sony));
+			if (configured != 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_ATTRIBUTES_REJECTED"
+				     " videoout_error=0x%08x\n",
+				     static_cast<uint32_t>(configured));
+				return KERNEL_ERROR_EINVAL;
+			}
+			// DCE mode controller and guest VideoOut client share the MAIN head; VideoOutOpen
+			// reuses it only under the DCE-owner lease
+			const int leased = VideoOut::VideoOutNativeAcquireSplashHandle(
+			    &file->native_dce_display_handle, &file->native_dce_display_generation);
+			if (leased != OK) {
+				return KERNEL_ERROR_EBUSY;
+			}
+			file->native_dce_display_id     = envelope.display_id;
+			file->native_dce_display_id_set = true;
+			LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_BUFFER_ATTRIBUTE_STAGE_ACCEPTED"
+			     " DCE_command=0x38 bytes=96"
+			     " shared_videoout_head=1 guest_splash_client"
+			     " NO_BUFFER_POINTERS_YET\n");
+			Log::Flush();
+			return OK;
+		}
+		if (envelope.command == 0x37 && envelope.payload_size == 0x30 &&
+		    envelope.index_or_zero < 4 && envelope.result_addr == 0 && envelope.result_size == 0) {
+			if (!NativeDceReadable(envelope.payload_addr, sizeof(NativeDceRegisterPayload))) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			NativeDceRegisterPayload payload {};
+			std::memcpy(&payload, reinterpret_cast<const void*>(envelope.payload_addr),
+			            sizeof(payload));
+			if (payload.zero0 != 0 || payload.zero8 != 0 || payload.register_base_index != 0 ||
+			    payload.zero18 != 0 || payload.metadata != 0 || payload.zero28 != 0) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			if ((payload.guest_data & 0xffu) != 0 ||
+			    !NativeDceReadable(payload.guest_data, 0x7e9000, true) ||
+			    !NativeDceGuestFrameMapped(payload.guest_data, 0x7e9000)) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			Common::LockGuard dce_lock(file->mutex);
+			if (file->native_dce_display_id_set &&
+			    file->native_dce_display_id != envelope.display_id) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			if (file->native_dce_buffers[envelope.index_or_zero] != 0) {
+				return KERNEL_ERROR_EBUSY;
+			}
+			const int rc = VideoOut::VideoOutNativeRegisterSplashBuffer(
+			    &file->native_dce_display_handle, static_cast<int>(envelope.index_or_zero),
+			    payload.guest_data, &file->native_dce_display_generation);
+			if (rc != 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_REGISTER_KYTY_FAILURE"
+				     " index=%" PRIu64 " kyty_error=0x%08x\n",
+				     envelope.index_or_zero, static_cast<uint32_t>(rc));
+				return KERNEL_ERROR_EINVAL;
+			}
+			file->native_dce_display_id                      = envelope.display_id;
+			file->native_dce_display_id_set                  = true;
+			file->native_dce_buffers[envelope.index_or_zero] = payload.guest_data;
+			LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_REGISTER_CONFIRMED"
+			     " index=%" PRIu64 " guest_addr=0x%016" PRIx64 "\n",
+			     envelope.index_or_zero, payload.guest_data);
+			return OK;
+		}
+		if (envelope.command == 0x36 && envelope.payload_size == 0x48 &&
+		    envelope.index_or_zero == 0 && envelope.result_size == 8) {
+			if (!NativeDceReadable(envelope.payload_addr, sizeof(NativeDceFlipPayload)) ||
+			    !NativeDceReadable(envelope.result_addr, sizeof(uint64_t), true)) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			NativeDceFlipPayload flip {};
+			std::memcpy(&flip, reinterpret_cast<const void*>(envelope.payload_addr), sizeof(flip));
+			if (flip.zero0 != 0 || flip.buffer_index < 0 || flip.buffer_index >= 4 ||
+			    flip.flip_mode != 1 || flip.shifted_flags != 0 || flip.extended_flag != 0 ||
+			    flip.zero2c != 0 || flip.extended_ptr != 0 || flip.zero38 != 0 ||
+			    flip.zero40 != 0) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			Common::LockGuard dce_lock(file->mutex);
+			if (!file->native_dce_display_id_set ||
+			    file->native_dce_display_id != envelope.display_id ||
+			    file->native_dce_display_handle < 0 ||
+			    file->native_dce_buffers[flip.buffer_index] == 0 ||
+			    (file->native_dce_has_flip_sequence &&
+			     flip.sequence <= file->native_dce_last_flip_sequence)) {
+				return KERNEL_ERROR_EINVAL;
+			}
+			if (!NativeDceReadable(file->native_dce_buffers[flip.buffer_index], 0x7e9000, true) ||
+			    !NativeDceGuestFrameMapped(file->native_dce_buffers[flip.buffer_index], 0x7e9000)) {
+				return KERNEL_ERROR_EFAULT;
+			}
+			const int rc = VideoOut::VideoOutNativeSubmitSplashFlip(
+			    file->native_dce_display_handle, static_cast<int>(flip.buffer_index),
+			    static_cast<int>(flip.flip_mode), flip.flip_arg,
+			    file->native_dce_buffers[flip.buffer_index], file->native_dce_display_generation);
+			if (rc != 0) {
+				LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_FLIP_REJECTED"
+				     " kyty_rc=0x%08x index=%" PRId64 " sequence=%" PRIu64 "\n",
+				     static_cast<uint32_t>(rc), flip.buffer_index, flip.sequence);
+				return rc == -1 ? KERNEL_ERROR_EINVAL : KERNEL_ERROR_EBUSY;
+			}
+			file->native_dce_last_flip_sequence = flip.sequence;
+			file->native_dce_has_flip_sequence  = true;
+			// readback hashes only: first 3 flips and every 16th of the first 160
+			if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_FRAME_READBACK") != nullptr) {
+				static std::atomic_uint32_t native_frame_counter {0};
+				const uint32_t              frame_no = native_frame_counter.fetch_add(1);
+				if (frame_no < 3 || (frame_no < 160 && (frame_no % 16) == 0)) {
+					const auto       address  = file->native_dce_buffers[flip.buffer_index];
+					const auto*      pixels   = reinterpret_cast<const uint32_t*>(address);
+					constexpr size_t count    = 1920u * 1080u;
+					uint64_t         hash     = 14695981039346656037ull;
+					size_t           coloured = 0;
+					for (size_t i = 0; i < count; ++i) {
+						const uint32_t value = pixels[i];
+						coloured += (value & 0x00ffffffu) != 0;
+						hash ^= value;
+						hash *= 1099511628211ull;
+					}
+					LOGF("FIRST_FRAME_AUDIT SYSAV_GUEST_READBACK"
+					     " queued_frame=%u index=%" PRId64 " guest_addr=0x%016" PRIx64
+					     " rgb_nonblack=%zu of %zu fnv64=0x%016" PRIx64
+					     " SOURCE_PIXELS_UNMODIFIED_NOT_SCREENSHOT\n",
+					     frame_no, flip.buffer_index, address, coloured, count, hash);
+				}
+			}
+			// caller takes its 0x0c status handler only for 0x58, 0 is no notification
+			constexpr uint64_t no_special_dce_notification = 0;
+			Memory::InvalidateMemory(envelope.result_addr, sizeof(uint64_t));
+			std::memcpy(reinterpret_cast<void*>(envelope.result_addr), &no_special_dce_notification,
+			            sizeof(uint64_t));
+			LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_FLIP_ACCEPTED"
+			     " index=%" PRId64 " sequence=%" PRIu64 " status=NO_SECONDARY_NOTIFICATION"
+			     " awaiting_asynchronous_host_presentation\n",
+			     flip.buffer_index, flip.sequence);
+			return OK;
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_UNSUPPORTED_IOCTL"
+		     " fd=%d cmd=0x%016" PRIx64 " result=ENOTTY\n",
+		     d, envelope.command);
+		return KERNEL_ERROR_ENOTTY;
 	}
 	if (file->special == SpecialFile::GcDiagnostic) {
 		if (request != 0xc0048118u && request != 0xc004812eu) {
@@ -7682,6 +8257,258 @@ int KYTY_SYSV_ABI KernelIoctl(int d, uint64_t request, void* arg) {
 		     " input=0 output=0\n",
 		     request);
 		return OK;
+	}
+
+	if (file->special == SpecialFile::NativeSshot) {
+		if (file->native_sshot_owner_pid != Process::GetPid()) return KERNEL_ERROR_EBADF;
+		if (request != 0xc0709d01u && request != 0xc0709d02u) return KERNEL_ERROR_ENOTTY;
+		NativeSshotRequest original {};
+		if (!Memory::CopyFromGuest(&original, arg, sizeof(original)) ||
+		    !Memory::CanWriteGuestNoTrace(arg, sizeof(original))) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		if (!NativeSshotRequestValid(original)) return KERNEL_ERROR_EINVAL;
+		Common::LockGuard lock(file->mutex);
+		if (request == 0xc0709d01u) {
+			if (file->native_sshot_active) return KERNEL_ERROR_EALREADY;
+			if (!NativeSshotMappingValid(original)) return KERNEL_ERROR_EINVAL;
+			NativeSshotRequest result = original;
+			result.status             = 0;
+			if (!Memory::CopyToGuest(arg, &result, sizeof(result))) return KERNEL_ERROR_EFAULT;
+			file->native_sshot_active     = true;
+			file->native_sshot_region     = original.region;
+			file->native_sshot_size       = original.size;
+			file->native_sshot_block_size = original.block_size;
+			file->native_sshot_value      = original.value;
+			LOGF("NATIVE_SSHOT_SESSION_START guest_pid=%d fd=%d"
+			     " mapping=CompositorShmScreenshotMem bytes=0x0a200000"
+			     " block=0x00200000 value=0x60\n",
+			     Process::GetPid(), d);
+			return OK;
+		}
+		if (!file->native_sshot_active) return KERNEL_ERROR_EINVAL;
+		if (file->native_sshot_region != original.region ||
+		    file->native_sshot_size != original.size ||
+		    file->native_sshot_block_size != original.block_size ||
+		    file->native_sshot_value != original.value) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		NativeSshotRequest result = original;
+		result.status             = 0;
+		if (!Memory::CopyToGuest(arg, &result, sizeof(result))) return KERNEL_ERROR_EFAULT;
+		file->native_sshot_active     = false;
+		file->native_sshot_region     = 0;
+		file->native_sshot_size       = 0;
+		file->native_sshot_block_size = 0;
+		file->native_sshot_value      = 0;
+		LOGF("NATIVE_SSHOT_SESSION_STOP guest_pid=%d fd=%d result=0\n", Process::GetPid(), d);
+		return OK;
+	}
+
+	if (file->special == SpecialFile::Devctl) {
+		if (request == 0x8004667cu || request == 0x4004667bu) {
+			LOGF("DEVCTL_IOCTL_UNMODELED fd=%d req=%08" PRIx64 " result=ENOSYS\n", d,
+			     static_cast<uint64_t>(request));
+			return KERNEL_ERROR_ENOSYS;
+		}
+		if (request != 0x8004667eu && request != 0x8004667du) return KERNEL_ERROR_ENOTTY;
+		if (arg == nullptr) return KERNEL_ERROR_EFAULT;
+		int32_t value = 0;
+		std::memcpy(&value, arg, sizeof(value));
+		const auto softc = DevctlShared();
+		if (softc == nullptr || !softc->Set(request == 0x8004667eu, value != 0))
+			return KERNEL_ERROR_EIO;
+		LOGF("DEVCTL_IOCTL fd=%d req=%08" PRIx64 " value=%d\n", d, static_cast<uint64_t>(request),
+		     value != 0 ? 1 : 0);
+		return OK;
+	}
+
+	// failures go in +0x340 and ioctl() still returns 0; out written only on success
+	if (file->special == SpecialFile::Envelope) {
+#if defined(_WIN32)
+		if (request != 0xc3483101u) return KERNEL_ERROR_ENOTTY;
+		std::array<uint8_t, 0x348> fields {};
+		if (!Memory::CopyFromGuest(fields.data(), arg, fields.size())) return KERNEL_ERROR_EFAULT;
+		uint32_t cid = 0, mkv = 0;
+		uint64_t in_size = 0, in_ptr = 0, out_ptr = 0;
+		std::memcpy(&cid, fields.data(), 4);
+		std::memcpy(&mkv, fields.data() + 0x304, 4);
+		std::memcpy(&in_size, fields.data() + 0x328, 8);
+		std::memcpy(&in_ptr, fields.data() + 0x330, 8);
+		std::memcpy(&out_ptr, fields.data() + 0x338, 8);
+		const uint8_t*       key  = fields.data() + 4;
+		const uint8_t*       salt = fields.data() + 0x308;
+		std::vector<uint8_t> in;
+		std::string          in_identity;
+		const char*          decrypt     = "not_reached";
+		const char*          sp_status   = "not_attempted";
+		const char*          sp_provider = "none";
+		int32_t        sp_transport = 0, sp_open = 0, sp_ioctl = 0, sp_close = 0, sp_cleanup = 0;
+		uint32_t       sp_dispatch    = 0;
+		const char*    local_contract = "not_validated";
+		const char*    guest_output   = out_ptr == 0 ? "not_requested" : "untouched";
+		uint64_t       payload        = 0;
+		const uint32_t result         = [&]() -> uint32_t {
+			if (in_size < 0x1d1 || in_size > 0x40000) return 0x800f0f16;
+			in.resize(in_size);
+			if (!Memory::CopyFromGuest(in.data(), reinterpret_cast<const void*>(in_ptr), in_size))
+				return 0x800f0f0e;
+			in_identity    = AuthInfo::DigestHex(AuthInfo::Sha256(in.data(), in.size()));
+			uint32_t magic = 0, version = 0, content = 0;
+			std::memcpy(&magic, in.data(), 4);
+			std::memcpy(&version, in.data() + 4, 4);
+			std::memcpy(&content, in.data() + 8, 4);
+			std::memcpy(&payload, in.data() + 0x10, 8);
+			if (magic != 0x5173cbcc || 0x1d0 + payload != in_size) return 0x800f0f23;
+			if (version != 1) return 0x800f0f2e;
+			if (content != cid) return 0x800f0f26;
+			if (!EnvelopeSignatureValid(key, in)) return 0x800f0f24;
+			local_contract = "validated";
+			if (out_ptr == 0) {
+				decrypt = "verify_only";
+				return 0;
+			}
+			EnvelopeSecureProcessor::Context context;
+			context.cid = cid;
+			context.mkv = mkv;
+			std::memcpy(context.salt.data(), salt, context.salt.size());
+			SecureEnvelopeBytes                      plaintext(payload);
+			EnvelopeSecureProcessor::EnvelopeRequest provider_request {
+			    context,
+			    std::span<const uint8_t, 0x300>(key, 0x300),
+			    std::span<const uint8_t>(in.data(), in.size()),
+			    plaintext.bytes.size(),
+			};
+			const auto sp = EnvelopeSecureProcessor::ProcessEnvelope(
+			    provider_request, std::span<const uint8_t, 16>(in.data() + 0x20, 16),
+			    std::span<const uint8_t>(in.data() + 0x1d0, payload), plaintext.bytes);
+			sp_status    = EnvelopeSecureProcessor::StatusName(sp.status);
+			sp_provider  = EnvelopeSecureProcessor::ProviderName(sp.provider);
+			sp_transport = sp.transport_result;
+			sp_open      = sp.native_open_errno;
+			sp_ioctl     = sp.native_ioctl_errno;
+			sp_close     = sp.native_close_errno;
+			sp_cleanup   = sp.cleanup_result;
+			sp_dispatch  = sp.dispatch_state;
+			if (sp.status != EnvelopeSecureProcessor::Status::NotConfigured) {
+				if (sp.status != EnvelopeSecureProcessor::Status::Success ||
+				    sp.operation_result != 0 || sp.written != payload) {
+					decrypt = "secure_processor_failed";
+					return sp.operation_result == 0 ? EnvelopeSecureProcessor::unavailable_result
+					                                : sp.operation_result;
+				}
+				if (!EnvelopeDigestMatches(plaintext.bytes, in.data() + 0x30)) {
+					decrypt = "secure_processor_digest_mismatch";
+					return 0x800f0f36;
+				}
+				decrypt = "secure_processor";
+				if (!Memory::CopyToGuest(reinterpret_cast<void*>(out_ptr), plaintext.bytes.data(),
+				                         plaintext.bytes.size())) {
+					guest_output = "copy_fault";
+					return 0x800f0f0e;
+				}
+				guest_output = "written";
+				return 0;
+			}
+			const auto in_sha256   = AuthInfo::Sha256(in.data(), in.size());
+			const auto key_sha256  = AuthInfo::Sha256(key, 0x300);
+			const auto salt_sha256 = AuthInfo::Sha256(salt, 0x20);
+			for (const auto& record: EnvelopeObservations()) {
+				if (record.in_sha256 != in_sha256 || record.in_size != in_size ||
+				    record.cid != cid || record.mkv != mkv || record.key_sha256 != key_sha256 ||
+				    record.salt_sha256 != salt_sha256 ||
+				    !EnvelopeDigestMatches(record.plaintext, in.data() + 0x30))
+					continue;
+				decrypt = "console_observation";
+				if (!Memory::CopyToGuest(reinterpret_cast<void*>(out_ptr), record.plaintext.data(),
+				                         record.plaintext.size())) {
+					guest_output = "copy_fault";
+					return 0x800f0f0e;
+				}
+				guest_output = "written";
+				return 0;
+			}
+			// K+0x290780 answers -19 when the SP mailbox is unavailable.
+			decrypt = "sp_unavailable";
+			return 0xffffffed;
+		}();
+		std::memcpy(fields.data() + 0x340, &result, 4);
+		LOGF("SBL_ENVELOPE_IOCTL guest_pid=%d fd=%d cid=0x%x mkv=%u in_size=0x%" PRIx64
+		     " payload_size=0x%" PRIx64
+		     " local_contract=%s output_requested=%u guest_output=%s decrypt=%s"
+		     " sp_provider=%s sp_status=%s sp_transport=%d sp_open=%d sp_ioctl=%d sp_close=%d"
+		     " sp_cleanup=%d sp_dispatch=%u result=0x%08x%s%s\n",
+		     Process::GetPid(), d, cid, mkv, in_size, payload, local_contract,
+		     out_ptr != 0 ? 1u : 0u, guest_output, decrypt, sp_provider, sp_status, sp_transport,
+		     sp_open, sp_ioctl, sp_close, sp_cleanup, sp_dispatch, result,
+		     in_identity.empty() ? "" : " in_sha256=", in_identity.c_str());
+		return Memory::CopyToGuest(arg, fields.data(), fields.size()) ? OK : KERNEL_ERROR_EFAULT;
+#else
+		return KERNEL_ERROR_ENOSYS;
+#endif
+	}
+
+	// {buf, i32 size, u32 result}, decrypted in place
+	if (file->special == SpecialFile::Rnps) {
+#if defined(_WIN32)
+		if (request != 0xc0105203u) return KERNEL_ERROR_ENOTTY;
+		std::array<uint8_t, 0x10> fields {};
+		if (!Memory::CopyFromGuest(fields.data(), arg, fields.size())) return KERNEL_ERROR_EFAULT;
+		uint64_t buf_ptr   = 0;
+		uint32_t rnps_size = 0;
+		std::memcpy(&buf_ptr, fields.data(), 8);
+		std::memcpy(&rnps_size, fields.data() + 8, 4);
+		if (buf_ptr == 0 || static_cast<int32_t>(rnps_size) <= 0) {
+			LOGF("RNPS_PROVIDER_OPERATION_REJECT guest_pid=%d fd=%d buf_ptr=0x%" PRIx64
+			     " in_size=0x%x reason=%s\n",
+			     Process::GetPid(), d, buf_ptr, rnps_size,
+			     buf_ptr == 0     ? "null_buffer"
+			     : rnps_size == 0 ? "empty_input"
+			                      : "size_outside_i32_domain");
+			return KERNEL_ERROR_EINVAL;
+		}
+		std::vector<uint8_t> bundle(rnps_size);
+		if (!Memory::CopyFromGuest(bundle.data(), reinterpret_cast<const void*>(buf_ptr),
+		                           rnps_size))
+			return KERNEL_ERROR_EFAULT;
+		const auto  in_sha256 = AuthInfo::DigestHex(AuthInfo::Sha256(bundle.data(), bundle.size()));
+		const auto  sp        = EnvelopeSecureProcessor::ProcessRnps(bundle);
+		uint32_t    rnps_result  = sp.operation_result;
+		const char* guest_output = "untouched";
+		int         error        = OK;
+		if (sp.status == EnvelopeSecureProcessor::Status::Success && sp.operation_result == 0) {
+			if (!Memory::CopyToGuest(reinterpret_cast<void*>(buf_ptr), bundle.data(),
+			                         bundle.size())) {
+				error        = KERNEL_ERROR_EFAULT;
+				guest_output = "copy_fault";
+				rnps_result  = 0x800f0f0e;
+			} else {
+				guest_output = "written";
+			}
+		} else if (sp.status == EnvelopeSecureProcessor::Status::NotConfigured ||
+		           sp.status == EnvelopeSecureProcessor::Status::Unavailable ||
+		           sp.status == EnvelopeSecureProcessor::Status::TransportError ||
+		           sp.status == EnvelopeSecureProcessor::Status::ProtocolError) {
+			error = KERNEL_ERROR_EIO;
+		}
+		if (error == OK) {
+			std::memcpy(fields.data() + 0xc, &rnps_result, 4);
+			if (!Memory::CopyToGuest(arg, fields.data(), fields.size()))
+				error = KERNEL_ERROR_EFAULT;
+		}
+		LOGF("RNPS_PROVIDER_OPERATION guest_pid=%d fd=%d request_id=0x%" PRIx64
+		     " in_size=0x%x in_sha256=%s"
+		     " out_size=0x%zx native_result=0x%08x sp_status=%s sp_transport=%d sp_open=%d "
+		     "sp_ioctl=%d"
+		     " sp_close=%d sp_cleanup=%d sp_dispatch=%u guest_output=%s ioctl_result=0x%x\n",
+		     Process::GetPid(), d, sp.request_id, rnps_size, in_sha256.c_str(), sp.written,
+		     rnps_result, EnvelopeSecureProcessor::StatusName(sp.status), sp.transport_result,
+		     sp.native_open_errno, sp.native_ioctl_errno, sp.native_close_errno, sp.cleanup_result,
+		     sp.dispatch_state, guest_output, error);
+		return error;
+#else
+		return KERNEL_ERROR_ENOSYS;
+#endif
 	}
 
 	if (file->special == SpecialFile::Npdrm) {
@@ -7776,6 +8603,34 @@ static int64_t ReadNativeSystemMbus(const std::shared_ptr<NativeMbusReceiveQueue
 	return static_cast<int64_t>(bytes.size());
 }
 
+static int64_t ReadNativeMetadbg(const std::shared_ptr<NativeMetadbgOpen>& opened, int fd,
+                                 void* buf, size_t nbytes) {
+	if (!opened->readable) return KERNEL_ERROR_EBADF;
+	if (nbytes > INT_MAX) return KERNEL_ERROR_EINVAL;
+	if (nbytes == 0) return 0;
+	if (!Memory::CanWriteGuest(buf, nbytes)) return KERNEL_ERROR_EFAULT;
+	const auto       stream = opened->stream;
+	std::unique_lock lock(stream->mutex);
+	if (!stream->shutting_down && stream->received.empty()) {
+		LOGF("METADBG_DEVICE_READ_WAIT guest_pid=%d fd=%d requested=%zu"
+		     " queued_bytes=0\n",
+		     Process::GetPid(), fd, nbytes);
+		stream->cv.wait(lock, [&] { return stream->shutting_down || !stream->received.empty(); });
+	}
+	if (stream->shutting_down) {
+		LOGF("METADBG_DEVICE_READ_CANCELED fd=%d internal_host_teardown=1"
+		     " result=ECANCELED\n",
+		     fd);
+		return KERNEL_ERROR_ECANCELED;
+	}
+	const auto           count = std::min({nbytes, size_t {0x4000}, stream->received.size()});
+	std::vector<uint8_t> bytes(count);
+	std::copy_n(stream->received.begin(), count, bytes.begin());
+	if (!Memory::CopyToGuest(buf, bytes.data(), count)) return KERNEL_ERROR_EFAULT;
+	for (size_t i = 0; i != count; ++i)
+		stream->received.pop_front();
+	return static_cast<int64_t>(count);
+}
 
 static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {
 	if (d < DESCRIPTOR_MIN) {
@@ -7806,7 +8661,16 @@ static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {
 		return KERNEL_ERROR_EPERM;
 	}
 
-	if (buf == nullptr) {
+	if (g_files != nullptr) {
+		if (auto opened = g_files->PinNativeMetadbg(d))
+			return ReadNativeMetadbg(opened, d, buf, nbytes);
+		if (auto opened = g_files->PinNativeMbus(d); opened && opened->system)
+			return ReadNativeSystemMbus(opened, d, buf, nbytes);
+	}
+	if (buf == nullptr &&
+	    (nbytes != 0 || (!IsSectorPayloadDescriptor(d) && !IsIccnvs4SnapshotDescriptor(d) &&
+	                     !IsTmpfsDescriptor(d) && !IsExfatDescriptor(d) &&
+	                     !IsPassthroughDescriptor(d) && !IsLvdDescriptor(d)))) {
 		return KERNEL_ERROR_EFAULT;
 	}
 
@@ -7877,6 +8741,57 @@ static int64_t ReadInternal(int d, void* buf, size_t nbytes, int* read_error) {
 		LOGF("\tRead %" PRIu64 " directory bytes from: %s\n", bytes,
 		     Common::PathToString(file->real_name).c_str());
 		return static_cast<int64_t>(bytes);
+	}
+	if (file->special == SpecialFile::PipeRead) {
+		return ReadGuestPipe(file->pipe, buf, nbytes);
+	}
+	if (file->special == SpecialFile::PipeWrite) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (file->special == SpecialFile::GuestSocketPair) {
+		return ReadGuestPipe(file->pipe, buf, nbytes);
+	}
+	if (file->special == SpecialFile::NativeS3da) {
+		return file->readable ? KERNEL_ERROR_ENOSYS : KERNEL_ERROR_EBADF;
+	}
+	if (file->native_mbus_receive) {
+		if (!file->readable) return KERNEL_ERROR_EBADF;
+		if (nbytes < 80) return KERNEL_ERROR_EWOULDBLOCK;
+		if (!Memory::CanWriteGuest(buf, 80)) return KERNEL_ERROR_EFAULT;
+		auto            inbox = file->native_mbus_receive;
+		std::lock_guard lock(inbox->mutex);
+		if (inbox->closed) return KERNEL_ERROR_EBADF;
+		if (inbox->received.size() < 80) return KERNEL_ERROR_EWOULDBLOCK;
+		std::array<uint8_t, 80> bytes {};
+		std::copy_n(inbox->received.begin(), bytes.size(), bytes.begin());
+		if (!Memory::CopyToGuest(buf, bytes.data(), bytes.size())) return KERNEL_ERROR_EFAULT;
+		inbox->received.erase(inbox->received.begin(), inbox->received.begin() + bytes.size());
+		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_MBUS_READ_QUEUED_BYTES"
+		     " guest_fd=%d bytes=%zu controller_event_origin_must_be_verified\n",
+		     d, bytes.size());
+		return static_cast<int64_t>(bytes.size());
+	}
+	if (file->special == SpecialFile::NativeAvDevice) return KERNEL_ERROR_ENODEV;
+	if (file->special == SpecialFile::Devctl) {
+		if (!file->readable) return KERNEL_ERROR_EBADF;
+		const auto softc    = DevctlShared();
+		const int  nonblock = softc != nullptr ? softc->Nonblock() : -1;
+		if (nonblock < 0) return KERNEL_ERROR_EIO;
+		if (nonblock != 0) return KERNEL_ERROR_EAGAIN;
+		LOGF("DEVCTL_READ_BLOCK guest_pid=%d fd=%d nbytes=%zu\n", Process::GetPid(), d, nbytes);
+		// devread sleeps on "dev cv" and nothing here queues a record, same as an idle console
+		for (;;)
+			std::this_thread::sleep_for(std::chrono::hours(1));
+	}
+	if (file->special == SpecialFile::NativeAvProbe) {
+		static std::atomic<uint32_t> read_count {0};
+		if (read_count.fetch_add(1) < 8) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_AV_PROBE_READ path=%s fd=%d"
+			     " requested_bytes=%zu result=ENODEV"
+			     " NON_AUTHENTIC\n",
+			     file->name.c_str(), d, nbytes);
+		}
+		return KERNEL_ERROR_ENODEV;
 	}
 
 	if (file->special == SpecialFile::DeciStdin) {
@@ -8733,7 +9648,16 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		return OK;
 	}
 
-	LOGF("\t KernelStat: %s\n", path);
+	LOGF("\t KernelStat: %s\n", EscapeLogPath(path).c_str());
+	if (std::strcmp(path, "/dev/s3da") == 0 || std::strcmp(path, "/dev/metadbg") == 0 ||
+	    std::strcmp(path, "/dev/envelope") == 0 ||
+	    (std::strcmp(path, "/dev/mbus") == 0 &&
+	     std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr)) {
+		FileStat stat {};
+		stat.st_mode  = std::strcmp(path, "/dev/s3da") == 0 ? 0020666u : 0020600u;
+		stat.st_nlink = 1;
+		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
+	}
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
 

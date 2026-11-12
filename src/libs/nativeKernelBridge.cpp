@@ -3643,6 +3643,24 @@ Reply SysAvDceOpen(const SyscallRequest& request) {
 	return {fd, 0};
 }
 
+// 0x448530..0x448577 builds "/SceAvControl" on the stack for shm_open (0x1E2),
+// O_RDWR|O_CREAT|O_EXCL 0xA02, 0644
+Reply SysAvControlShmOpen(const SyscallRequest& request) {
+	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
+	    request.args[0] == 0 || request.args[1] != 0xa02 || request.args[2] != 0x1a4) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	const int fd = LibKernel::FileSystem::KernelShmOpen(
+	    "/SceAvControl", static_cast<int>(request.args[1]), static_cast<uint16_t>(request.args[2]));
+	if (fd < 0) {
+		return {-1, *Libs::Posix::GetErrorAddr()};
+	}
+	LOGF("FIRST_FRAME_AUDIT SYSAV_SHM_OPEN"
+	     " name=/SceAvControl guest_fd=%d"
+	     " shared_memory_descriptor\n",
+	     fd);
+	return {fd, 0};
+}
 
 Reply SysAvControlShmTruncate(const SyscallRequest& request) {
 	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
@@ -4921,6 +4939,135 @@ Reply SysAvGuestSocketSendto(const SyscallRequest& request) {
 	return {sent, 0};
 }
 
+Reply SysAvNativeKevent(const SyscallRequest& request) {
+	if (request.number == 0x16b && request.args[1] == 0 && request.args[2] == 0 &&
+	    request.args[4] != 0) {
+		return NativeKeventWait(request);
+	}
+	if (request.number == 0x16b && request.args[2] != 0 && request.args[3] == 0 &&
+	    request.args[4] == 0 && request.args[5] == 0) {
+		if (request.args[2] != 1 && request.args[2] != 4) return NativeKeventChanges(request);
+		LibKernel::EventQueue::KernelEvent first {};
+		if (!LibKernel::Memory::CopyFromGuest(
+		        &first, reinterpret_cast<const void*>(request.args[1]), sizeof(first))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		if (first.filter == LibKernel::EventQueue::KERNEL_EVFILT_READ ||
+		    first.filter == LibKernel::EventQueue::KERNEL_EVFILT_NOTIFY ||
+		    (first.filter == LibKernel::EventQueue::KERNEL_EVFILT_USER && first.flags == 0x21)) {
+			return NativeKeventChanges(request);
+		}
+	}
+	// libSceVideoOut 0x4691C0 EV_ADD EVFILT_VIDEO_OUT, bound to the main VideoOut's flips
+	if (request.number == 0x16b && request.args[0] >= 3 && request.args[0] <= INT32_MAX &&
+	    request.args[1] != 0 && request.args[2] == 1 && request.args[3] == 0 &&
+	    request.args[4] == 0 && request.args[5] == 0) {
+		LibKernel::Memory::VirtualQueryInfo guest {};
+		const auto                          addr = request.args[1];
+		if (addr <= UINT64_MAX - sizeof(LibKernel::EventQueue::KernelEvent) &&
+		    LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(addr), 0, &guest,
+		                                          sizeof(guest)) == 0 &&
+		    guest.is_committed && guest.start <= addr &&
+		    guest.end >= addr + sizeof(LibKernel::EventQueue::KernelEvent) &&
+		    (guest.protection & 1u) != 0) {
+			LibKernel::EventQueue::KernelEvent original {};
+			if (!LibKernel::Memory::CopyFromGuest(&original, reinterpret_cast<const void*>(addr),
+			                                      sizeof(original))) {
+				return {-1, Libs::Posix::POSIX_EFAULT};
+			}
+			if (original.filter == LibKernel::EventQueue::KERNEL_EVFILT_VIDEO_OUT &&
+			    original.flags == 1 && original.fflags == 0 && original.data == 0 &&
+			    original.udata == nullptr) {
+				int64_t actual_queue = 0;
+				if (!LibKernel::FileSystem::ResolveNativeKqueueDescriptor(
+				        static_cast<int>(request.args[0]), &actual_queue)) {
+					return {-1, Libs::Posix::POSIX_EBADF};
+				}
+				const int rc =
+				    LibKernel::FileSystem::RegisterNativeDceFlipEvent(actual_queue, original.ident);
+				if (rc != 0) return {-1, LibKernel::KernelToPosix(rc)};
+				return {0, 0};
+			}
+		}
+	}
+	// TID7 kevent, nevents=1, 200 ms. Woken by EVFILT_USER ident 2, NOTE_TRIGGER
+	if (request.number == 0x16b &&
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr &&
+	    request.args[0] >= 3 && request.args[0] <= INT32_MAX && request.args[1] != 0 &&
+	    request.args[2] == 1 && request.args[3] == 0 && request.args[4] == 0 &&
+	    request.args[5] == 0) {
+		const auto                          pointer = request.args[1];
+		LibKernel::Memory::VirtualQueryInfo guest {};
+		if (LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(pointer), 0, &guest,
+		                                          sizeof(guest)) != 0 ||
+		    !guest.is_committed || guest.start > pointer ||
+		    guest.end < pointer + sizeof(LibKernel::EventQueue::KernelEvent) ||
+		    (guest.protection & 1u) == 0) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		LibKernel::EventQueue::KernelEvent change {};
+		if (!LibKernel::Memory::CopyFromGuest(&change, reinterpret_cast<const void*>(pointer),
+		                                      sizeof(change))) {
+			return {-1, Libs::Posix::POSIX_EFAULT};
+		}
+		if ((change.ident != 1 && change.ident != 2) ||
+		    change.filter != LibKernel::EventQueue::KERNEL_EVFILT_USER || change.flags != 0 ||
+		    change.fflags != 0x01000000u || change.data != 0 || change.udata != nullptr) {
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+		int64_t actual_queue = 0;
+		if (!LibKernel::FileSystem::ResolveNativeKqueueDescriptor(static_cast<int>(request.args[0]),
+		                                                          &actual_queue)) {
+			return {-1, Libs::Posix::POSIX_EBADF};
+		}
+		const int rc = LibKernel::EventQueue::KernelTriggerUserEvent(
+		    actual_queue, static_cast<int>(change.ident), nullptr);
+		if (rc != 0) {
+			return {-1, LibKernel::KernelToPosix(rc)};
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KEVENT_USER_TRIGGERED"
+		     " queue=%" PRId64 " event_id=%" PRIuPTR
+		     " native_filter=EVFILT_USER native_note=NOTE_TRIGGER"
+		     " worker_wakeup_queued\n",
+		     actual_queue, change.ident);
+		return {0, 0};
+	}
+	if (request.number != 0x16b ||
+	    std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
+	    request.args[1] == 0 || request.args[2] != 4 || request.args[3] != 0 ||
+	    request.args[4] != 0 || request.args[5] != 0 ||
+	    request.args[0] > static_cast<uint64_t>(INT32_MAX)) {
+		return {-1, Libs::Posix::POSIX_ENOSYS};
+	}
+	int64_t handle = 0;
+	if (!LibKernel::FileSystem::ResolveNativeKqueueDescriptor(static_cast<int>(request.args[0]),
+	                                                          &handle)) {
+		return {-1, Libs::Posix::POSIX_EBADF};
+	}
+	std::array<LibKernel::EventQueue::KernelEvent, 4> events {};
+	if (!LibKernel::Memory::CopyFromGuest(
+	        events.data(), reinterpret_cast<const void*>(request.args[1]), sizeof(events))) {
+		return {-1, Libs::Posix::POSIX_EFAULT};
+	}
+	for (uint64_t i = 0; i != 4; ++i) {
+		const auto& ev = events[i];
+		if (ev.ident != i + 1 || ev.filter != LibKernel::EventQueue::KERNEL_EVFILT_USER ||
+		    ev.flags != 0x21 || ev.fflags != 0 || ev.data != 0 || ev.udata != nullptr) {
+			return {-1, Libs::Posix::POSIX_ENOSYS};
+		}
+	}
+	for (int i = 0; i != 4; ++i) {
+		const int rc = LibKernel::EventQueue::KernelAddUserEventEdge(handle, i + 1);
+		if (rc != 0) {
+			return {-1, Libs::Posix::POSIX_EINVAL};
+		}
+	}
+	LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KEVENT_REGISTER"
+	     " guest_fd=%" PRIu64 " backed_queue=%" PRId64 " native_change_filters=4xEVFILT_USER"
+	     " ids=1,2,3,4 flags=EV_ADD|EV_CLEAR event_queue\n",
+	     request.args[0], handle);
+	return {0, 0};
+}
 
 Reply SysAvEmptyMprotect(const SyscallRequest& request) {
 	if (request.number != 0x4a || request.args[0] != 0 || request.args[1] != 0 ||
@@ -5679,6 +5826,109 @@ Reply DispatchSyscall(const SyscallRequest& request) {
 				result = MiniSyscoreWrite(request);
 			}
 			break;
+		case 0x05:
+			result = std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr
+			             ? MiniSyscoreOpen(request)
+			             : SysAvDceOpen(request);
+			break;
+		case 0x07:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_WAIT4_NATIVE_SYSCALL") != nullptr) {
+				auto* status_ptr = reinterpret_cast<int32_t*>(request.args[1]);
+				if (request.args[3] != 0) {
+					result = {-1, Libs::Posix::POSIX_ENOSYS};
+					break;
+				}
+				if (status_ptr != nullptr &&
+				    !LibKernel::Memory::CanWriteGuestNoTrace(status_ptr, sizeof(*status_ptr))) {
+					result = {-1, Libs::Posix::POSIX_EFAULT};
+					break;
+				}
+				const int child = LibKernel::Process::WaitForChild(
+				    static_cast<int32_t>(request.args[0]), reinterpret_cast<uint32_t*>(status_ptr),
+				    static_cast<int32_t>(request.args[2]), true);
+				if (child < 0) {
+					result = {-1, LibKernel::KernelToPosix(child)};
+					break;
+				}
+				LOGF("MINI_SYSCORE_WAIT4_NATIVE_REAPED parent_pid=%d child_pid=%d NON_AUTHENTIC "
+				     "env_gated\n",
+				     LibKernel::Process::GetPid(), child);
+				result = {child, 0};
+			}
+			break;
+		case 0xbc:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr) {
+				result = MiniSyscoreStat(request);
+			}
+			break;
+		case 0xa5:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr) {
+				LibKernel::Memory::VirtualQueryInfo region {};
+				const uint64_t                      addr = request.args[1];
+				const bool                          readable =
+				    addr != 0 && addr <= UINT64_MAX - 8 &&
+				    LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(addr), 0,
+					                                      &region, sizeof(region)) == 0 &&
+				    region.is_committed && region.start <= addr && region.end >= addr + 8 &&
+				    (region.protection & 1u) != 0;
+				uint64_t argument = 0;
+				if (readable) {
+					std::memcpy(&argument, reinterpret_cast<const void*>(addr), sizeof(argument));
+				}
+				LibKernel::Memory::VirtualQueryInfo thread_region {};
+				const bool                          target_mapped =
+				    readable && argument != 0 && argument <= UINT64_MAX - 0x40 &&
+				    LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(argument),
+					                                      0, &thread_region,
+					                                      sizeof(thread_region)) == 0 &&
+				    thread_region.is_committed && thread_region.start <= argument &&
+				    thread_region.end >= argument + 0x40 && (thread_region.protection & 1u) != 0;
+				if (request.args[0] == 0x81 && readable && (argument == 0 || target_mapped)) {
+					Loader::SetMiniSyscoreNativeThreadFsBase(argument);
+					result = {0, 0};
+				}
+				static std::atomic<uint32_t> sysarch_traces {0};
+				if (sysarch_traces.fetch_add(1) < 16) {
+					LOGF("FIRST_FRAME_AUDIT MINI_SYSCORE_SYSARCH"
+					     " op=0x%016" PRIx64 " pointer=0x%016" PRIx64
+					     " mapped=%u input_qword=0x%016" PRIx64
+					     " target_mapped=%u result=0x%016" PRIx64 " kernel_guest_fsbase_state\n",
+					     request.args[0], addr, readable ? 1u : 0u, argument,
+					     target_mapped ? 1u : 0u, static_cast<uint64_t>(result.value));
+				}
+			}
+			break;
+		case 0x1e2:
+			result = SysAvAudioShmOpen(request);
+			if (result.value == -1 && result.posix_errno == Libs::Posix::POSIX_ENOSYS) {
+				result = SysAvControlShmOpen(request);
+			}
+			break;
+		case 0x1e0:
+			result = SysAvAudioShmTruncate(request);
+			if (result.value == -1 && result.posix_errno == Libs::Posix::POSIX_ENOSYS) {
+				result = SysAvControlShmTruncate(request);
+			}
+			break;
+		case 0xbd:
+			result = SysAvAudioShmFstat(request);
+			if (result.value == -1 && result.posix_errno == Libs::Posix::POSIX_ENOSYS) {
+				result = SysAvControlShmFstat(request);
+			}
+			break;
+		case 0x06:
+			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr) {
+				if (request.args[0] > INT32_MAX) {
+					result = {-1, Libs::Posix::POSIX_EBADF};
+				} else {
+					const int rc =
+					    LibKernel::FileSystem::KernelClose(static_cast<int>(request.args[0]));
+					result = rc == 0 ? Reply {0, 0} : Reply {-1, LibKernel::KernelToPosix(rc)};
+				}
+			} else {
+				result = SysAvControlShmClose(request);
+			}
+			break;
 		case 0x87:
 			if (std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr) {
 				result = MiniSyscoreSocketpair(request);
@@ -5783,6 +6033,40 @@ Reply DispatchSyscall(const SyscallRequest& request) {
 				: (request.args[1] == 0x4000 && SysAvGuestNameIs(request.args[2], "/SceAo2TVCorP"))
 			        ? SysAvNameAudioSharedMemory(request)
 			        : SysAvNameStackGuard(request);
+			break;
+		case 0xd1: result = SyscoreNativePoll(request); break;
+		case 0xf0: result = SysAvNativeNanosleep(request); break;
+		case 0xe8: result = SysAvNativeClockGettime(request); break;
+		case 0x1c6: result = SysAvNativeUmtx(request); break;
+		case 0x1c7: result = SysAvThrNew(request); break;
+		case 0x24b: result = SysAvGetAuthInfo(request); break;
+		case 0x25f: result = SysAvGetSelfAuthInfo(request); break;
+		case 0x1b0: result = SysAvThrSelf(request); break;
+		case 0x268: result = SysAvThrGetName(request); break;
+		case 0x26e: result = SysAvIpmiManagerCall(request); break;
+		case 0x259: result = SysAvNativeMdbgService(request); break;
+		case 0x1af: result = SysAvThrExit(request); break;
+		case 0x1d2: result = SysAvRtprioThread(request); break;
+		case 0x1a0: result = SysAvSigaction(request); break;
+		case 0x154: result = SysAvSigprocmask(request); break;
+		case 0x16a: result = SysAvNativeKqueue(request); break;
+		case 0x238: result = BudgetCreate(request); break;
+		case 0x239: result = BudgetDelete(request); break;
+		case 0x23a: result = BudgetGetResourceLimit(request); break;
+		case 0x23b: result = BudgetSet(request); break;
+		case 0x261: result = BudgetGet(request); break;
+		case 0x2c2: result = AppMountBegin(request); break;
+		case 0x2c3: result = AppMountEnd(request); break;
+		case 0x25b: result = SyscoreNativeRdup(request); break;
+		case 0x258: result = AppSandboxPath(request); break;
+		case 0x249: result = AppIsInSandbox(request); break;
+		case 0x262: result = AppBudgetGetPtype(request); break;
+		case 0xc: result = GuestChdir(request); break;
+		case 0x3d: result = GuestChroot(request); break;
+		case 0x16b:
+			result = std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr
+			             ? MiniSyscoreKevent(request)
+			             : SysAvNativeKevent(request);
 			break;
 		case 0x5d: result = SysAvGuestSocketSelect(request); break;
 		case 0x1d: result = SysAvGuestSocketRecvfrom(request); break;

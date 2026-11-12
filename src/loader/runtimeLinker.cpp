@@ -1591,7 +1591,38 @@ static bool IsWritableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// ioctl 0x80308217: 0x30-byte IOC_IN envelope, payload pointer at +0x10. Register is 0x37 with 0x30
+// bytes (0x4668CA..0x466919), flip 0x36 with 0x48 bytes plus an 8-byte result (0x464BD3..0x464C56).
+struct OriginalDceDeviceIoctl {
+	uint64_t command;       // 0x36=flip or 0x37=register
+	uint32_t display_id;    // native backend context +0x6c0
+	uint32_t payload_size;  // 0x48 for flip, 0x30 for register
+	uint64_t payload_addr;  // +0x10: nested guest input
+	uint64_t index_or_zero; // +0x18: registration index or flip zero
+	uint64_t result_addr;   // +0x20: flip's independent output word
+	uint64_t result_size;   // +0x28: flip 8; registration 0
+};
+static_assert(sizeof(OriginalDceDeviceIoctl) == 0x30);
+static_assert(offsetof(OriginalDceDeviceIoctl, payload_addr) == 0x10);
+static_assert(offsetof(OriginalDceDeviceIoctl, index_or_zero) == 0x18);
+static_assert(offsetof(OriginalDceDeviceIoctl, result_addr) == 0x20);
 
+static bool IsOriginalDceDeviceRequest(uint64_t pointer) {
+	if (!IsReadableRange(pointer, sizeof(OriginalDceDeviceIoctl))) {
+		return false;
+	}
+	OriginalDceDeviceIoctl arg {};
+	std::memcpy(&arg, reinterpret_cast<const void*>(pointer), sizeof(arg));
+	if (arg.command == 0x36) {
+		return arg.payload_size == 0x48 && arg.index_or_zero == 0 && arg.result_size == 8 &&
+		       IsReadableRange(arg.payload_addr, 0x48) && IsWritableRange(arg.result_addr, 8);
+	}
+	if (arg.command == 0x37) {
+		return arg.payload_size == 0x30 && arg.index_or_zero < 0x11 && arg.result_addr == 0 &&
+		       arg.result_size == 0 && IsReadableRange(arg.payload_addr, 0x30);
+	}
+	return false;
+}
 #endif
 
 static bool
@@ -3593,6 +3624,53 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					return true;
 				}
 			}
+			// open(5) at 0x46f12a also gets /dev/dmem0..2 from the 0x476670 allocator init. These
+			// are formatted on the guest stack, so check the whole string
+			if (info->rax == 0x05 && info->rdi >= 0x7e0000000ull && info->rsi == 2 &&
+			    info->rdx == 0 && IsReadableRange(info->rdi, 64)) {
+				char original_path[64] {};
+				std::memcpy(original_path, reinterpret_cast<const void*>(info->rdi),
+				            sizeof(original_path));
+				if (std::memchr(original_path, 0, sizeof(original_path)) != nullptr) {
+					LOGF("FIRST_FRAME_AUDIT SYSAV_DYNAMIC_OPEN_PATH"
+					     " guest_ptr=0x%016" PRIx64 " guest_string=%s\n",
+					     info->rdi, original_path);
+				}
+			}
+			const bool original_dce_path =
+			    info->rdi == 0x4c04ac && IsReadableRange(info->rdi, sizeof("/dev/dce"));
+			const bool original_av_control_path =
+			    info->rdi == 0x4c2a7d && IsReadableRange(info->rdi, sizeof("/dev/av_control")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/av_control",
+				            sizeof("/dev/av_control")) == 0;
+			const bool original_hdmi_path  = info->rdi == 0x4c3bf3 &&
+			                                 IsReadableRange(info->rdi, sizeof("/dev/hdmi")) &&
+			                                 std::memcmp(reinterpret_cast<const void*>(info->rdi),
+			                                             "/dev/hdmi", sizeof("/dev/hdmi")) == 0;
+			const bool original_dipsw_path = info->rdi == 0x4c8a25 &&
+			                                 IsReadableRange(info->rdi, sizeof("/dev/dipsw")) &&
+			                                 std::memcmp(reinterpret_cast<const void*>(info->rdi),
+			                                             "/dev/dipsw", sizeof("/dev/dipsw")) == 0;
+			const bool original_dynamic_hdmi_path =
+			    info->rdi >= 0x7e0000000ull && info->rdi < 0x800000000ull &&
+			    IsReadableRange(info->rdi, sizeof("/dev/hdmi")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/hdmi",
+				            sizeof("/dev/hdmi")) == 0;
+			const bool original_dynamic_av_control_path =
+			    info->rdi >= 0x7e0000000ull && info->rdi < 0x800000000ull &&
+			    IsReadableRange(info->rdi, sizeof("/dev/av_control")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/av_control",
+				            sizeof("/dev/av_control")) == 0;
+			const bool original_dynamic_scanin_path =
+			    info->rdi >= 0x7e0000000ull && info->rdi < 0x800000000ull &&
+			    IsReadableRange(info->rdi, sizeof("/dev/scanin")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/scanin",
+				            sizeof("/dev/scanin")) == 0;
+			const bool original_dynamic_hmd_cmd_path =
+			    info->rdi >= 0x7e0000000ull && info->rdi < 0x800000000ull &&
+			    IsReadableRange(info->rdi, sizeof("/dev/hmd_cmd")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/hmd_cmd",
+				            sizeof("/dev/hmd_cmd")) == 0;
 			const bool original_mbus_av_path =
 			    IsReadableRange(info->rdi, sizeof("/dev/mbus_av")) &&
 			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "/dev/mbus_av",
@@ -3644,6 +3722,27 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					     " open_flags=0x5 ENOENT\n");
 				}
 				return true;
+			}
+			if (info->rax == 0x05 && info->rsi == 2 && (info->rdx == 0 || original_dipsw_path) &&
+			    (original_dce_path || original_dmem_path || original_av_control_path ||
+			     original_hdmi_path || original_dipsw_path || original_dynamic_hdmi_path ||
+			     original_dynamic_av_control_path || original_dynamic_scanin_path ||
+			     original_dynamic_hmd_cmd_path || original_mbus_av_path)) {
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value >= 3 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = reply.value < 0 ? static_cast<uint64_t>(reply.posix_errno)
+					                                : static_cast<uint64_t>(reply.value);
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_DCE_OPEN_RETURN"
+					     " fd_or_errno=%" PRIu64 " guest_CF=%u\n",
+					     context->Rax, static_cast<unsigned>(context->EFlags & 1));
+					return true;
+				}
 			}
 			if (info->rax == 0x1e2 && info->rsi == 0xa02 && info->rdx == 0x1a4 &&
 			    IsReadableRange(info->rdi, sizeof("/SceAvControl")) &&
@@ -3822,6 +3921,101 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					    rc == 0 ? 0 : static_cast<uint64_t>(Libs::LibKernel::KernelToPosix(rc));
 					context->EFlags = (context->EFlags & ~uint32_t {1}) | (rc == 0 ? 0u : 1u);
 					context->Rip += 2;
+					return true;
+				}
+			}
+			// Its worker then calls ioctl(0xffffffff,0xc0109a0e,..); return the EBADF Kyty gives
+			// for the bad descriptor.
+			if (info->rax == 0x36 && info->rdi == UINT32_MAX && info->rsi == 0xc0109a0e &&
+			    IsReadableRange(info->rdx, 0x10)) {
+				const int rc = Libs::LibKernel::FileSystem::KernelIoctl(
+				    -1, info->rsi, reinterpret_cast<void*>(info->rdx));
+				if (rc == Libs::LibKernel::KERNEL_ERROR_EBADF) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax  = static_cast<uint64_t>(Libs::Posix::POSIX_EBADF);
+					context->EFlags |= uint32_t {1};
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_AV_CONTROL_IOCTL_BAD_FD"
+					     " request=0xc0109a0e device_open_failed"
+					     " EBADF\n");
+					return true;
+				}
+			}
+			if (info->rax == 0x36 && info->rdi >= 3 && info->rdi <= INT32_MAX &&
+			    ((info->rsi == 0x80208218 && IsReadableRange(info->rdx, 0x20)) ||
+			     (info->rsi == 0xc0588212 && IsWritableRange(info->rdx, 0x58)) ||
+			     (info->rsi == 0x80308217 &&
+			      IsReadableRange(info->rdx, sizeof(OriginalDceDeviceIoctl))) ||
+			     (info->rsi == 0x4008800a && IsWritableRange(info->rdx, 0x8)) ||
+			     (info->rsi == 0xc0288001 && IsWritableRange(info->rdx, 0x28)) ||
+			     (info->rsi == 0xc018800f && IsReadableRange(info->rdx, 0x18) &&
+			      Libs::LibKernel::FileSystem::IsNativeDmemDescriptor(
+			          static_cast<int>(info->rdi))) ||
+			     (info->rsi == 0x80108002 && IsReadableRange(info->rdx, 0x10) &&
+			      Libs::LibKernel::FileSystem::IsNativeDmemDescriptor(
+			          static_cast<int>(info->rdi))))) {
+				// walks back to the callers of the display config and flip-control commands. Keep
+				// formatting shallow, this is a first-chance handler on a small guest stack
+				if (info->rsi == 0x80308217 && !IsOriginalDceDeviceRequest(info->rdx)) {
+					OriginalDceDeviceIoctl dce {};
+					std::memcpy(&dce, reinterpret_cast<const void*>(info->rdx), sizeof(dce));
+					LOGF("FIRST_FRAME_AUDIT SYSAV_UNIMPLEMENTED_DCE_IOCTL"
+					     " command=0x%016" PRIx64 " display_id=%u size=%u"
+					     " payload=0x%016" PRIx64 " index=0x%016" PRIx64 " result=0x%016" PRIx64
+					     " result_size=%" PRIu64 " forwarded_to_device\n",
+					     dce.command, dce.display_id, dce.payload_size, dce.payload_addr,
+					     dce.index_or_zero, dce.result_addr, dce.result_size);
+					if (dce.command == 9 && dce.payload_size == 8 && dce.result_size == 8 &&
+					    IsReadableRange(dce.payload_addr, 8) &&
+					    IsReadableRange(dce.result_addr, 8) &&
+					    IsWritableRange(dce.result_addr, 8)) {
+						uint64_t original_input = 0, original_result = 0;
+						std::memcpy(&original_input,
+						            reinterpret_cast<const void*>(dce.payload_addr), 8);
+						std::memcpy(&original_result,
+						            reinterpret_cast<const void*>(dce.result_addr), 8);
+						LOGF("FIRST_FRAME_AUDIT SYSAV_VIDEOOUT_DCE_COMMAND9_INPUT"
+						     " input=0x%016" PRIx64 " result_before=0x%016" PRIx64 "\n",
+						     original_input, original_result);
+					}
+				}
+				if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_VERBOSE_DCE_STACK") &&
+				    info->rsi == 0x80208218 && IsReadableRange(info->rdx, 0x20)) {
+					uint64_t dce_words[4] {};
+					std::memcpy(dce_words, reinterpret_cast<const void*>(info->rdx),
+					            sizeof(dce_words));
+					if (dce_words[0] == 10 || dce_words[0] == 12) {
+						static std::atomic_uint32_t dce_caller_samples {0};
+						if (dce_caller_samples.fetch_add(1) < 6) {
+							uint64_t frame = info->rbp;
+							LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_CALL_CHAIN"
+							     " command=%" PRIu64 " syscall_rbp=0x%016" PRIx64 "\n",
+							     dce_words[0], frame);
+							for (unsigned i = 0; i < 8 && IsReadableRange(frame, 16); ++i) {
+								uint64_t chain[2] {};
+								std::memcpy(chain, reinterpret_cast<const void*>(frame),
+								            sizeof(chain));
+								LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_CALL_FRAME"
+								     " command=%" PRIu64 " depth=%u return_pc=0x%016" PRIx64 "\n",
+								     dce_words[0], i, chain[1]);
+								if (chain[0] <= frame || chain[0] - frame > 0x1000000) break;
+								frame = chain[0];
+							}
+						}
+					}
+				}
+				const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+				    {info->rax, {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+				if ((reply.value == 0 && reply.posix_errno == 0) ||
+				    (reply.value == -1 && reply.posix_errno > 0)) {
+					auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+					context->Rax = reply.value == -1 ? static_cast<uint64_t>(reply.posix_errno) : 0;
+					context->EFlags =
+					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
+					context->Rip += 2;
+					LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_DCE_IOCTL_RETURN"
+					     " request=0x%08" PRIx64 " guest_CF=%u\n",
+					     info->rsi, static_cast<unsigned>(context->EFlags & 1));
 					return true;
 				}
 			}
@@ -4260,6 +4454,69 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					    (context->EFlags & ~uint32_t {1}) | (reply.value == -1 ? 1u : 0u);
 					context->Rip += 2;
 					return true;
+				}
+			}
+			const bool original_static_named_object = info->rdi >= 0x4a4000 && info->rdi < 0x4e0000;
+			const bool original_mbus_probe_named_object =
+			    std::getenv("KYTY_DIAGNOSTIC_SYSAV_AV_DEVICE_PROBE") != nullptr &&
+			    info->rdi >= 0x7e0000000ull && info->rdi < 0x800000000ull;
+			int64_t    original_splash_named_queue = 0;
+			const bool original_splash_equeue_name =
+			    info->rax == 0x22d && original_static_named_object && info->rdx == 0x107 &&
+			    info->rsi >= 3 && info->rsi <= INT32_MAX &&
+			    IsReadableRange(info->rdi, sizeof("SceAvControlSplash")) &&
+			    std::memcmp(reinterpret_cast<const void*>(info->rdi), "SceAvControlSplash",
+				            sizeof("SceAvControlSplash")) == 0 &&
+			    Libs::LibKernel::FileSystem::ResolveNativeKqueueDescriptor(
+			        static_cast<int>(info->rsi), &original_splash_named_queue);
+			if (info->rax == 0x22d && std::getenv("KYTY_DIAGNOSTIC_NAMEDOBJ_ID_TABLE") != nullptr) {
+				static std::atomic_uint32_t named_object_audit_count {0};
+				if (named_object_audit_count.fetch_add(1) < 28) {
+					char audited_name[49] {};
+					if (IsReadableRange(info->rdi, sizeof(audited_name) - 1)) {
+						std::memcpy(audited_name, reinterpret_cast<const void*>(info->rdi),
+						            sizeof(audited_name) - 1);
+						for (auto& c: audited_name) {
+							if (c == '\0') break;
+							if (c < ' ' || c > '~') c = '?';
+						}
+					}
+					LOGF("FIRST_FRAME_AUDIT SYSAV_UNFILTERED_NAMED_OBJECT"
+					     " name=%s name_addr=0x%016" PRIx64 " object=0x%016" PRIx64
+					     " type=0x%016" PRIx64 " name_static=%u probe_name=%u"
+					     "\n",
+					     audited_name, info->rdi, info->rsi, info->rdx,
+					     original_static_named_object ? 1u : 0u,
+					     original_mbus_probe_named_object ? 1u : 0u);
+				}
+			}
+			if (info->rax == 0x22d &&
+			    (original_static_named_object || original_mbus_probe_named_object) &&
+			    IsReadableRange(info->rdi, 64) && info->rsi != 0 &&
+			    // 0x101/0x102 carry a guest pointer; named kqueue 0x107 passes a plain fd (e.g.
+			    // 26), don't probe it
+			    ((info->rdx == 0x107) || IsReadableRange(info->rsi, 16)) &&
+			    (info->rdx == 0x101 || info->rdx == 0x102 || original_splash_equeue_name) &&
+			    std::getenv("KYTY_DIAGNOSTIC_NAMEDOBJ_ID_TABLE") != nullptr) {
+				const char*  original_name = reinterpret_cast<const char*>(info->rdi);
+				const auto*  name_end = static_cast<const char*>(std::memchr(original_name, 0, 64));
+				const size_t length   = name_end == nullptr ? 0 : name_end - original_name;
+				if (length >= 1 && length <= 48 &&
+				    std::all_of(original_name, original_name + length,
+				                [](char c) { return c >= 0x20 && c <= 0x7e; })) {
+					const auto reply = Libs::NativeKernelBridge::DispatchSyscall(
+					    {info->rax,
+						 {info->rdi, info->rsi, info->rdx, info->r10, info->r8, info->r9}});
+					if (reply.value > 0 && reply.value <= 0xfffe && reply.posix_errno == 0) {
+						auto* context = reinterpret_cast<CONTEXT*>(info->native_context);
+						context->Rax  = static_cast<uint64_t>(reply.value);
+						context->EFlags &= ~uint32_t {1};
+						context->Rip += 2;
+						LOGF("FIRST_FRAME_AUDIT SYSAV_NAMED_OBJECT_ID"
+						     " name=%s assigned_diagnostic_id=%" PRId64 " NON_AUTHENTIC\n",
+						     reinterpret_cast<const char*>(info->rdi), reply.value);
+						return true;
+					}
 				}
 			}
 			// 0x22e on AV-controller failure cleanup releases IDs from the process-local table

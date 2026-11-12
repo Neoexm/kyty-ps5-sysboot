@@ -1,4 +1,7 @@
 #if defined(_WIN32)
+extern "C" size_t KytyVideoOutSysSetModeRegistrationCountForTest(uint32_t head);
+extern "C" size_t KytyVideoOutSysVblankRegistrationCountForTest(uint32_t head);
+
 namespace NativeAvTest {
 namespace VO = Libs::VideoOut;
 namespace Memory = Libs::LibKernel::Memory;
@@ -155,4 +158,6 @@ private:
 };
 }
 #else
+void CheckNativeAvControls(Libs::Graphics::WindowContext&,
+                           const Config::ConfigOptions&) {}
 #endif

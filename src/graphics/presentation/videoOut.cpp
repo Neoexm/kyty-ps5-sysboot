@@ -48,6 +48,7 @@ constexpr int      VIDEO_OUT_EVENT_FLIP                                 = 0;
 constexpr int      VIDEO_OUT_EVENT_VBLANK                               = 1;
 constexpr int      VIDEO_OUT_EVENT_PRE_VBLANK_START                     = 2;
 constexpr int      VIDEO_OUT_EVENT_SET_MODE                             = 8;
+constexpr int      VIDEO_OUT_EVENT_SET_MODE_INTERNAL                     = 0x10008;
 constexpr int      VIDEO_OUT_TRUE                                       = 1;
 constexpr int      VIDEO_OUT_FALSE                                      = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
@@ -76,6 +77,7 @@ enum class VideoOutEventKind : uintptr_t {
 	Vblank         = VIDEO_OUT_EVENT_VBLANK,
 	PreVblankStart = VIDEO_OUT_EVENT_PRE_VBLANK_START,
 	OutputMode     = VIDEO_OUT_EVENT_SET_MODE,
+	SetMode        = VIDEO_OUT_EVENT_SET_MODE_INTERNAL,
 };
 
 enum class FlipRequestSource { Cpu, GpuEop };
@@ -98,6 +100,7 @@ struct VideoOutEventState {
 	VideoOutEventQueues pre_vblank;
 	VideoOutEventQueues vblank;
 	VideoOutEventQueues output_mode;
+	VideoOutEventQueues set_mode;
 };
 
 struct VideoOutBufferAttribute2 {
@@ -195,7 +198,16 @@ struct VideoOutConfig {
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
+	// DCE signal timing, not the 1920x1080 logo surface size
+	uint32_t                            native_signal_width             = 0;
+	uint32_t                            native_signal_height            = 0;
+	uint32_t                            native_signal_h_total           = 0;
+	uint32_t                            native_signal_v_total           = 0;
+	float                               native_signal_refresh_hz        = 0.0f;
+	uint32_t                            native_signal_pixel_clock_10khz = 0;
+	bool                                native_signal_pending           = false;
 	bool                                native_signal_active            = false;
+	uint32_t                            native_signal_ppll_100hz        = 0;
 	uint64_t                            native_timing_generation        = 0;
 	bool                                native_scanout_bound            = false;
 	bool                                native_scanout_enabled          = false;
@@ -218,6 +230,16 @@ struct VideoOutVblankPhase {
 };
 
 enum class VideoOutCloseMode { Direct, User, Native, NativeClient };
+static bool NativeVblankPeriod(uint64_t frequency, uint32_t h_total, uint32_t v_total,
+                               uint32_t ppll_rate_100hz, uint64_t& numerator,
+                               uint64_t& denominator) {
+	if (frequency == 0 || h_total == 0 || v_total == 0 || ppll_rate_100hz == 0) return false;
+	const uint64_t pixels = uint64_t {h_total} * v_total;
+	if (frequency > std::numeric_limits<uint64_t>::max() / pixels) return false;
+	numerator   = frequency * pixels;
+	denominator = uint64_t {ppll_rate_100hz} * 100u;
+	return numerator >= denominator;
+}
 class FlipQueue {
 public:
 	explicit FlipQueue(Graphics::Presenter& presenter): m_presenter(presenter) {
@@ -288,6 +310,9 @@ public:
 	VideoOutConfig* Get(int handle, uint64_t& generation);
 	bool            IsOpened(int handle);
 	int             SetFlipMaster(int slave_handle, int master_handle);
+	int             AddSysSetModeEvent(EventQueue::KernelEqueue eq, uint32_t head, void* udata);
+	int             AddSysVblankEvent(EventQueue::KernelEqueue eq, uint32_t head, void* udata);
+	void            GetSysVblankStatus(uint32_t head, VideoOutVblankStatus* status);
 
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
@@ -304,10 +329,15 @@ private:
 	Graphics::Presenter&     m_presenter;
 	FlipQueue                m_flip_queue;
 	std::jthread             m_present_thread;
+	// Sys vblank registrations are per head and belong to no handle.
+	std::array<std::shared_ptr<VideoOutEventState>, 2> m_sys_events {
+	    std::make_shared<VideoOutEventState>(), std::make_shared<VideoOutEventState>()};
+	std::array<VideoOutVblankStatus, 2> m_sys_vblank_status;
 };
 
 static std::unique_ptr<VideoOutDriver> g_video_out_driver;
 static std::atomic_bool                                g_video_out_ready {false};
+static std::atomic_bool                                g_native_dce_owns_main_head {false};
 static std::atomic_uint32_t                            g_native_virtual_display_clock {0};
 static Common::Mutex                                   g_native_controller_mutex;
 static std::array<VideoOutNativeControllerSnapshot, 2> g_native_controllers {};
@@ -325,6 +355,10 @@ static uintptr_t VideoOutEventId(VideoOutEventKind kind) {
 	return static_cast<uintptr_t>(kind);
 }
 
+
+static uintptr_t VideoOutSysSetModeEventId(uint32_t head) {
+	return (uint64_t {0x73} << 48u) | (uint64_t {head} << 40u) | 0x100000000ULL;
+}
 static VideoOutEventQueues& VideoOutEventQueuesFor(VideoOutEventState& state,
                                                    VideoOutEventKind   kind) {
 	switch (kind) {
@@ -860,8 +894,10 @@ void VideoOutDriver::Impl::VblankBegin() {
 	}
 }
 
-void VideoOutDriver::Impl::VblankEnd() {
-	Common::LockGuard lock(m_mutex);
+int VideoOutDriver::Impl::AddSysVblankEvent(EventQueue::KernelEqueue eq, uint32_t head,
+                                            void* udata) {
+	auto  event_state = m_sys_events[head];
+	auto& queues      = event_state->vblank;
 
 	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
 		auto& ctx = m_video_out_ctx[i];
@@ -878,6 +914,54 @@ void VideoOutDriver::Impl::VblankEnd() {
 			ctx.mutex.Unlock();
 		}
 	}
+}
+int VideoOutDriver::Impl::AddSysSetModeEvent(EventQueue::KernelEqueue eq, uint32_t head,
+                                             void* udata) {
+	auto  event_state = m_sys_events[head];
+	auto& queues      = event_state->set_mode;
+
+	EventQueue::KernelEqueueEvent event {};
+	event.event.ident              = VideoOutSysSetModeEventId(head);
+	event.event.filter             = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
+	event.event.udata              = udata;
+	event.filter.delete_event_func = RemoveVideoOutEventQueue;
+	event.filter.reset_func        = ResetVideoOutEvent;
+
+	VideoOutEventRegistrationRef registration;
+	bool                         add_queue = false;
+	{
+		Common::LockGuard event_lock(event_state->mutex);
+		const auto        existing =
+		    std::find_if(queues.begin(), queues.end(),
+			             [eq](const auto& candidate) { return candidate->handle == eq; });
+		if (existing != queues.end()) {
+			registration = *existing;
+		} else {
+			registration = std::make_shared<VideoOutEventRegistration>(VideoOutEventRegistration {
+			    .handle                = eq,
+			    .state                 = event_state,
+			    .kind                  = VideoOutEventKind::SetMode,
+			    .original_native_ident = VideoOutSysSetModeEventId(head)});
+			queues.push_back(registration);
+			add_queue = true;
+		}
+	}
+	event.filter.data  = registration.get();
+	event.filter.owner = registration;
+	const int result   = EventQueue::KernelAddEvent(eq, event);
+	if (result != OK && add_queue) {
+		Common::LockGuard event_lock(event_state->mutex);
+		const auto        added = std::find(queues.begin(), queues.end(), registration);
+		if (added != queues.end()) {
+			queues.erase(added);
+		}
+	}
+	return result == LibKernel::KERNEL_ERROR_EBADF ? VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE : result;
+}
+void VideoOutDriver::Impl::GetSysVblankStatus(uint32_t head, VideoOutVblankStatus* status) {
+	Common::LockGuard lock(m_mutex);
+
+	*status = m_sys_vblank_status[head];
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
@@ -1418,6 +1502,17 @@ int VideoOutNativeProgramDisplayClock(uint32_t requested_rate, uint32_t* applied
 	     requested_rate);
 	return OK;
 }
+int VideoOutNativeGetControllerSnapshot(uint32_t                          original_port,
+                                        VideoOutNativeControllerSnapshot* snapshot) {
+	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
+	    snapshot == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	Common::LockGuard lock(g_native_controller_mutex);
+	*snapshot                     = g_native_controllers[original_port];
+	snapshot->display_clock_10khz = g_native_virtual_display_clock.load(std::memory_order_acquire);
+	return OK;
+}
 uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle) {
 	if (!VideoOutIsInitialized()) return 0;
 	uint64_t generation = 0;
@@ -1611,6 +1706,148 @@ int VideoOutNativeProgramFormatControl(uint32_t original_request, uint32_t origi
 	     original_request, original_port, original_value, controller.transaction_id);
 	return OK;
 }
+int VideoOutNativeConfigureDisplaySignal(int* native_display_handle, uint32_t original_port,
+                                         uint32_t signal_width, uint32_t signal_height,
+                                         uint32_t h_total, uint32_t v_total, float refresh_hz,
+                                         uint32_t  pixel_clock_10khz,
+                                         uint64_t* native_display_generation) {
+	const bool hdmi =
+	    original_port == 0 && ((signal_width == 3840 && signal_height == 2160 && h_total == 4400 &&
+		                        v_total == 2250 && pixel_clock_10khz == 59341) ||
+		                       (signal_width == 720 && signal_height == 480 && h_total == 858 &&
+		                        v_total == 525 && pixel_clock_10khz == 2700));
+	const bool type_c = original_port == 1 && signal_width == 1920 && signal_height == 1080 &&
+	                    h_total == 2200 && v_total == 1125 && pixel_clock_10khz == 14836;
+	if (!VideoOutIsInitialized() || native_display_handle == nullptr || (!hdmi && !type_c) ||
+	    !(refresh_hz >= 59.90f && refresh_hz <= 59.97f)) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	auto stage = [&](VideoOutConfig* ctx, int handle, uint64_t generation) {
+		Common::LockGuard lock(g_native_controller_mutex);
+		auto&             controller = g_native_controllers[original_port];
+		if (g_native_virtual_display_clock.load(std::memory_order_acquire) != 120000u) {
+			return VIDEO_OUT_ERROR_INVALID_VALUE;
+		}
+		if (controller.pending && controller.master_locked) {
+			return VIDEO_OUT_ERROR_RESOURCE_BUSY;
+		}
+		if (hdmi &&
+		    (ctx == nullptr || !ctx->opened || ctx->closing || ctx->generation != generation ||
+		     !ctx->native_scanout_bound ||
+		     (controller.bound_handle >= 0 &&
+		      (controller.bound_handle != handle || controller.bound_generation != generation)))) {
+			return VIDEO_OUT_ERROR_INVALID_HANDLE;
+		}
+		VideoOutNativeTimingSnapshot timing {};
+		timing.width              = signal_width;
+		timing.height             = signal_height;
+		timing.h_total            = h_total;
+		timing.v_total            = v_total;
+		timing.refresh_hz         = refresh_hz;
+		timing.pixel_clock_10khz  = pixel_clock_10khz;
+		controller.pending_timing = timing;
+		controller.pending        = true;
+		controller.master_locked  = false;
+		if (++controller.transaction_id == 0) EXIT("native display transaction wrapped\n");
+		if (hdmi) {
+			controller.bound_handle       = handle;
+			controller.bound_generation   = generation;
+			ctx->native_signal_pending    = true;
+			ctx->native_timing_generation = controller.timing_generation;
+			*native_display_handle        = handle;
+			if (native_display_generation != nullptr) *native_display_generation = generation;
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KYTY_SIGNAL_PENDING"
+		     " port=%u signal=%ux%u transaction=%" PRIu64
+		     " bound_handle=%d bound_generation=%" PRIu64 " committed_unchanged=%u\n",
+		     original_port, signal_width, signal_height, controller.transaction_id,
+		     controller.bound_handle, controller.bound_generation, controller.committed ? 1u : 0u);
+		return OK;
+	};
+	if (type_c) return stage(nullptr, -1, 0);
+	bool     opened_here = false;
+	int      handle      = *native_display_handle;
+	uint64_t generation  = 0;
+	if (handle < 0) {
+		{
+			Common::LockGuard lock(g_native_controller_mutex);
+			if (g_native_virtual_display_clock.load(std::memory_order_acquire) != 120000u) {
+				return VIDEO_OUT_ERROR_INVALID_VALUE;
+			}
+		}
+		handle = DriverState().Open(VIDEO_OUT_BUS_TYPE_MAIN, 0, true, &generation);
+		if (handle < 0) return handle;
+		opened_here = true;
+	}
+	uint64_t current_generation = 0;
+	auto*    ctx                = DriverState().Get(handle, current_generation);
+	if (!opened_here) generation = current_generation;
+	int result = VIDEO_OUT_ERROR_INVALID_HANDLE;
+	if (ctx != nullptr && current_generation == generation) {
+		Common::LockGuard lock(ctx->mutex);
+		if (opened_here || native_display_generation == nullptr ||
+		    *native_display_generation == generation) {
+			result = stage(ctx, handle, generation);
+		}
+		if (result == OK && opened_here) {
+			g_native_dce_owns_main_head.store(true, std::memory_order_release);
+		}
+	}
+	if (result != OK && opened_here) (void)DriverState().Close(handle, generation);
+	return result;
+}
+int VideoOutNativeFinishDisplaySignal(uint32_t original_port, uint64_t expected_generation) {
+	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size()) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	if (original_port == 1) return VIDEO_OUT_ERROR_UNSUPPORTED_OPERATION;
+	uint64_t generation = 0;
+	auto*    ctx        = DriverState().Get(1, generation);
+	if (ctx == nullptr) return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	Common::LockGuard context_lock(ctx->mutex);
+	Common::LockGuard controller_lock(g_native_controller_mutex);
+	auto&             controller  = g_native_controllers[original_port];
+	const auto&       timing      = controller.pending_timing;
+	uint64_t          numerator   = 0;
+	uint64_t          denominator = 0;
+	if (!ctx->opened || ctx->closing || ctx->generation != generation ||
+	    (expected_generation != 0 && generation != expected_generation) ||
+	    !ctx->native_scanout_bound || controller.bound_handle != 1 ||
+	    controller.bound_generation != generation || !controller.pending ||
+	    controller.master_locked || !timing.ppll_programmed || !timing.timing_programmed ||
+	    !timing.double_buffer_enabled || !timing.otg_enabled || !timing.pixel_encoding_programmed ||
+	    !timing.subsampling_programmed ||
+	    g_native_virtual_display_clock.load(std::memory_order_acquire) != 120000u ||
+	    !NativeVblankPeriod(Common::Timer::QueryPerformanceFrequency(), timing.h_total,
+	                        timing.v_total, timing.ppll_rate_100hz, numerator, denominator)) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	controller.committed_timing = timing;
+	controller.committed        = true;
+	controller.pending          = false;
+	controller.scanout_enabled  = true;
+	if (++controller.timing_generation == 0) EXIT("native display timing generation wrapped\n");
+	ctx->native_signal_width             = timing.width;
+	ctx->native_signal_height            = timing.height;
+	ctx->native_signal_h_total           = timing.h_total;
+	ctx->native_signal_v_total           = timing.v_total;
+	ctx->native_signal_refresh_hz        = timing.refresh_hz;
+	ctx->native_signal_pixel_clock_10khz = timing.pixel_clock_10khz;
+	ctx->native_signal_ppll_100hz        = timing.ppll_rate_100hz;
+	ctx->native_signal_pending           = false;
+	ctx->native_signal_active            = true;
+	ctx->native_scanout_enabled          = true;
+	ctx->native_timing_generation        = controller.timing_generation;
+	TriggerVideoOutEvents(*ctx, VideoOutEventKind::SetMode,
+	                      reinterpret_cast<void*>(ctx->output_mode));
+	LOGF("FIRST_FRAME_AUDIT SYSAV_NATIVE_KYTY_SIGNAL_ACTIVE"
+	     " port=0 adapter=diagnostic_HDMI_to_MAIN signal=%ux%u"
+	     " ppll_100hz=%u h_total=%u v_total=%u timing_generation=%" PRIu64
+	     " guest_vblank_clock=1\n",
+	     timing.width, timing.height, timing.ppll_rate_100hz, timing.h_total, timing.v_total,
+	     controller.timing_generation);
+	return OK;
+}
 int VideoOutNativeConfigureSplashAttributes(const uint64_t* original_words,
                                             size_t original_word_count, int handle,
                                             uint64_t expected_generation) {
@@ -1699,6 +1936,15 @@ int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_in
 	     " local_handle=%d index=%d guest_addr=0x%016" PRIx64 "\n",
 	     handle, buffer_index, original_guest_address);
 	return OK;
+}
+void VideoOutNativeReleaseSplashHandle(int* native_display_handle, uint64_t expected_generation) {
+	if (native_display_handle != nullptr && *native_display_handle >= 0) {
+		if (VideoOutIsInitialized()) {
+			(void)DriverState().Close(*native_display_handle, expected_generation,
+			                          VideoOutCloseMode::Native);
+		}
+		*native_display_handle = -1;
+	}
 }
 void VideoOutNativeReleaseClientHandle(int* handle, uint64_t expected_generation) {
 	if (handle == nullptr || *handle < 0) return;
@@ -1860,6 +2106,11 @@ KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
+KYTY_SYSV_ABI int VideoOutAddSetModeEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
+                                          void* udata) {
+	PRINT_NAME();
+	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::SetMode, udata);
+}
 KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer_index_start,
                                            const VideoOutBuffers* buffers, int buffer_num,
                                            const VideoOutBufferAttribute2* attribute, int category,
@@ -2270,6 +2521,56 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	return OK;
 }
 
+KYTY_SYSV_ABI int VideoOutSysGetVblankStatus2(uint32_t head, VideoOutVblankStatus* status) {
+	PRINT_NAME();
+
+	if (head > 1) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+
+	// dce cmd 9 (ioctl 0x80208218): vblank count, processTime, tsc, one flags byte. XXX: flags
+	// unknown, left 0
+	DriverState().GetSysVblankStatus(head, status);
+	static std::atomic_uint logged = 0;
+	if (logged.fetch_add(1) < 2) {
+		LOGF("FIRST_FRAME_AUDIT VIDEOOUT_SYS_VBLANK_STATUS head=%u count=%" PRIu64
+		     " EMULATOR_DEFINED_NO_DCE\n",
+		     head, status->count);
+	}
+	return OK;
+}
+KYTY_SYSV_ABI int VideoOutSysAddSetModeEvent2(LibKernel::EventQueue::KernelEqueue eq, uint32_t head,
+                                              void* udata) {
+	PRINT_NAME();
+
+	LOGF("\t eq    = 0x%016" PRIx64 "\n"
+	     "\t head  = %u\n"
+	     "\t udata = 0x%016" PRIx64 "\n",
+	     static_cast<uint64_t>(eq), head, reinterpret_cast<uint64_t>(udata));
+
+	if (head > 1) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	if (!VideoOutIsInitialized()) {
+		return VIDEO_OUT_ERROR_FATAL;
+	}
+
+	return DriverState().AddSysSetModeEvent(eq, head, udata);
+}
+KYTY_SYSV_ABI int VideoOutSysAddVblankEvent2(LibKernel::EventQueue::KernelEqueue eq, uint32_t head,
+                                             void* udata) {
+	PRINT_NAME();
+
+	LOGF("\t eq    = 0x%016" PRIx64 "\n"
+	     "\t head  = %u\n"
+	     "\t udata = 0x%016" PRIx64 "\n",
+	     static_cast<uint64_t>(eq), head, reinterpret_cast<uint64_t>(udata));
+
+	if (head > 1) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	return DriverState().AddSysVblankEvent(eq, head, udata);
+}
 KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
 	if (!DriverState().IsOpened(handle)) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;

@@ -4761,6 +4761,26 @@ int main(int argc, char** argv) {
       return 0;
     }
   }
+  if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--native-s3da-only") == 0)) {
+    CheckNativeS3da();
+    if (argc == 2) {
+      FileSystem::Shutdown();
+      graphics.reset();
+      subsystems.Destroy();
+      std::printf("KernelFileSystemTests: native S3DA cases passed\n");
+      return 0;
+    }
+  }
+  if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--process-pids-only") == 0)) {
+    CheckProcessPids(temporary.Path());
+    if (argc == 2) {
+      FileSystem::Shutdown();
+      graphics.reset();
+      subsystems.Destroy();
+      std::printf("KernelFileSystemTests: process PID cases passed\n");
+      return 0;
+    }
+  }
   if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--kern-proc-pid-only") == 0)) {
     CheckKernProcPid();
     if (argc == 2) {

@@ -103,6 +103,14 @@ int      VideoOutNativeProgramOtgControl(uint32_t original_ioctl, uint32_t origi
                                          uint32_t original_value);
 int      VideoOutNativeProgramFormatControl(uint32_t original_ioctl, uint32_t original_port,
                                             uint32_t original_value);
+// The diagnostic HDMI adapter maps to the MAIN output. TYPE_C has no output route.
+int VideoOutNativeConfigureDisplaySignal(int* native_display_handle, uint32_t original_port,
+                                         uint32_t signal_width, uint32_t signal_height,
+                                         uint32_t h_total, uint32_t v_total, float refresh_hz,
+                                         uint32_t  pixel_clock_10khz,
+                                         uint64_t* native_display_generation = nullptr);
+// Command 11 can finish a mode change begun on another /dev/dce fd, so state is per device.
+int VideoOutNativeFinishDisplaySignal(uint32_t original_port, uint64_t expected_generation = 0);
 // Backend 0, only for the linear 1920x1080 SceSysAvControlSplash buffers.
 int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_index,
                                        uint64_t  original_guest_address,
@@ -117,6 +125,8 @@ int  VideoOutNativeSubmitSplashFlip(int native_display_handle, int buffer_index,
                                     uint64_t expected_generation = 0);
 int  VideoOutNativeGetFlipStatus(int native_display_handle, uint64_t* original_words,
                                  size_t original_word_count, uint64_t expected_generation = 0);
+void VideoOutNativeReleaseSplashHandle(int*     native_display_handle,
+                                       uint64_t expected_generation = 0);
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
 KYTY_SYSV_ABI int  VideoOutSetFlipMaster(int slave_handle, int master_handle);

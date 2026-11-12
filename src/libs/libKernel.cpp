@@ -5393,6 +5393,26 @@ int KYTY_SYSV_ABI TraceIpmiCreateClient(void** out_client, void* config, void* a
 	return result;
 }
 
+int KYTY_SYSV_ABI TraceAvControlAddCallbacksForLnc(void* funcs, void* arg1, void* arg2) {
+	auto* rt          = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	auto  module_path = ResolveNativeModulePath("/system/common/lib/libSceAvSetting.sprx");
+	auto* program     = rt->FindProgramByFileName(module_path);
+	EXIT_IF(program == nullptr);
+
+	auto*      wrapper    = reinterpret_cast<uint64_t*>(program->base_vaddr + 0x22238);
+	const auto state      = *wrapper;
+	const auto backend    = state != 0 ? *reinterpret_cast<const uint64_t*>(state + 0x1de8) : 0;
+	const auto storage    = state != 0 ? *reinterpret_cast<const uint64_t*>(state + 0x1df0) : 0;
+	const auto init_state = state != 0 ? *reinterpret_cast<const uint32_t*>(state + 0x1e10) : 0;
+	const auto vtable     = backend != 0 ? *reinterpret_cast<const uint64_t*>(backend) : 0;
+	const auto slot58     = vtable != 0 ? *reinterpret_cast<const uint64_t*>(vtable + 0x58) : 0;
+	LOGF("AvControl add callbacks before: state=%016" PRIx64 " init=%u backend=%016" PRIx64
+	     " storage=%016" PRIx64 " vtable=%016" PRIx64 " slot58=%016" PRIx64 "\n",
+	     state, static_cast<unsigned>(init_state), backend, storage, vtable, slot58);
+
+	using add_func_t = KYTY_SYSV_ABI int (*)(void*, void*, void*);
+	return reinterpret_cast<add_func_t>(program->base_vaddr + 0xf510)(funcs, arg1, arg2);
+}
 
 int KYTY_SYSV_ABI KernelAioInitializeImpl(void* param, int32_t size) {
 	PRINT_NAME();
@@ -6181,6 +6201,21 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("LwG8g3niqwA", LibKernel::KernelDlsym);
 	LIB_FUNC("-ZR+hG7aDHw", LibKernel::KernelSleep);
 	LIB_FUNC("6c3rCVE-fTU", LibKernel::open);
+	LIB_FUNC("juWbTNM+8hw", LibKernel::fsync);
+	LIB_FUNC("Rb6ziJKvCCQ", LibKernel::umask);
+	LIB_FUNC("wW+k21cmbwQ", LibKernel::ioctl);
+	LIB_FUNC("MhC53TKmjVA", LibKernel::sysctlbyname);
+	LIB_FUNC("2YsHtbvCrgs", LibKernel::KernelGetIdTableCurrentCount);
+	LIB_FUNC("BPE9s9vQQXo", LibKernel::Memory::KernelMmap);
+	LIB_FUNC("KiJEPEWRyUY", LibKernel::GuestSigactionCall);
+	LIB_FUNC("-Jp7F+pXxNg", LibKernel::FileSystem::KernelPipe);
+	LIB_FUNC("6MojQ8uFHEI", TraceSceNetConfigure);
+	LIB_FUNC("dgJBaeJnGpo", TraceSceNetPoolCreate);
+	LIB_FUNC("9PCBPZcDU7Q", TraceSysCoreInitializeForShellCore);
+	LIB_FUNC("yvbO67OvrFc", TraceSysCoreGetShellCoreAppId);
+	LIB_FUNC("SfPuQO4vW9M", TraceSysCoreFinalize);
+	LIB_FUNC("0zsTiDhM0nU", TraceIpmiCreateClient);
+	LIB_FUNC("Im9QXnr0QK4", TraceAvControlAddCallbacksForLnc);
 	LIB_FUNC("6xVpy0Fdq+I", LibKernel::sigprocmask);
 	LIB_FUNC("6Z83sYWFlA8", LibKernel::exit);
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
