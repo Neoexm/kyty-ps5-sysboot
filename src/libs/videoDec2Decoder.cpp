@@ -29,9 +29,11 @@ constexpr uint32_t CODEC_TYPE_HEVC = 974921;
 constexpr uint32_t CODEC_TYPE_VP9  = 2382845;
 
 struct PacketMetadata {
-	uint64_t pts           = TIMESTAMP_INVALID;
-	uint64_t dts           = TIMESTAMP_INVALID;
-	uint64_t attached_data = 0;
+	uint64_t pts                 = TIMESTAMP_INVALID;
+	uint64_t dts                 = TIMESTAMP_INVALID;
+	uint64_t attached_data       = 0;
+	void*    picture_buffer      = nullptr;
+	size_t   picture_buffer_size = 0;
 };
 
 struct StoredPicture {
@@ -109,6 +111,10 @@ public:
 
 		// This carries PTS/DTS/attachedData through codecs that reorder B frames.
 		m_codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+		// Slice threads only. Frame threads delay output by thread_count - 1 access units and each
+		// of those keeps a caller frame buffer.
+		m_codec->thread_count = 8;
+		m_codec->thread_type  = FF_THREAD_SLICE;
 		const int result = avcodec_open2(m_codec, decoder, nullptr);
 		if (result < 0) {
 			LOGF("Videodec2: avcodec_open2 failed: %s (%d)\n", AvErrorString(result), result);
@@ -123,6 +129,11 @@ public:
 	                                 Output* output) {
 		std::scoped_lock lock(m_mutex);
 		*output = {};
+
+		if (m_draining) {
+			avcodec_flush_buffers(m_codec);
+			m_draining = false;
+		}
 
 		AVPacket* packet = av_packet_alloc();
 		AVFrame*  frame  = av_frame_alloc();
@@ -150,7 +161,8 @@ public:
 			av_frame_free(&frame);
 			return Result::ApiFail;
 		}
-		const PacketMetadata metadata {input.pts, input.dts, input.attached_data};
+		const PacketMetadata metadata {input.pts, input.dts, input.attached_data,
+		                               input.picture_buffer, input.picture_buffer_size};
 		std::memcpy(packet->opaque_ref->data, &metadata, sizeof(metadata));
 
 		bool have_pending_frame = false;
@@ -173,6 +185,7 @@ public:
 			av_frame_free(&frame);
 			return Result::AccessUnit;
 		}
+		output->input_accepted = true;
 
 		Result decode_result = Result::Ok;
 		if (!have_pending_frame) {
@@ -222,9 +235,49 @@ public:
 		return result;
 	}
 
+	[[nodiscard]] Result DrainOutput(const FrameBuffer& frame_buffer, Output* output) {
+		std::scoped_lock lock(m_mutex);
+		*output = {};
+
+		if (!m_draining) {
+			const int send_result = avcodec_send_packet(m_codec, nullptr);
+			if (send_result < 0 && send_result != AVERROR_EOF) {
+				LOGF("Videodec2: entering drain failed: %s (%d)\n", AvErrorString(send_result),
+				     send_result);
+				return Result::ApiFail;
+			}
+			m_draining = true;
+		}
+
+		AVFrame* frame = av_frame_alloc();
+		if (frame == nullptr) {
+			return Result::ApiFail;
+		}
+
+		const int receive_result = avcodec_receive_frame(m_codec, frame);
+		if (receive_result == AVERROR_EOF) {
+			// FFmpeg refuses new packets after a drain until its buffers are flushed.
+			avcodec_flush_buffers(m_codec);
+			m_draining = false;
+			av_frame_free(&frame);
+			return Result::Ok;
+		}
+		if (receive_result < 0) {
+			LOGF("Videodec2: receiving a drained frame failed: %s (%d)\n",
+			     AvErrorString(receive_result), receive_result);
+			av_frame_free(&frame);
+			return Result::ApiFail;
+		}
+
+		const auto result = CopyFrame(frame, frame_buffer, output);
+		av_frame_free(&frame);
+		return result;
+	}
+
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
 		avcodec_flush_buffers(m_codec);
+		m_draining = false;
 		ClearPictureMetadata();
 	}
 
@@ -278,18 +331,33 @@ private:
 			return Result::OversizeDecode;
 		}
 
+		FrameBuffer target = frame_buffer;
+		if (frame->opaque_ref != nullptr && frame->opaque_ref->size >= sizeof(PacketMetadata)) {
+			PacketMetadata metadata {};
+			std::memcpy(&metadata, frame->opaque_ref->data, sizeof(metadata));
+			if (metadata.picture_buffer != nullptr) {
+				target = {metadata.picture_buffer, metadata.picture_buffer_size};
+			}
+		}
+
 		const auto width       = static_cast<uint32_t>(frame->width);
 		const auto height      = static_cast<uint32_t>(frame->height);
 		const auto pitch       = AlignUp(width, 256);
 		const auto chroma_rows = (static_cast<uint64_t>(height) + 1u) / 2u;
 		const auto required =
 		    static_cast<uint64_t>(pitch) * height + static_cast<uint64_t>(pitch) * chroma_rows;
-		if (required > frame_buffer.size) {
+		if (required > target.size) {
 			return Result::FrameBufferSize;
 		}
 
-		auto* dst = static_cast<uint8_t*>(frame_buffer.data);
-		std::memset(dst, 0, static_cast<size_t>(required));
+		auto* dst = static_cast<uint8_t*>(target.data);
+		// only the width..pitch columns; clearing first would show zeros through other mappings
+		// until the copy lands
+		if (pitch > width) {
+			for (uint64_t row = 0; row < height + chroma_rows; row++) {
+				std::memset(dst + row * pitch + width, 0, pitch - width);
+			}
+		}
 		if (frame->format == AV_PIX_FMT_NV12) {
 			for (uint32_t y = 0; y < height; y++) {
 				std::memcpy(dst + static_cast<size_t>(y) * pitch,
@@ -324,13 +392,13 @@ private:
 		output->width           = width;
 		output->pitch           = pitch;
 		output->height          = height;
-		output->buffer          = frame_buffer.data;
-		output->buffer_size     = frame_buffer.size;
+		output->buffer          = target.data;
+		output->buffer_size     = target.size;
 
 		{
 			std::scoped_lock lock(g_picture_mutex);
-			g_picture_infos[frame_buffer.data] = {this, MakePictureInfo(frame)};
-			m_picture_buffers.insert(frame_buffer.data);
+			g_picture_infos[target.data] = {this, MakePictureInfo(frame)};
+			m_picture_buffers.insert(target.data);
 		}
 		return Result::Ok;
 	}
@@ -349,6 +417,7 @@ private:
 	Config                    m_config;
 	AVCodecContext*           m_codec    = nullptr;
 	SwsContext*               m_sws      = nullptr;
+	bool                      m_draining = false;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };
@@ -384,6 +453,10 @@ Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_b
 
 Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
 	return instance->FlushOutput(frame_buffer, output);
+}
+
+Result Drain(Instance* instance, const FrameBuffer& frame_buffer, Output* output) {
+	return instance->DrainOutput(frame_buffer, output);
 }
 
 void Reset(Instance* instance) {

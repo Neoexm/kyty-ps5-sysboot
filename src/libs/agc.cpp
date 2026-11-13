@@ -29,6 +29,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -48,6 +49,18 @@ template <typename... Args>
 static void AgcTrace(const char* format, const Args&... args) {
 	if (Config::GraphicsDebugDumpEnabled()) {
 		LOGF(format, args...);
+	}
+}
+
+// draw/dispatch builders only log through AgcTrace, so a buffer built for another process leaves no
+// record
+static void AgcDrawBuildAudit(const char* what, const uint32_t* cmd, uint32_t value) {
+	if (std::getenv("KYTY_DIAGNOSTIC_AGC_DRAW_BUILD_TRACE") != nullptr) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1) < 256) {
+			LOGF("FIRST_FRAME_AUDIT AGC_DRAW_BUILD %s cmd=0x%016" PRIx64 " value=0x%" PRIx32 "\n",
+			     what, reinterpret_cast<uint64_t>(cmd), value);
+		}
 	}
 }
 
@@ -2586,6 +2599,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
 	auto* cmd = buf->AllocateDW(6);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DrawIndex", cmd, index_count);
 
 	auto vaddr = reinterpret_cast<uint64_t>(index_addr);
 
@@ -2629,6 +2643,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 	auto* cmd = buf->AllocateDW(9);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DrawIndexMultiInstanced", cmd, index_count);
 
 	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
 	auto object_vaddr = reinterpret_cast<uint64_t>(object_ids);
@@ -2698,6 +2713,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DrawIndexAuto", cmd, index_count);
 
 	cmd[0] = KYTY_PM4(3, Pm4::IT_DRAW_INDEX_AUTO, 0u);
 	cmd[1] = index_count;
@@ -2728,6 +2744,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 	auto* cmd = buf->AllocateDW(5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DrawIndexOffset", cmd, index_count);
 
 	cmd[0] = KYTY_PM4(5, Pm4::IT_DRAW_INDEX_OFFSET_2, 0u);
 	cmd[1] = (index_count == 0 ? 1u : index_count);
@@ -2785,6 +2802,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 	auto* cmd = buf->AllocateDW(5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DrawIndexIndirect", cmd, data_offset_in_bytes);
 
 	// Single indexed draws store the index-offset enable in word 3, bit 28.
 	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, true) |
@@ -2814,6 +2832,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_off
 	auto* cmd = buf->AllocateDW(5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DrawIndirect", cmd, data_offset_in_bytes);
 
 	const auto patch_offsets = decode_indirect_modifier_patch_offsets(modifier, false);
 
@@ -2857,6 +2876,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	if (cmd == nullptr) {
 		return nullptr;
 	}
+	AgcDrawBuildAudit("DrawIndirectMulti", cmd, data_offset_in_bytes);
 
 	write_agc_internal_data_packet(cmd, AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG);
 	auto* draw = cmd + AGC_INTERNAL_DATA_PACKET_SIZE_DW;
@@ -2914,6 +2934,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	auto* cmd = buf->AllocateDW(10);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DrawIndexIndirectMulti", cmd, data_offset_in_bytes);
 
 	const auto low           = static_cast<uint32_t>(modifier);
 	const auto sgpr_base     = indirect_modifier_sgpr_base(low);
@@ -2964,6 +2985,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
 	auto* cmd = buf->AllocateDW(3);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+	AgcDrawBuildAudit("DispatchIndirect", cmd, data_offset_in_bytes);
 
 	cmd[0] = KYTY_PM4(3, Pm4::IT_DISPATCH_INDIRECT, 0u);
 	cmd[1] = data_offset_in_bytes;

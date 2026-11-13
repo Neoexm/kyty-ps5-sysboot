@@ -28,6 +28,10 @@ struct Input {
 	uint64_t    pts           = TIMESTAMP_INVALID;
 	uint64_t    dts           = TIMESTAMP_INVALID;
 	uint64_t    attached_data = 0;
+	// Where this AU's own picture goes when the decoder reorders; null means the buffer of the call
+	// that outputs it.
+	void*  picture_buffer      = nullptr;
+	size_t picture_buffer_size = 0;
 };
 
 struct FrameBuffer {
@@ -45,6 +49,8 @@ struct Output {
 	uint32_t height          = 0;
 	void*    buffer          = nullptr;
 	size_t   buffer_size     = 0;
+	// The AU is inside the decoder and its picture can still come out, whatever this call returned.
+	bool input_accepted = false;
 };
 
 struct PictureInfo {
@@ -78,6 +84,7 @@ void                    Destroy(Instance* instance);
 [[nodiscard]] Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_buffer,
                             Output* output);
 [[nodiscard]] Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output);
+[[nodiscard]] Result    Drain(Instance* instance, const FrameBuffer& frame_buffer, Output* output);
 void                 Reset(Instance* instance);
 [[nodiscard]] bool   GetPictureInfo(void* frame_buffer, PictureInfo* picture_info);
 

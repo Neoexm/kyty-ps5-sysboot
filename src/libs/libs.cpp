@@ -22,6 +22,9 @@ namespace VideoDec2 {
 LIB_DEFINE(InitVideoDec2_1);
 } // namespace VideoDec2
 
+namespace VdecCore {
+LIB_DEFINE(InitVdecCore_1);
+} // namespace VdecCore
 
 namespace LibMouse {
 LIB_DEFINE(InitMouse_1);
@@ -160,6 +163,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	LibUlt::InitUlt_1(s);
 	InitUserService_1(s);
 	VideoDec2::InitVideoDec2_1(s);
+	VdecCore::InitVdecCore_1(s);
 	LibGen5::InitVideoOut_1(s);
 	LibGen5::VrrStatus::InitVideoOutVrrStatus_1(s);
 	InitWebBrowserDialog_1(s);

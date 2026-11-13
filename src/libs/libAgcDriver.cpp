@@ -1,7 +1,11 @@
 #include "common/abi.h"
+#include "common/logging/log.h"
+#include "kernel/fileSystem.h"
 #include "libs/agc.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+
+#include <cstdlib>
 
 namespace Libs {
 
@@ -166,8 +170,30 @@ LIB_VERSION("Graphics5Driver", 1, "Graphics5Driver", 1, 1);
 
 namespace Gen5Driver = Graphics::Gen5Driver;
 
+static int KYTY_SYSV_ABI DiagnosticAgcDriverGcRecoveryStatus() {
+	const bool ready = LibKernel::FileSystem::IsDiagnosticGcDeviceReady();
+	LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_AGC_RECOVERY_STATUS device_ready=%u"
+	     " RETURN_IS_SIMULATED NOT_AUTHENTIC\n",
+	     ready ? 1u : 0u);
+	return ready ? 0 : static_cast<int>(0x8a6dffffu);
+}
+
+// ioctl 0xc0048115 on /dev/gc. No big app runs beside the compositor, so none has closed.
+static uint32_t KYTY_SYSV_ABI AgcDriverSysIsGameClosed() {
+	return 0;
+}
+
+// gc client count, ioctl 0xc0048113; the compositor only accepts 1 (itself)
+static uint32_t KYTY_SYSV_ABI AgcDriverSysGetClientNumber() {
+	LOGF("AgcDriver HLE client number: 1\n");
+	return 1;
+}
+
 LIB_DEFINE(InitAgcDriver_1) {
 	PRINT_NAME_ENABLE(true);
+	if (std::getenv("KYTY_DIAGNOSTIC_AGC_RECOVERY_STATUS") != nullptr) {
+		LIB_FUNC("x3K61sY5m8Q", DiagnosticAgcDriverGcRecoveryStatus);
+	}
 
 	LIB_FUNC("UglJIZjGssM", Gen5Driver::AgcDriverSubmitDcb);
 	LIB_FUNC("AhGvpITrf4M", Gen5Driver::AgcDriverSubmitDcb);
@@ -185,6 +211,8 @@ LIB_DEFINE(InitAgcDriver_1) {
 	LIB_FUNC("MM4IZSEYytQ", Gen5Driver::AgcDriverSetHsOffchipParam);
 	LIB_FUNC("Ddwk4gLT5j0", Gen5Driver::AgcDriverIsCaptureInProgress);
 	LIB_FUNC("U9ueyEhSkF4", Gen5Driver::AgcDriverUnknownU9ueyEhSkF4);
+	LIB_FUNC("ftf-xlfBQpo", AgcDriverSysIsGameClosed);
+	LIB_FUNC("kuE1uTiWfuk", AgcDriverSysGetClientNumber);
 }
 
 } // namespace LibGen5Driver
