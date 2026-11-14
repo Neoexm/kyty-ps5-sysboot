@@ -4054,6 +4054,64 @@ bool VerifyCompositorCommand3000Log(const std::filesystem::path& path) {
 } // namespace
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+  const int native_sshot_child = RunNativeSshotChild(argc, argv);
+  if (native_sshot_child >= 0) return native_sshot_child;
+  const int exec_startup_child = RunGuestExecStartupDiagnosticsChild(argc, argv);
+  if (exec_startup_child >= 0) return exec_startup_child;
+  const int app_state_child = RunAppRegistrationStateChild(argc, argv);
+  if (app_state_child >= 0) return app_state_child;
+  const int native_app_mount_child = RunNativeAppMountChild(argc, argv);
+  if (native_app_mount_child >= 0) return native_app_mount_child;
+  const int local_socket_policy_child = RunLocalSocketPolicyChild(argc, argv);
+  if (local_socket_policy_child >= 0) return local_socket_policy_child;
+  const int pid_child = RunProcessPidChild(argc, argv);
+  if (pid_child >= 0) return pid_child;
+  const int auth_info_scope_child = RunAuthInfoScopeLifecycleChild(argc, argv);
+  if (auth_info_scope_child >= 0) return auth_info_scope_child;
+  const int eventflag_child = RunEventFlagLifetimeChild(argc, argv);
+  if (eventflag_child >= 0) return eventflag_child;
+  const int semaphore_child = RunSemaphoreCrossHostChild(argc, argv);
+  if (semaphore_child >= 0) return semaphore_child;
+  const int libc_child = RunLibcExitChild(argc, argv);
+  if (libc_child >= 0) return libc_child;
+  const int exec_fatal_signal_child = RunGuestExecFatalSignalChild(argc, argv);
+  if (exec_fatal_signal_child >= 0) return exec_fatal_signal_child;
+  const int child = RunTmpfsChild(argc, argv);
+  if (child >= 0) return child;
+  const int registry_child = RunRegistryTrapChild(argc, argv);
+  if (registry_child >= 0) return registry_child;
+  const int sysav_audio_shm_child = RunSysAvAudioShmChild(argc, argv);
+  if (sysav_audio_shm_child >= 0) return sysav_audio_shm_child;
+  const int physhm_child = RunPhyshmChild(argc, argv);
+  if (physhm_child >= 0) return physhm_child;
+  const int sysav_raw_syscall_trap_child = RunSysAvRawSyscallTrapChild(argc, argv);
+  if (sysav_raw_syscall_trap_child >= 0) return sysav_raw_syscall_trap_child;
+  const int audiod_extended_mmap_trap_child = RunAudiodExtendedMmapTrapChild(argc, argv);
+  if (audiod_extended_mmap_trap_child >= 0) return audiod_extended_mmap_trap_child;
+  const int host_exception_provenance_child =
+      RunUnhandledHostExceptionDiagnosticsChild(argc, argv);
+  if (host_exception_provenance_child >= 0) return host_exception_provenance_child;
+  if (argc == 1 ||
+      (argc == 2 && std::strcmp(argv[1], "--system-ex-decrypted-overlay-only") == 0)) {
+    CheckSystemExDecryptedOverlay();
+    if (argc == 2) {
+      std::printf("KernelFileSystemTests: system_ex decrypted overlay cases passed\n");
+      return 0;
+    }
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--shellui-ime-decrypted-overlay-only") == 0) {
+    CheckShellUiImeDecryptedOverlayProduction(argv[2], argv[3]);
+    std::printf("KernelFileSystemTests: ShellUI IME decrypted overlay production case passed\n");
+    return 0;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--shellui-app-decrypted-overlay-only") == 0) {
+    CheckShellUiAppDecryptedOverlayProduction(argv[2], argv[3]);
+    std::printf("KernelFileSystemTests: ShellUI app decrypted overlay production cases passed\n");
+    return 0;
+  }
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -4174,6 +4232,30 @@ int main(int argc, char** argv) {
   }
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+  if (native_sshot_only) {
+    TempDirectory temporary;
+    CheckNativeSshot(temporary.Path());
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: native screenshot cases passed\n");
+    return 0;
+  }
+  if (json2_object_iterator_exit_child) return RunJson2ObjectIteratorExitChild(argv[2]);
+  if (json2_resource_arbitrator_only) {
+    TestJson2ResourceArbitratorDerived();
+    TestJson2ResourceArbitratorOriginal(Common::PathFromUtf8(argv[2]), argv[3]);
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: Json2 ResourceArbitrator cases passed\n");
+    return 0;
+  }
+  if (exec_startup_diagnostics_only) {
+    subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    CheckGuestExecStartupDiagnostics(exec_startup_log);
+    subsystems.Destroy();
+    std::error_code ignored;
+    std::filesystem::remove(exec_startup_log, ignored);
+    std::printf("KernelFileSystemTests: exec-child startup diagnostics cases passed\n");
+    return 0;
+  }
   const bool exec_fatal_signal_only =
       argc == 2 && std::strcmp(argv[1], "--exec-fatal-signal-only") == 0;
   const bool exec_fatal_classifier_child =
@@ -4457,6 +4539,56 @@ int main(int argc, char** argv) {
       std::printf("KernelFileSystemTests: read-only provider cases passed\n");
       return 0;
     }
+  }
+  if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--nullfs-exec-only") == 0)) {
+    {
+      TempDirectory nullfs_temporary;
+      CheckNullfsExec(nullfs_temporary.Path());
+    }
+    {
+      TempDirectory flags_temporary;
+      CheckNullfsMountFlags(flags_temporary.Path());
+    }
+    if (argc == 2) {
+      FileSystem::Shutdown();
+      graphics.reset();
+      subsystems.Destroy();
+      std::printf("KernelFileSystemTests: nullfs exec snapshot cases passed\n");
+      return 0;
+    }
+  }
+  const int dce_lease_child = RunNativeDceLeaseChild(argc, argv, *graphics);
+  if (dce_lease_child >= 0) {
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return dce_lease_child;
+  }
+  if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--native-umtx-only") == 0)) {
+    CheckNativeUmtxStartupWake();
+    if (argc == 2) {
+      FileSystem::Shutdown();
+      graphics.reset();
+      subsystems.Destroy();
+      std::printf("KernelFileSystemTests: native startup mutex cases passed\n");
+      return 0;
+    }
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--native-dce-leases-only") == 0) {
+    CheckNativeDceLeases(temporary.Path(), *graphics);
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: cross-host DCE lease cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mbus-isolation-only") == 0) {
+    CheckMbusDescriptorIsolation();
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: MBus isolation cases passed\n");
+    return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mbus-lifetime-only") == 0) {
     CheckMbusDescriptorLifetimes();
@@ -4941,7 +5073,20 @@ int main(int argc, char** argv) {
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
-  FileSystem::Shutdown();
+  CheckTmpfsMounts(temporary.Path());
+  CheckModuleLifetimes(temporary.Path());
+  CheckThreadAtexitLifetimes(temporary.Path());
+  CheckWeakRelocations(temporary.Path());
+  CheckSysmoduleFontProviders(temporary.Path());
+  CheckSysmoduleDependencies(temporary.Path());
+  CheckCapturedRootMetadata(temporary.Path());
+  CheckRegistryTraps(temporary.Path());
+  CheckNativeNamedObjects();
+  CheckNativeStrictIpmi();
+  CheckImportedIpmiErrors();
+  CheckNativeAvControls(*graphics, options);
+  CheckNativeDceLeases(temporary.Path(), *graphics);
+  CheckNativeMetadbg();
   CheckSocketWakeup();
   CheckCompositorSockets();
   CheckSocketPolicy();
