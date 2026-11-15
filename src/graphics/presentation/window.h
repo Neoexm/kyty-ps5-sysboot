@@ -4,10 +4,13 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <string_view>
+
 namespace Libs::Graphics {
 
 class Presenter;
 
+void                     WindowSetProcessImage(std::string_view image);
 [[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
 void                     WindowRun();
 void                     WindowShutdown();

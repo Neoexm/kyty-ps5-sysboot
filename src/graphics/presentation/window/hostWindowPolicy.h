@@ -11,18 +11,51 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
+
 namespace Libs::Graphics::HostWindowPolicy {
 
 enum class Role : uintptr_t { Standalone, Service, Startup, Compositor };
+
 #ifdef _WIN32
 constexpr UINT FOCUS_VISIBLE_CHILD_MESSAGE = WM_APP + 0x4b;
 #endif
+
 struct Policy {
 	Role        role = Role::Standalone;
 	std::string scope;
 };
+
+inline Policy Select(std::string_view image, std::string_view scope, bool coordinated,
+                     bool show_services) {
+#ifdef _WIN32
+	if (coordinated && !scope.empty() && !show_services) {
+		std::string name(image);
+		std::transform(name.begin(), name.end(), name.begin(),
+		               [](unsigned char c) { return std::tolower(c); });
+		auto role = Role::Service;
+		if (name == "scesysavcontrol.elf") role = Role::Startup;
+		if (name == "agccompositor.elf") role = Role::Compositor;
+		return {role, std::string(scope)};
+	}
+#endif
+	return {};
+}
+
+inline uint32_t InitialFlags(bool fullscreen, const Policy& policy) {
+	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+	if (policy.role != Role::Standalone) {
+		flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	} else if (fullscreen) {
+		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
+	}
+	return flags;
+}
+
 #ifdef _WIN32
 inline std::wstring ScopeName(std::string_view scope) {
 	uint64_t hash = 0xcbf29ce484222325ull;
@@ -30,6 +63,7 @@ inline std::wstring ScopeName(std::string_view scope) {
 		hash = (hash ^ c) * 0x100000001b3ull;
 	return L"KytyBootDisplay." + std::to_wstring(hash);
 }
+
 struct Handoff {
 	const wchar_t*    property;
 	HWND              window;
@@ -37,6 +71,7 @@ struct Handoff {
 	bool              compositor = false;
 	std::vector<HWND> replace;
 };
+
 inline BOOL CALLBACK VisitWindow(HWND window, LPARAM parameter) {
 	auto& handoff = *reinterpret_cast<Handoff*>(parameter);
 	if (window == handoff.window) return TRUE;
@@ -48,6 +83,7 @@ inline BOOL CALLBACK VisitWindow(HWND window, LPARAM parameter) {
 	}
 	return TRUE;
 }
+
 inline HWND BrokerWindow() {
 	const char* value = std::getenv("KYTY_DIAGNOSTIC_HOST_DISPLAY_WINDOW");
 	if (value == nullptr || *value == '\0') return nullptr;
@@ -57,6 +93,7 @@ inline HWND BrokerWindow() {
 	const auto broker = reinterpret_cast<HWND>(static_cast<uintptr_t>(parsed));
 	return IsWindow(broker) != FALSE ? broker : nullptr;
 }
+
 inline bool AttachToBroker(HWND window, HWND broker) {
 	SetLastError(ERROR_SUCCESS);
 	const auto previous = SetParent(window, broker);
@@ -76,6 +113,15 @@ inline bool AttachToBroker(HWND window, HWND broker) {
 	                    client.bottom - client.top, SWP_FRAMECHANGED | SWP_NOACTIVATE) != FALSE;
 }
 #endif
+
+inline bool UsesBroker() {
+#ifdef _WIN32
+	return BrokerWindow() != nullptr;
+#else
+	return false;
+#endif
+}
+
 inline bool Apply(SDL_Window* window, const Policy& policy, bool fullscreen) {
 	if (policy.role == Role::Standalone || policy.role == Role::Service) return true;
 #ifdef _WIN32
@@ -122,4 +168,5 @@ inline bool Apply(SDL_Window* window, const Policy& policy, bool fullscreen) {
 	return true;
 #endif
 }
+
 } // namespace Libs::Graphics::HostWindowPolicy

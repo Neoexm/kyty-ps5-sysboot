@@ -5652,6 +5652,59 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		     descriptor);
 		return descriptor;
 	}
+	if (!directory && std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") != nullptr &&
+	    (file->name == "/dev/av_control" || file->name == "/dev/hdmi" ||
+	     file->name == "/dev/scanin" || file->name == "/dev/hmd_cmd")) {
+		if (flags != 2 || mode != 0) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EINVAL;
+		}
+		const bool discovery = std::getenv("KYTY_DIAGNOSTIC_SYSAV_AV_DEVICE_PROBE") != nullptr;
+		if (!discovery && !VideoOut::VideoOutIsInitialized()) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_ENODEV;
+		}
+		file->real_name    = file->name;
+		file->special      = discovery ? SpecialFile::NativeAvProbe : SpecialFile::NativeAvDevice;
+		file->special_size = 0;
+		file->opened       = true;
+		if (discovery) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_AV_PROBE_OPEN path=%s fd=%d"
+			     " NON_AUTHENTIC\n",
+			     file->name.c_str(), descriptor);
+		} else {
+			LOGF("NATIVE_AV_DEVICE_OPEN path=%s fd=%d existing_videoout_backend=1"
+			     "\n",
+			     file->name.c_str(), descriptor);
+		}
+		return descriptor;
+	}
+	if (file->name == "/dev/m2.ctl") {
+		if (directory || creat || trunc || excl || append || direct) {
+			g_files->DeleteDescriptor(descriptor);
+			return directory ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_EINVAL;
+		}
+		// m2storage creates the node at load, drive or not
+		file->real_name = file->name;
+		file->special   = SpecialFile::M2Ctl;
+		file->opened    = true;
+		LOGF("M2_CTL_DEVICE_OPEN guest_pid=%d fd=%d access=%u m2_drive_fitted=0\n",
+		     Process::GetPid(), descriptor, flags_u);
+		return descriptor;
+	}
+	if (file->name == "/dev/s3da") {
+		if (directory || creat || trunc || excl || append || direct) {
+			g_files->DeleteDescriptor(descriptor);
+			return directory ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_EINVAL;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::NativeS3da;
+		file->opened    = true;
+		LOGF("S3DA_DEVICE_OPEN guest_pid=%d fd=%d access=%u cloexec=%u"
+		     "\n",
+		     Process::GetPid(), descriptor, flags_u, descriptor_flags != 0 ? 1u : 0u);
+		return descriptor;
+	}
 	if (!directory && file->name == "/dev/s3da" &&
 	    std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_S3DA_PROBE") != nullptr) {
 		if (flags != 2 || directory || creat || trunc) {

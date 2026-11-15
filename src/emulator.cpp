@@ -222,6 +222,7 @@ void Run(const RunOptions& options) {
 	}
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
+	Libs::Graphics::WindowSetProcessImage(Common::PathToGenericString(options.elf.filename()));
 	Common::Subsystems subsystems(true);
 	Libs::LibKernel::Process::MarkExecChildStartupStage(3);
 	Init(options.config, param_json, subsystems);

@@ -1,17 +1,15 @@
 #include "graphics/presentation/window.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
-#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -19,18 +17,20 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/hostWindowPolicy.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
-#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -41,6 +41,8 @@
 #define KYTY_DBG_INPUT
 
 namespace Libs::Graphics {
+
+static HostWindowPolicy::Policy g_host_window_policy;
 
 struct EventKeyboard {
 	bool     down;
@@ -87,15 +89,14 @@ static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 }
 
 static bool ControllerAxisIsTrigger(int axis_id) {
-	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
-	       axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
+	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
 }
 
 static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
 	return ControllerAxisIsTrigger(axis_id)
 	           ? Controller::controller_get_axis(0, SDL_JOYSTICK_AXIS_MAX, axis_value)
-	           : Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
-	                                             axis_value);
+			   : Controller::controller_get_axis(SDL_JOYSTICK_AXIS_MIN, SDL_JOYSTICK_AXIS_MAX,
+			                                     axis_value);
 }
 
 struct EventMouse {
@@ -180,7 +181,7 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
 	const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0u;
 	if (!SDL_SetWindowFullscreen(g_window->window, !fullscreen)) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
@@ -332,8 +333,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis, ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -681,9 +681,8 @@ void WindowContext::ProcessEvent(double time_s) {
 				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
 				                                                        : Controller::Sensor::Gyro,
 				                      sensor.data,
-				                      sensor.sensor_timestamp != 0
-				                          ? sensor.sensor_timestamp / 1000
-				                          : sensor.timestamp / 1000);
+				                      sensor.sensor_timestamp != 0 ? sensor.sensor_timestamp / 1000
+				                                                   : sensor.timestamp / 1000);
 			}
 			break;
 		}
@@ -766,7 +765,7 @@ static void WindowCreate(WindowContext& context) {
 	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
 		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
-			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
+			std::string       moltenvk_path = base_path_str + "libMoltenVK.dylib";
 			if (!Common::File::IsFileExisting(moltenvk_path)) {
 				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
 			}
@@ -797,11 +796,17 @@ static void WindowCreate(WindowContext& context) {
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
-	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
-	if (fullscreen) {
-		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
-	}
-	return flags;
+	return HostWindowPolicy::InitialFlags(fullscreen, g_host_window_policy);
+}
+
+void WindowSetProcessImage(std::string_view image) {
+	const char* scope         = std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE");
+	const char* coordinated   = std::getenv("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY");
+	const char* show_services = std::getenv("KYTY_SHOW_SERVICE_WINDOWS");
+	g_host_window_policy      = HostWindowPolicy::Select(
+	    image, scope != nullptr ? scope : "",
+	    coordinated != nullptr && std::string_view(coordinated) == "1",
+	    show_services != nullptr && std::string_view(show_services) == "1");
 }
 
 Presenter& WindowInit(uint32_t width, uint32_t height) {
@@ -891,8 +896,8 @@ static void WindowLoadPngIcon(const std::filesystem::path& path, WindowIcon* ico
 
 	EXIT_IF(icon->pixels == nullptr);
 
-	icon->surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels,
-	                                      width * 4);
+	icon->surface =
+	    SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels, width * 4);
 	EXIT_NOT_IMPLEMENTED(icon->surface == nullptr);
 }
 
@@ -923,10 +928,10 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t          fps_start      = Common::Timer::QueryPerformanceCounter();
+	static uint64_t          frame_num      = 0;
+	static uint64_t          fps_frames     = 0;
+	static double            current_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -948,22 +953,34 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
+	auto        text        = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
+		SDL_Window* window;
+		std::string text;
+	};
+	// not waited for: we hold the present lock and waiting would stall vblank
 	EXIT_IF(!SDL_RunOnMainThread(
 	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
+		    std::unique_ptr<TitleUpdate> title(static_cast<TitleUpdate*>(data));
+		    if (HostWindowPolicy::UsesBroker()) {
+#ifdef _WIN32
+			    const auto native = static_cast<HWND>(
+			        SDL_GetPointerProperty(SDL_GetWindowProperties(title->window),
+					                       SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+			    if (native != nullptr && IsWindowVisible(native) != FALSE) {
+				    SetWindowTextA(HostWindowPolicy::BrokerWindow(), title->text.c_str());
+			    }
+#endif
+		    } else {
+			    SDL_SetWindowTitle(title->window, title->text.c_str());
+		    }
 	    },
-	    &update, true));
+	    new TitleUpdate {window, std::move(text)}, false));
 }
 
 } // namespace Libs::Graphics

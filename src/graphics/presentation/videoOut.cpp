@@ -54,6 +54,7 @@ constexpr int      VIDEO_OUT_FALSE                                      = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
+constexpr int      VIDEO_OUT_BUS_TYPE_SYSTEM                             = 0x100;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_FLIP_MODE_SLAVE                            = 8;
@@ -82,6 +83,13 @@ enum class VideoOutEventKind : uintptr_t {
 
 enum class FlipRequestSource { Cpu, GpuEop };
 
+struct DcePrivacyMaskState {
+	static constexpr uint16_t RESERVED_BIT = 1;
+	uint16_t                  occupied_ids = RESERVED_BIT;
+
+	[[nodiscard]] uint64_t Query() const noexcept { return occupied_ids; }
+};
+
 struct VideoOutEventState;
 
 struct VideoOutEventRegistration {
@@ -89,6 +97,7 @@ struct VideoOutEventRegistration {
 	std::shared_ptr<VideoOutEventState> state;
 	uint64_t                            generation = 0;
 	VideoOutEventKind                   kind       = VideoOutEventKind::Flip;
+	uintptr_t                           original_native_ident = 0;
 };
 
 using VideoOutEventRegistrationRef = std::shared_ptr<VideoOutEventRegistration>;
@@ -117,6 +126,15 @@ struct VideoOutBufferAttribute2 {
 	uint32_t pad0;
 	uint64_t reserved1[3];
 };
+
+static_assert(sizeof(VideoOutBufferAttribute2) == 0x50);
+static_assert(offsetof(VideoOutBufferAttribute2, tiling_mode) == 0x04);
+static_assert(offsetof(VideoOutBufferAttribute2, width) == 0x0c);
+static_assert(offsetof(VideoOutBufferAttribute2, height) == 0x10);
+static_assert(offsetof(VideoOutBufferAttribute2, option) == 0x18);
+static_assert(offsetof(VideoOutBufferAttribute2, pixel_format) == 0x20);
+static_assert(offsetof(VideoOutBufferAttribute2, dcc_cb_register_clear_color) == 0x28);
+static_assert(offsetof(VideoOutBufferAttribute2, dcc_control) == 0x30);
 
 // PS5 layout
 struct VideoOutFlipStatus {
@@ -151,6 +169,18 @@ struct VideoOutOutputStatus {
 	uint64_t refreshRate  = 0;
 	uint64_t flags        = 0;
 	uint64_t reserved[3]  = {};
+};
+
+struct VideoOutResolutionStatus {
+	uint32_t fullWidth        = 0;
+	uint32_t fullHeight       = 0;
+	uint32_t paneWidth        = 0;
+	uint32_t paneHeight       = 0;
+	uint64_t refreshRate      = 0;
+	float    screenSizeInInch = 0.0f;
+	uint16_t flags            = 0;
+	uint16_t reserved0        = 0;
+	uint32_t reserved1[4]     = {};
 };
 
 struct VideoOutOutputOptions {
@@ -197,6 +227,7 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	bool                                blank_after_resume = false;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	// DCE signal timing, not the 1920x1080 logo surface size
 	uint32_t                            native_signal_width             = 0;
@@ -230,6 +261,15 @@ struct VideoOutVblankPhase {
 };
 
 enum class VideoOutCloseMode { Direct, User, Native, NativeClient };
+
+static bool IsVblankPhaseCurrentLocked(const VideoOutVblankPhase& phase) {
+	const auto& config = *phase.config;
+	return phase.due && config.opened && !config.closing && config.generation == phase.generation &&
+	       config.native_timing_generation == phase.timing_generation &&
+	       (!config.native_scanout_bound ||
+	        (config.native_signal_active && config.native_scanout_enabled));
+}
+
 static bool NativeVblankPeriod(uint64_t frequency, uint32_t h_total, uint32_t v_total,
                                uint32_t ppll_rate_100hz, uint64_t& numerator,
                                uint64_t& denominator) {
@@ -240,6 +280,7 @@ static bool NativeVblankPeriod(uint64_t frequency, uint32_t h_total, uint32_t v_
 	denominator = uint64_t {ppll_rate_100hz} * 100u;
 	return numerator >= denominator;
 }
+
 class FlipQueue {
 public:
 	explicit FlipQueue(Graphics::Presenter& presenter): m_presenter(presenter) {
@@ -290,8 +331,9 @@ private:
 
 struct VideoOutDriver::Impl {
 public:
-	static constexpr std::array VIDEO_OUT_BUSES {
-	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
+	static constexpr std::array VIDEO_OUT_BUSES {VIDEO_OUT_BUS_TYPE_MAIN,
+	                                             VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB,
+	                                             VIDEO_OUT_BUS_TYPE_SYSTEM};
 	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
@@ -311,15 +353,18 @@ public:
 	bool            IsOpened(int handle);
 	int             SetFlipMaster(int slave_handle, int master_handle);
 	int             AddSysSetModeEvent(EventQueue::KernelEqueue eq, uint32_t head, void* udata);
+	size_t          SysSetModeRegistrationCountForTest(uint32_t head);
 	int             AddSysVblankEvent(EventQueue::KernelEqueue eq, uint32_t head, void* udata);
+	size_t          SysVblankRegistrationCountForTest(uint32_t head);
 	void            GetSysVblankStatus(uint32_t head, VideoOutVblankStatus* status);
 
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
+	[[nodiscard]] uint64_t   OccupiedPrivacyMask() const noexcept { return m_privacy_mask.Query(); }
 
-	void VblankBegin();
-	void VblankEnd();
+	void VblankBegin(std::span<VideoOutVblankPhase> phases);
+	void VblankEnd(std::span<const VideoOutVblankPhase> phases, bool fallback_due);
 	void PresentThread(std::stop_token token);
 
 private:
@@ -329,6 +374,7 @@ private:
 	Graphics::Presenter&     m_presenter;
 	FlipQueue                m_flip_queue;
 	std::jthread             m_present_thread;
+	DcePrivacyMaskState      m_privacy_mask;
 	// Sys vblank registrations are per head and belong to no handle.
 	std::array<std::shared_ptr<VideoOutEventState>, 2> m_sys_events {
 	    std::make_shared<VideoOutEventState>(), std::make_shared<VideoOutEventState>()};
@@ -338,6 +384,7 @@ private:
 static std::unique_ptr<VideoOutDriver> g_video_out_driver;
 static std::atomic_bool                                g_video_out_ready {false};
 static std::atomic_bool                                g_native_dce_owns_main_head {false};
+static std::atomic_uint32_t                            g_native_splash_shared_main_leases {0};
 static std::atomic_uint32_t                            g_native_virtual_display_clock {0};
 static Common::Mutex                                   g_native_controller_mutex;
 static std::array<VideoOutNativeControllerSnapshot, 2> g_native_controllers {};
@@ -351,14 +398,32 @@ static VideoOutDriver::Impl& DriverState() {
 	return g_video_out_driver->State();
 }
 
+bool VideoOutNativeCanAttachOriginalDceClient() {
+	if (!VideoOutIsInitialized() || !g_native_dce_owns_main_head.load(std::memory_order_acquire)) {
+		return false;
+	}
+	auto* const ctx = DriverState().Get(1);
+	if (ctx == nullptr) return false;
+	Common::LockGuard lock(ctx->mutex);
+	return ctx->opened && !ctx->closing &&
+	       (ctx->native_signal_active || ctx->native_signal_pending) &&
+	       ((ctx->native_signal_width == 3840 && ctx->native_signal_height == 2160) ||
+	        (ctx->native_signal_width == 1920 && ctx->native_signal_height == 1080));
+}
+
 static uintptr_t VideoOutEventId(VideoOutEventKind kind) {
 	return static_cast<uintptr_t>(kind);
 }
 
+// Same layout as the set-mode kevent in VideoOutSysAddSetModeEvent2, with dce event type 0x70.
+static uintptr_t VideoOutSysVblankEventId(uint32_t head) {
+	return (uint64_t {0x70} << 48u) | (uint64_t {head} << 40u) | 0x100000000ULL;
+}
 
 static uintptr_t VideoOutSysSetModeEventId(uint32_t head) {
 	return (uint64_t {0x73} << 48u) | (uint64_t {head} << 40u) | 0x100000000ULL;
 }
+
 static VideoOutEventQueues& VideoOutEventQueuesFor(VideoOutEventState& state,
                                                    VideoOutEventKind   kind) {
 	switch (kind) {
@@ -366,6 +431,7 @@ static VideoOutEventQueues& VideoOutEventQueuesFor(VideoOutEventState& state,
 		case VideoOutEventKind::Vblank: return state.vblank;
 		case VideoOutEventKind::PreVblankStart: return state.pre_vblank;
 		case VideoOutEventKind::OutputMode: return state.output_mode;
+		case VideoOutEventKind::SetMode: return state.set_mode;
 	}
 	EXIT("unsupported video-out event kind\n");
 	return state.flip;
@@ -407,6 +473,17 @@ static void TriggerVideoOutEvent(EventQueue::KernelEqueueEvent* event, void* tri
 	event->triggered = true;
 }
 
+static void TriggerVideoOutSysVblank(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
+	EXIT_IF(event == nullptr);
+
+	// coalesce, libScePsm drains one event per wait
+	if (event->event.fflags < 0xfu) {
+		event->event.fflags++;
+	}
+	event->event.data = MakeVideoOutEventData(event->event.data, trigger_data);
+	event->triggered  = true;
+}
+
 static void RemoveVideoOutEventQueue(EventQueue::KernelEqueue       eq,
                                      EventQueue::KernelEqueueEvent* event) {
 	if (event == nullptr || event->filter.data == nullptr) {
@@ -440,9 +517,11 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		if (!registration || registration->generation != video_out.generation) {
 			continue;
 		}
-		const auto result =
-		    EventQueue::KernelTriggerEvent(registration->handle, VideoOutEventId(kind),
-		                                   EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
+		const auto result = EventQueue::KernelTriggerEvent(
+		    registration->handle,
+		    registration->original_native_ident != 0 ? registration->original_native_ident
+			                                         : VideoOutEventId(kind),
+		    EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
@@ -453,15 +532,19 @@ static void DeleteVideoOutEvents(const VideoOutEventQueues& queues, VideoOutEven
 		if (!registration) {
 			continue;
 		}
-		const auto result = EventQueue::KernelDeleteEvent(
-		    registration->handle, VideoOutEventId(kind), EventQueue::KERNEL_EVFILT_VIDEO_OUT);
+		const auto result = EventQueue::KernelDeleteEvent(registration->handle,
+		                                                  registration->original_native_ident != 0
+		                                                      ? registration->original_native_ident
+		                                                      : VideoOutEventId(kind),
+		                                                  EventQueue::KERNEL_EVFILT_VIDEO_OUT);
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
 }
 
 static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOutEventKind kind,
-                                 void* udata) {
+                                 void* udata, uintptr_t original_native_ident = 0,
+                                 uint64_t expected_generation = 0) {
 	uint64_t generation = 0;
 	auto*    video_out  = DriverState().Get(handle, generation);
 	if (video_out == nullptr) {
@@ -469,7 +552,8 @@ static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoO
 	}
 
 	Common::LockGuard lock(video_out->mutex);
-	if (!video_out->opened || video_out->closing || video_out->generation != generation) {
+	if (!video_out->opened || video_out->closing || video_out->generation != generation ||
+	    (expected_generation != 0 && generation != expected_generation)) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	if (kind == VideoOutEventKind::OutputMode) {
@@ -492,8 +576,9 @@ static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoO
 
 	EventQueue::KernelEqueueEvent event {};
 	event.triggered    = initially_triggered;
-	event.event.ident  = VideoOutEventId(kind);
+	event.event.ident  = original_native_ident != 0 ? original_native_ident : VideoOutEventId(kind);
 	event.event.filter = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
+	event.event.flags  = original_native_ident != 0 ? 1u : 0u;
 	event.event.udata  = udata;
 	event.event.fflags = initially_triggered ? 1u : 0u;
 	event.event.data   = initially_triggered ? MakeVideoOutEventData(0, initial_trigger_data) : 0;
@@ -507,13 +592,18 @@ static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoO
 		Common::LockGuard event_lock(event_state->mutex);
 		const auto        existing =
 		    std::find_if(queues.begin(), queues.end(), [&](const auto& candidate) {
-			    return candidate->handle == eq && candidate->generation == generation;
+			    return candidate->handle == eq && candidate->generation == generation &&
+				       candidate->original_native_ident == original_native_ident;
 		    });
 		if (existing != queues.end()) {
 			registration = *existing;
 		} else {
-			registration = std::make_shared<VideoOutEventRegistration>(VideoOutEventRegistration {
-			    .handle = eq, .state = event_state, .generation = generation, .kind = kind});
+			registration = std::make_shared<VideoOutEventRegistration>(
+			    VideoOutEventRegistration {.handle                = eq,
+				                           .state                 = event_state,
+				                           .generation            = generation,
+				                           .kind                  = kind,
+				                           .original_native_ident = original_native_ident});
 			queues.push_back(registration);
 			add_queue = true;
 		}
@@ -575,8 +665,10 @@ static bool IsValidFlipMode(int mode) {
 }
 
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
-                              int64_t flip_arg, FlipRequestSource source, uint64_t& request_id) {
-	auto* video_out = driver.Get(handle);
+                              int64_t flip_arg, FlipRequestSource source, uint64_t& request_id,
+                              uint64_t expected_generation = 0) {
+	uint64_t generation = 0;
+	auto*    video_out  = driver.Get(handle, generation);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
@@ -588,6 +680,10 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	}
 
 	Common::LockGuard lock(video_out->mutex);
+	if (!video_out->opened || video_out->closing || video_out->generation != generation ||
+	    (expected_generation != 0 && generation != expected_generation)) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
 	if ((video_out->master != nullptr) != (flip_mode == VIDEO_OUT_FLIP_MODE_SLAVE) ||
 	    (video_out->slave_count != 0) != (flip_mode == VIDEO_OUT_FLIP_MODE_MASTER)) {
 		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
@@ -603,6 +699,8 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 }
 
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
+	// splash logo is CPU-written row by row (stride 0x1e00), reading it as tiled scrambles it
+	const bool linear_scanout = attribute.tiling_mode == 1;
 	const auto compression = Graphics::ClassifyVideoOutCompression(
 	    category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, buffer.metadata_address,
 	    attribute.dcc_control, attribute.dcc_cb_register_clear_color);
@@ -611,8 +709,9 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	    attribute.pitch_in_pixel != 0 ||
 	    (attribute.option & ~(VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY |
 	                          VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED)) != 0 ||
-	    attribute.tiling_mode != 0 || attribute.pad0 != 0 || attribute.reserved1[0] != 0 ||
-	    attribute.reserved1[1] != 0 || attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
+	    (attribute.tiling_mode != 0 && attribute.tiling_mode != 1 && attribute.tiling_mode != 4) ||
+	    attribute.pad0 != 0 || attribute.reserved1[0] != 0 || attribute.reserved1[1] != 0 ||
+	    attribute.reserved1[2] != 0 || buffer.data_address == 0 ||
 	    compression == Graphics::VideoOutCompression::Unsupported) {
 		EXIT("unsupported or invalid video-out surface attributes\n");
 	}
@@ -628,13 +727,15 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 			    "pixels unchanged (format=0x{:016x}).\n", attribute.pixel_format));
 		}
 	}
-	const auto tile_mode = Graphics::Prospero::TileMode::kRenderTarget;
+	const auto tile_mode = linear_scanout ? Graphics::Prospero::TileMode::kLinear
+	                                      : Graphics::Prospero::TileMode::kRenderTarget;
 	const auto pitch =
 	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, tile_mode);
 	Graphics::TileSizeAlign total {};
 	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
 	                                  1, 1, tile_mode, false, total);
-	if (total.size == 0 || total.align != 65536 ||
+	const uint32_t required_alignment = linear_scanout ? 256u : 65536u;
+	if (total.size == 0 || total.align != required_alignment ||
 	    (buffer.data_address & (total.align - 1u)) != 0) {
 		EXIT("invalid video-out surface footprint or alignment\n");
 	}
@@ -680,18 +781,43 @@ VideoOutDriver::Impl& VideoOutDriver::State() noexcept {
 
 VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height, Graphics::Presenter& presenter) {
 	EXIT_IF(g_video_out_driver != nullptr);
+	g_native_dce_owns_main_head.store(false, std::memory_order_release);
+	g_native_splash_shared_main_leases.store(0, std::memory_order_release);
+	g_native_virtual_display_clock.store(0, std::memory_order_release);
+	{
+		Common::LockGuard lock(g_native_controller_mutex);
+		g_native_controllers = {};
+	}
 	g_video_out_driver = std::make_unique<VideoOutDriver>(width, height, presenter);
+	g_video_out_ready.store(true, std::memory_order_release);
 	return *g_video_out_driver;
 }
 
 void VideoOutShutdown() {
+	g_video_out_ready.store(false, std::memory_order_release);
+	g_native_dce_owns_main_head.store(false, std::memory_order_release);
+	g_native_splash_shared_main_leases.store(0, std::memory_order_release);
+	g_native_virtual_display_clock.store(0, std::memory_order_release);
 	g_video_out_driver.reset();
+	Common::LockGuard lock(g_native_controller_mutex);
+	g_native_controllers = {};
 }
 
 VideoOutDriver::Impl::~Impl() {
 	if (m_present_thread.joinable()) {
 		m_present_thread.request_stop();
 		m_present_thread.join();
+	}
+	for (const auto& event_state: m_sys_events) {
+		VideoOutEventQueues vblank_events;
+		VideoOutEventQueues set_mode_events;
+		{
+			Common::LockGuard event_lock(event_state->mutex);
+			vblank_events   = event_state->vblank;
+			set_mode_events = event_state->set_mode;
+		}
+		DeleteVideoOutEvents(vblank_events, VideoOutEventKind::Vblank);
+		DeleteVideoOutEvents(set_mode_events, VideoOutEventKind::SetMode);
 	}
 	for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
 		if (m_video_out_ctx[handle].master != nullptr) {
@@ -731,6 +857,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index, bool native_adapter, uin
 		EXIT_IF(!config.events->pre_vblank.empty());
 		EXIT_IF(!config.events->vblank.empty());
 		EXIT_IF(!config.events->output_mode.empty());
+		EXIT_IF(!config.events->set_mode.empty());
 	}
 	EXIT_IF(config.flip_rate != 0);
 	for (const auto& buffer: config.buffers) {
@@ -747,13 +874,28 @@ int VideoOutDriver::Impl::Open(int bus_type, int index, bool native_adapter, uin
 		EXIT("video-out port generation wrapped\n");
 	}
 	config.output_mode               = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
+	config.native_signal_width             = 0;
+	config.native_signal_height            = 0;
+	config.native_signal_h_total           = 0;
+	config.native_signal_v_total           = 0;
+	config.native_signal_refresh_hz        = 0.0f;
+	config.native_signal_pixel_clock_10khz = 0;
+	config.native_signal_pending           = false;
+	config.native_signal_active            = false;
+	config.native_signal_ppll_100hz        = 0;
+	config.native_timing_generation        = 0;
+	config.native_scanout_bound            = native_adapter;
+	config.native_scanout_enabled          = false;
+	config.native_splash_attribute_record.fill(0);
+	config.native_splash_attributes_programmed = false;
+	config.blank_after_resume                  = false;
 	config.flip_status               = VideoOutFlipStatus();
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.flip_status.count         = 0;
 	config.pre_vblank_status         = VideoOutVblankStatus();
 	config.vblank_status             = VideoOutVblankStatus();
-
+	if (generation != nullptr) *generation = config.generation;
 	return handle;
 }
 
@@ -765,17 +907,76 @@ bool VideoOutDriver::Impl::Close(int handle, uint64_t expected_generation, Video
 	}
 
 	auto&               config = m_video_out_ctx[handle];
+	if (mode == VideoOutCloseMode::NativeClient && handle == 1 &&
+	    g_native_dce_owns_main_head.load(std::memory_order_acquire) &&
+	    g_native_splash_shared_main_leases.load(std::memory_order_acquire) != 0) {
+		{
+			Common::LockGuard config_lock(config.mutex);
+			if (config.closing || expected_generation == 0 ||
+			    config.generation != expected_generation)
+				return false;
+		}
+		m_flip_queue.Cancel(config);
+		{
+			Common::LockGuard config_lock(config.mutex);
+			for (auto& buffer: config.buffers)
+				buffer = VideoOutBuffer {};
+			for (auto& group: config.groups)
+				group = BufferAttributeGroup {};
+			config.native_splash_attributes_programmed = false;
+			config.native_splash_attribute_record.fill(0);
+			g_native_splash_shared_main_leases.store(0, std::memory_order_release);
+		}
+		LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_VIDEOOUT_LEASE_RELEASED"
+		     " main_head=1 generation=%" PRIu64 "\n",
+		     expected_generation);
+		return true;
+	}
 	VideoOutEventQueues flip_events;
 	VideoOutEventQueues pre_vblank_events;
 	VideoOutEventQueues vblank_events;
 	VideoOutEventQueues output_mode_events;
+	VideoOutEventQueues set_mode_events;
 	VideoOutConfig* master = nullptr;
 	{
 		Common::LockGuard config_lock(config.mutex);
-		if (config.closing) {
+		if (config.closing ||
+		    (expected_generation != 0 && config.generation != expected_generation)) {
 			return false;
 		}
+		if (handle == 1 && mode == VideoOutCloseMode::Native &&
+		    g_native_dce_owns_main_head.exchange(false, std::memory_order_acq_rel) &&
+		    g_native_splash_shared_main_leases.load(std::memory_order_acquire) != 0) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_DCE_HEAD_OWNERSHIP_TRANSFERRED"
+			     " main_head=1 owned_by_splash_lease\n");
+			return true;
+		}
+		if (handle == 1 && mode != VideoOutCloseMode::Direct &&
+		    g_native_splash_shared_main_leases.exchange(0, std::memory_order_acq_rel) != 0 &&
+		    g_native_dce_owns_main_head.load(std::memory_order_acquire)) {
+			LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_VIDEOOUT_LEASE_RELEASED"
+			     " main_head=1 remains_open_for_DCE_owner\n");
+			return true;
+		}
 		EXIT_IF(config.slave_count != 0);
+		if (config.native_scanout_bound) {
+			Common::LockGuard controller_lock(g_native_controller_mutex);
+			auto&             controller = g_native_controllers[0];
+			if (controller.bound_handle == handle &&
+			    controller.bound_generation == config.generation) {
+				controller.bound_handle     = -1;
+				controller.bound_generation = 0;
+				controller.pending          = false;
+				controller.pending_timing   = {};
+				controller.master_locked    = false;
+				controller.scanout_enabled  = false;
+			}
+			config.native_scanout_bound   = false;
+			config.native_scanout_enabled = false;
+			config.native_signal_pending  = false;
+			config.native_signal_active   = false;
+			g_native_dce_owns_main_head.store(false, std::memory_order_release);
+		}
 		config.opened  = false;
 		config.closing = true;
 		if (++config.generation == 0) {
@@ -787,8 +988,10 @@ bool VideoOutDriver::Impl::Close(int handle, uint64_t expected_generation, Video
 			pre_vblank_events  = std::move(config.events->pre_vblank);
 			vblank_events      = std::move(config.events->vblank);
 			output_mode_events = std::move(config.events->output_mode);
+			set_mode_events    = std::move(config.events->set_mode);
 		}
 		config.flip_rate   = 0;
+		config.blank_after_resume = false;
 		master             = config.master;
 		config.master      = nullptr;
 
@@ -817,6 +1020,7 @@ bool VideoOutDriver::Impl::Close(int handle, uint64_t expected_generation, Video
 	DeleteVideoOutEvents(pre_vblank_events, VideoOutEventKind::PreVblankStart);
 	DeleteVideoOutEvents(vblank_events, VideoOutEventKind::Vblank);
 	DeleteVideoOutEvents(output_mode_events, VideoOutEventKind::OutputMode);
+	DeleteVideoOutEvents(set_mode_events, VideoOutEventKind::SetMode);
 	return true;
 }
 
@@ -875,21 +1079,64 @@ int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
 	return OK;
 }
 
-void VideoOutDriver::Impl::VblankBegin() {
+void VideoOutDriver::Impl::VblankBegin(std::span<VideoOutVblankPhase> phases) {
 	Common::LockGuard lock(m_mutex);
+	for (auto& phase: phases) {
+		if (phase.config == nullptr) continue;
+		auto&             ctx = *phase.config;
+		Common::LockGuard context_lock(ctx.mutex);
+		if (!IsVblankPhaseCurrentLocked(phase)) {
+			phase.due            = false;
+			phase.flip_available = false;
+			continue;
+		}
+		ctx.pre_vblank_status.count++;
+		ctx.pre_vblank_status.processTime        = LibKernel::KernelGetProcessTime();
+		ctx.pre_vblank_status.reserved           = LibKernel::KernelReadTsc();
+		ctx.pre_vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
+		TriggerVideoOutEvents(ctx, VideoOutEventKind::PreVblankStart,
+		                      reinterpret_cast<void*>(ctx.pre_vblank_status.count));
+	}
+}
 
-	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
-		auto& ctx = m_video_out_ctx[i];
-		if (ctx.opened) {
-			ctx.mutex.Lock();
-			ctx.pre_vblank_status.count++;
-			ctx.pre_vblank_status.processTime        = LibKernel::KernelGetProcessTime();
-			ctx.pre_vblank_status.reserved           = LibKernel::KernelReadTsc();
-			ctx.pre_vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
+void VideoOutDriver::Impl::VblankEnd(std::span<const VideoOutVblankPhase> phases,
+                                     bool                                 fallback_due) {
+	Common::LockGuard lock(m_mutex);
+	bool              head0_due = fallback_due;
+	for (const auto& phase: phases) {
+		if (phase.config == nullptr) continue;
+		auto&             ctx = *phase.config;
+		Common::LockGuard context_lock(ctx.mutex);
+		const bool        current = IsVblankPhaseCurrentLocked(phase);
+		if (phase.config == &m_video_out_ctx[1] && ctx.opened && ctx.native_scanout_bound) {
+			head0_due = current;
+		}
+		if (!current) continue;
+		ctx.vblank_status.count++;
+		ctx.vblank_status.processTime        = LibKernel::KernelGetProcessTime();
+		ctx.vblank_status.reserved           = LibKernel::KernelReadTsc();
+		ctx.vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
+		TriggerVideoOutEvents(ctx, VideoOutEventKind::Vblank,
+		                      reinterpret_cast<void*>(ctx.vblank_status.count));
+		ctx.vblank_cond.SignalAll();
+	}
 
-			TriggerVideoOutEvents(ctx, VideoOutEventKind::PreVblankStart,
-			                      reinterpret_cast<void*>(ctx.pre_vblank_status.count));
-			ctx.mutex.Unlock();
+	for (uint32_t head = 0; head < m_sys_events.size(); head++) {
+		if (!(head == 0 ? head0_due : fallback_due)) continue;
+		m_sys_vblank_status[head].count++;
+		m_sys_vblank_status[head].processTime = LibKernel::KernelGetProcessTime();
+		m_sys_vblank_status[head].reserved    = LibKernel::KernelReadTsc();
+		VideoOutEventQueues queues;
+		{
+			Common::LockGuard event_lock(m_sys_events[head]->mutex);
+			queues = m_sys_events[head]->vblank;
+		}
+		for (const auto& registration: queues) {
+			const auto result =
+			    EventQueue::KernelTriggerEvent(registration->handle, VideoOutSysVblankEventId(head),
+				                               EventQueue::KERNEL_EVFILT_VIDEO_OUT, nullptr);
+			EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
+			                     result != LibKernel::KERNEL_ERROR_ENOENT);
 		}
 	}
 }
@@ -899,22 +1146,52 @@ int VideoOutDriver::Impl::AddSysVblankEvent(EventQueue::KernelEqueue eq, uint32_
 	auto  event_state = m_sys_events[head];
 	auto& queues      = event_state->vblank;
 
-	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
-		auto& ctx = m_video_out_ctx[i];
-		if (ctx.opened) {
-			ctx.mutex.Lock();
-			ctx.vblank_status.count++;
-			ctx.vblank_status.processTime        = LibKernel::KernelGetProcessTime();
-			ctx.vblank_status.reserved           = LibKernel::KernelReadTsc();
-			ctx.vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
+	EventQueue::KernelEqueueEvent event {};
+	event.event.ident              = VideoOutSysVblankEventId(head);
+	event.event.filter             = EventQueue::KERNEL_EVFILT_VIDEO_OUT;
+	event.event.udata              = udata;
+	event.filter.delete_event_func = RemoveVideoOutEventQueue;
+	event.filter.reset_func        = ResetVideoOutEvent;
+	event.filter.trigger_func      = TriggerVideoOutSysVblank;
 
-			TriggerVideoOutEvents(ctx, VideoOutEventKind::Vblank,
-			                      reinterpret_cast<void*>(ctx.vblank_status.count));
-			ctx.vblank_cond.SignalAll();
-			ctx.mutex.Unlock();
+	VideoOutEventRegistrationRef registration;
+	bool                         add_queue = false;
+	{
+		Common::LockGuard event_lock(event_state->mutex);
+		const auto        existing =
+		    std::find_if(queues.begin(), queues.end(),
+			             [eq](const auto& candidate) { return candidate->handle == eq; });
+		if (existing != queues.end()) {
+			registration = *existing;
+		} else {
+			registration = std::make_shared<VideoOutEventRegistration>(VideoOutEventRegistration {
+			    .handle                = eq,
+			    .state                 = event_state,
+			    .kind                  = VideoOutEventKind::Vblank,
+			    .original_native_ident = VideoOutSysVblankEventId(head)});
+			queues.push_back(registration);
+			add_queue = true;
 		}
 	}
+	event.filter.data  = registration.get();
+	event.filter.owner = registration;
+	const int result   = EventQueue::KernelAddEvent(eq, event);
+	if (result != OK && add_queue) {
+		Common::LockGuard event_lock(event_state->mutex);
+		const auto        added = std::find(queues.begin(), queues.end(), registration);
+		if (added != queues.end()) {
+			queues.erase(added);
+		}
+	}
+	return result == LibKernel::KERNEL_ERROR_EBADF ? VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE : result;
 }
+
+size_t VideoOutDriver::Impl::SysVblankRegistrationCountForTest(uint32_t head) {
+	auto              event_state = m_sys_events[head];
+	Common::LockGuard event_lock(event_state->mutex);
+	return event_state->vblank.size();
+}
+
 int VideoOutDriver::Impl::AddSysSetModeEvent(EventQueue::KernelEqueue eq, uint32_t head,
                                              void* udata) {
 	auto  event_state = m_sys_events[head];
@@ -958,6 +1235,13 @@ int VideoOutDriver::Impl::AddSysSetModeEvent(EventQueue::KernelEqueue eq, uint32
 	}
 	return result == LibKernel::KERNEL_ERROR_EBADF ? VIDEO_OUT_ERROR_INVALID_EVENT_QUEUE : result;
 }
+
+size_t VideoOutDriver::Impl::SysSetModeRegistrationCountForTest(uint32_t head) {
+	auto              event_state = m_sys_events[head];
+	Common::LockGuard event_lock(event_state->mutex);
+	return event_state->set_mode.size();
+}
+
 void VideoOutDriver::Impl::GetSysVblankStatus(uint32_t head, VideoOutVblankStatus* status) {
 	Common::LockGuard lock(m_mutex);
 
@@ -965,38 +1249,95 @@ void VideoOutDriver::Impl::GetSysVblankStatus(uint32_t head, VideoOutVblankStatu
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
+	const uint64_t frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
+	struct VblankClock {
+		uint64_t deadline    = 0;
+		uint64_t whole       = 1;
+		uint64_t fraction    = 0;
+		uint64_t denominator = 1;
+		uint64_t remainder   = 0;
+		void     Reset(uint64_t numerator, uint64_t divisor, uint64_t now, bool immediate) {
+			whole       = std::max(numerator / divisor, uint64_t {1});
+			fraction    = numerator % divisor;
+			denominator = divisor;
+			remainder   = immediate ? 0 : fraction;
+			deadline    = immediate ? now : now + whole;
+		}
+		bool Poll(uint64_t now) {
+			if (now < deadline) return false;
+			uint64_t step = whole;
+			remainder += fraction;
+			if (remainder >= denominator) {
+				remainder -= denominator;
+				step++;
+			}
+			deadline += step;
+			if (deadline <= now) deadline = now + step;
+			return true;
+		}
+	};
+	VblankClock fallback_clock;
+	VblankClock native_clock;
+	uint32_t    fallback_refresh         = 0;
+	uint64_t    native_generation        = 0;
+	uint64_t    native_timing_generation = 0;
+	bool        native_running           = false;
 
-	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
-		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
-			const auto remaining_us =
-			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
-			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+		const uint64_t frame_begin = Common::Timer::QueryPerformanceCounter();
+		const uint32_t refresh     = std::max(Config::GetVblankFrequency(), 1u);
+		if (fallback_refresh != refresh) {
+			fallback_refresh = refresh;
+			fallback_clock.Reset(frequency, refresh, frame_begin, true);
 		}
-		if (token.stop_requested()) {
-			break;
+		const bool fallback_due = fallback_clock.Poll(frame_begin);
+		const bool paused       = m_presenter.IsGuestPaused();
+		std::array<VideoOutVblankPhase, VIDEO_OUT_NUM_MAX> phases {};
+		{
+			Common::LockGuard lock(m_mutex);
+			for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; handle++) {
+				auto&             ctx = m_video_out_ctx[handle];
+				Common::LockGuard context_lock(ctx.mutex);
+				auto&             phase = phases[handle];
+				phase.config            = &ctx;
+				phase.generation        = ctx.generation;
+				phase.timing_generation = ctx.native_timing_generation;
+				bool due                = fallback_due;
+				if (handle == 1) {
+					const bool running = ctx.opened && !ctx.closing && ctx.native_scanout_bound &&
+					                     ctx.native_signal_active && ctx.native_scanout_enabled;
+					if (running) {
+						if (!native_running || native_generation != ctx.generation ||
+						    native_timing_generation != ctx.native_timing_generation) {
+							uint64_t numerator   = 0;
+							uint64_t denominator = 0;
+							EXIT_IF(!NativeVblankPeriod(
+							    frequency, ctx.native_signal_h_total, ctx.native_signal_v_total,
+							    ctx.native_signal_ppll_100hz, numerator, denominator));
+							native_clock.Reset(numerator, denominator, frame_begin, false);
+							native_generation        = ctx.generation;
+							native_timing_generation = ctx.native_timing_generation;
+						}
+						due = native_clock.Poll(frame_begin);
+					} else if (ctx.native_scanout_bound) {
+						due = false;
+					}
+					native_running = running;
+				}
+				phase.due            = due && !paused && ctx.opened && !ctx.closing;
+				phase.flip_available = phase.due;
+			}
 		}
-		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
-		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
-
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
-
-		if (m_presenter.IsGuestPaused()) {
-			(void)m_presenter.PresentLastFrame();
-			const auto frame_end = Common::Timer::QueryPerformanceCounter();
-			total_wait +=
-			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
-			continue;
+		bool presented = false;
+		if (paused) {
+			if (fallback_due) presented = m_presenter.PresentLastFrame();
+		} else {
+			VblankBegin(phases);
+			while (m_flip_queue.Flip(phases))
+				presented = true;
 		}
-
-		VblankBegin();
-		bool presented = m_flip_queue.Flip(0);
-		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
+		if (fallback_due && !presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (m_presenter.PresentLastFrame()) {
 				presented = true;
 			} else {
@@ -1012,7 +1353,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				presented = true;
 			}
 		}
-		if (!presented && total_wait < 0) {
+		if (fallback_due && !presented) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;
@@ -1025,14 +1366,29 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				}
 			}
 			if (!any_open) {
+				static std::atomic_bool first_blank = false;
+				if (!first_blank.exchange(true)) {
+					LOGF("FIRST_FRAME_AUDIT host_blank_no_videoout width=%u height=%u\n", width,
+					     height);
+				}
 				auto& blank = m_presenter.PrepareBlankFrame(width, height, true);
 				m_presenter.Present(blank);
 			}
 		}
-		VblankEnd();
-
-		const auto frame_end = Common::Timer::QueryPerformanceCounter();
-		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+		if (!paused) VblankEnd(phases, fallback_due);
+		const uint64_t frame_end = Common::Timer::QueryPerformanceCounter();
+		if (frame_end - frame_begin >= frequency / 10) {
+			LOGF("FIRST_FRAME_AUDIT host_vblank_iteration_slow work_ms=%" PRIu64 "\n",
+			     (frame_end - frame_begin) * 1000 / frequency);
+		}
+		uint64_t next = fallback_clock.deadline;
+		if (native_running) next = std::min(next, native_clock.deadline);
+		if (next > frame_end) {
+			const long double micros =
+			    static_cast<long double>(next - frame_end) * 1000000.0L / frequency;
+			Common::Thread::SleepMicro(
+			    static_cast<uint32_t>(std::clamp(micros + 0.999L, 1.0L, 100000.0L)));
+		}
 	}
 }
 
@@ -1153,6 +1509,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;
+	bool            cpu_request = false;
 	{
 		Common::LockGuard lock(m_mutex);
 		auto request = std::find_if(m_requests.begin(), m_requests.end(),
@@ -1181,6 +1538,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		cfg            = request->cfg;
 		generation     = request->generation;
 		index          = request->index;
+		cpu_request    = request->source == FlipRequestSource::Cpu;
 	}
 
 	const bool          special = IsSpecialBufferIndex(index);
@@ -1232,6 +1590,14 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		                                       &buffer);
 	} else {
 		frame = &m_presenter.PrepareFrame(buffer, source_info);
+	}
+	// request id + guest address vs SYSAV_DCE_REGISTER_CONFIRMED/FLIP_ACCEPTED tell SysAv frames
+	// from other ports'
+	if (cpu_request && !special && std::getenv("KYTY_DIAGNOSTIC_SYSAV_FRAME_READBACK") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT SYSAV_CPU_FLIP_SOURCE_PREPARED"
+		     " request=%" PRIu64 " index=%d guest_addr=0x%016" PRIx64 " extent=%ux%u\n",
+		     request_id, index, source_info.data.address, source_info.extent.width,
+		     source_info.extent.height);
 	}
 
 	Common::LockGuard lock(m_mutex);
@@ -1300,8 +1666,11 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 void FlipQueue::Wait(VideoOutConfig& cfg, int index, uint64_t generation) {
 	Common::LockGuard lock(m_mutex);
 
-	auto has_request = [this, &cfg, index] {
-		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	auto has_request = [this, &cfg, index, generation] {
+		auto matches = [&cfg, index, generation](const auto& r) {
+			return r.cfg == &cfg && r.index == index &&
+			       (generation == 0 || r.generation == generation);
+		};
 		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
@@ -1312,94 +1681,152 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index, uint64_t generation) {
 
 bool FlipQueue::Flip(std::span<VideoOutVblankPhase> phases) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
-
-	m_mutex.Lock();
-	if (m_requests.empty()) {
-		m_submit_cond_var.WaitFor(&m_mutex, micros);
-	}
-	EXIT_IF(m_processing);
-	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
-	                               [](const auto& r) { return r.group == r.id; });
-	if (owner == m_requests.end()) {
+	for (;;) {
+		m_mutex.Lock();
+		EXIT_IF(m_processing);
+		auto                 owner       = m_requests.end();
+		VideoOutVblankPhase* owner_phase = nullptr;
+		for (auto candidate = m_requests.begin(); candidate != m_requests.end(); ++candidate) {
+			if (candidate->group != candidate->id || candidate->state != RequestState::Ready)
+				continue;
+			auto phase = std::find_if(phases.begin(), phases.end(), [&](const auto& value) {
+				return value.flip_available && value.config == candidate->cfg &&
+				       value.generation == candidate->generation;
+			});
+			if (phase == phases.end()) continue;
+			auto earlier_owner = [&](const auto& value) {
+				return value.cfg == candidate->cfg && value.group == value.id &&
+				       value.id < candidate->id;
+			};
+			auto group_pending = [&](const auto& value) { return value.group == candidate->id; };
+			if (std::any_of(m_requests.begin(), m_requests.end(), earlier_owner) ||
+			    std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), earlier_owner) ||
+			    std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), group_pending) ||
+			    std::any_of(m_requests.begin(), m_requests.end(), [&](const auto& value) {
+				    return group_pending(value) && value.state != RequestState::Ready;
+			    })) {
+				continue;
+			}
+			if (owner == m_requests.end() || candidate->id < owner->id) {
+				owner       = candidate;
+				owner_phase = &*phase;
+			}
+		}
+		if (owner == m_requests.end()) {
+			m_mutex.Unlock();
+			return false;
+		}
+		const uint64_t group        = owner->id;
+		owner_phase->flip_available = false;
+		std::array<Request, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> requests {};
+		size_t                                                            count = 0;
+		for (auto& request: m_requests) {
+			if (request.group == group) {
+				EXIT_IF(count == requests.size());
+				request.state     = RequestState::Presenting;
+				requests[count++] = request;
+			}
+		}
+		m_processing = true;
 		m_mutex.Unlock();
-		return false;
-	}
-	const uint64_t group = owner->id;
-	if (std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(),
-	                [group](const auto& r) { return r.group == group; }) ||
-	    std::any_of(m_requests.begin(), m_requests.end(), [group](const auto& r) {
-		    return r.group == group && r.state != RequestState::Ready;
-	    })) {
+
+		std::sort(requests.begin(), requests.begin() + count,
+		          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
+		bool due = true;
+		std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()>
+		    layers {};
+		for (size_t i = 0; i < count; i++) {
+			auto& r = requests[i];
+			r.cfg->mutex.Lock();
+			due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
+			due &= !r.cfg->native_scanout_bound ||
+			       (r.cfg->native_signal_active && r.cfg->native_scanout_enabled);
+			if (r.id == group) {
+				due &= IsVblankPhaseCurrentLocked(*owner_phase) &&
+				       IsFlipDueLocked(*r.cfg, r.generation);
+			}
+			int present_bus = r.cfg->bus;
+			if (present_bus == VIDEO_OUT_BUS_TYPE_SYSTEM &&
+			    std::getenv("KYTY_DIAGNOSTIC_SYSTEM_BUS_TO_MAIN_LAYER") != nullptr) {
+				EXIT_NOT_IMPLEMENTED(count != 1);
+				present_bus                               = VIDEO_OUT_BUS_TYPE_MAIN;
+				static std::atomic_bool logged_system_bus = false;
+				if (!logged_system_bus.exchange(true)) {
+					LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_SYSTEM_BUS_TO_MAIN_LAYER"
+					     " source_bus=0x100 target_bus=0 count=%zu NON_AUTHENTIC\n",
+					     count);
+				}
+			}
+			layers[i] = {r.frame, present_bus, r.premultiplied_alpha};
+		}
+		if (due) {
+			static std::atomic_bool first_guest_present = false;
+			if (!first_guest_present.exchange(true)) {
+				LOGF("FIRST_FRAME_AUDIT first_guest_present_attempt layers=%zu request=%" PRIu64
+				     "\n",
+				     count, group);
+			}
+			m_presenter.Present(std::span(layers.data(), count));
+			if (std::getenv("KYTY_DIAGNOSTIC_SYSAV_FRAME_READBACK") != nullptr) {
+				for (size_t i = 0; i < count; i++) {
+					const auto& r = requests[i];
+					if (r.source == FlipRequestSource::Cpu) {
+						LOGF("FIRST_FRAME_AUDIT SYSAV_CPU_FLIP_PRESENTER_INVOKED"
+						     " request=%" PRIu64 " index=%d bus=%d\n",
+						     r.id, r.index, r.cfg->bus);
+					}
+				}
+			}
+			if (std::getenv("KYTY_DIAGNOSTIC_HOLD_FIRST_PRESENT") != nullptr &&
+			    first_guest_present.load()) {
+				static std::atomic_bool held = false;
+				if (!held.exchange(true)) {
+					LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_HOST_PRESENT_RETURNED holding_2000ms"
+					     " FOR_WINDOW_SAMPLING\n");
+					std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+				}
+			}
+		}
+
+		m_mutex.Lock();
+		for (auto it = m_requests.begin(); it != m_requests.end();) {
+			if (it->group != group) {
+				++it;
+				continue;
+			}
+			if (!due) {
+				it++->state = RequestState::Ready;
+				continue;
+			}
+			auto& r = *it;
+			r.cfg->flip_status.count++;
+			r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
+			r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
+			r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
+			r.cfg->flip_status.flipArg                  = r.flip_arg;
+			r.cfg->flip_status.currentBuffer            = r.index;
+			r.cfg->flip_status.flipPendingNum--;
+			r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
+			TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip,
+			                      reinterpret_cast<void*>(r.flip_arg));
+			it = m_requests.erase(it);
+		}
+		m_processing = false;
+		m_done_cond_var.SignalAll();
+		m_submit_slot_cond_var.SignalAll();
 		m_mutex.Unlock();
-		return false;
-	}
-	std::array<Request, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> requests {};
-	size_t count = 0;
-	for (auto& request: m_requests) {
-		if (request.group == group) {
-			EXIT_IF(count == requests.size());
-			request.state = RequestState::Presenting;
-			requests[count++] = request;
+		for (size_t i = count; i != 0; i--) {
+			requests[i - 1].cfg->mutex.Unlock();
 		}
-	}
-	m_processing = true;
-	m_mutex.Unlock();
-
-	// Lock each port in bus order, then present and complete the whole group at one Vblank.
-	std::sort(requests.begin(), requests.begin() + count,
-	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
-	bool due = true;
-	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
-	for (size_t i = 0; i < count; i++) {
-		auto& r = requests[i];
-		r.cfg->mutex.Lock();
-		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
-		if (r.id == group) {
-			due &= IsFlipDueLocked(*r.cfg, r.generation);
+		if (due) {
+			Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
+			if (Config::GraphicsDebugDumpEnabled() &&
+			    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
+				LOGF("Flip done: %d\n", requests[0].index);
+			}
 		}
-		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+		if (due) return true;
 	}
-	if (due) {
-		m_presenter.Present(std::span(layers.data(), count));
-	}
-
-	m_mutex.Lock();
-	for (auto it = m_requests.begin(); it != m_requests.end();) {
-		if (it->group != group) {
-			++it;
-			continue;
-		}
-		if (!due) {
-			it++->state = RequestState::Ready;
-			continue;
-		}
-		auto& r = *it;
-		r.cfg->flip_status.count++;
-		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
-		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
-		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
-		r.cfg->flip_status.flipArg                  = r.flip_arg;
-		r.cfg->flip_status.currentBuffer            = r.index;
-		r.cfg->flip_status.flipPendingNum--;
-		r.cfg->flip_status.gcQueueNum -= r.source == FlipRequestSource::GpuEop;
-		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
-		it = m_requests.erase(it);
-	}
-	m_processing = false;
-	m_done_cond_var.SignalAll();
-	m_submit_slot_cond_var.SignalAll();
-	m_mutex.Unlock();
-	for (size_t i = count; i != 0; i--) {
-		requests[i - 1].cfg->mutex.Unlock();
-	}
-	if (due) {
-		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
-		if (Config::GraphicsDebugDumpEnabled() &&
-		    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
-			LOGF("Flip done: %d\n", requests[0].index);
-		}
-	}
-	return due;
 }
 
 void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
@@ -1422,6 +1849,20 @@ KYTY_SYSV_ABI void VideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* at
 
 KYTY_SYSV_ABI int VideoOutGetOccupiedPrivacyMask(uint64_t* mask) {
 	PRINT_NAME();
+	if (g_video_out_driver == nullptr) {
+		return VIDEO_OUT_ERROR_FATAL;
+	}
+	if (mask == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+	*mask                                       = DriverState().OccupiedPrivacyMask();
+	static std::atomic_bool first_privacy_query = false;
+	if (!first_privacy_query.exchange(true)) {
+		LOGF("FIRST_FRAME_AUDIT DCE_PRIVACY_QUERY mask=0x%016" PRIx64
+		     " DIAGNOSTIC_BASELINE_NO_RELEASE_MODEL\n",
+		     *mask);
+	}
+	return OK;
 }
 
 static int OpenVideoOut(int user_id, int bus_type, int index, const void* param,
@@ -1429,8 +1870,49 @@ static int OpenVideoOut(int user_id, int bus_type, int index, const void* param,
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
-	return DriverState().Open(bus_type, index);
+	const int handle = DriverState().Open(bus_type, index, false, generation);
+	if (handle == VIDEO_OUT_ERROR_RESOURCE_BUSY &&
+	    (native_client || std::getenv("KYTY_DIAGNOSTIC_SYSAV_SPLASH_SHARE_DCE_HEAD") != nullptr) &&
+	    user_id == 0 && bus_type == VIDEO_OUT_BUS_TYPE_MAIN && index == 0 && param == nullptr &&
+	    g_native_dce_owns_main_head.load(std::memory_order_acquire)) {
+		// DCE and sceVideoOutOpen share MAIN here, so lease the open head rather than RESOURCE_BUSY
+		auto* ctx = DriverState().Get(1);
+		if (ctx != nullptr) {
+			Common::LockGuard lock(ctx->mutex);
+			uint32_t          expected = 0;
+			const bool        real_head_eligible =
+			    ctx->opened && !ctx->closing && ctx->native_scanout_bound &&
+			    g_native_dce_owns_main_head.load(std::memory_order_acquire) &&
+			    (ctx->native_signal_active || ctx->native_signal_pending) &&
+			    (ctx->native_signal_width == 3840 || ctx->native_signal_width == 1920) &&
+			    g_native_splash_shared_main_leases.compare_exchange_strong(
+			        expected, 1, std::memory_order_acq_rel);
+			if (real_head_eligible) {
+				if (generation != nullptr) *generation = ctx->generation;
+				LOGF("FIRST_FRAME_AUDIT SYSAV_SPLASH_VIDEOOUT_HEAD_LEASE_GRANTED"
+				     " sceVideoOutOpen_user=0_bus=MAIN shared_head=1"
+				     " existing_signal=%ux%u pending=%u active=%u\n",
+				     ctx->native_signal_width, ctx->native_signal_height,
+				     ctx->native_signal_pending ? 1u : 0u, ctx->native_signal_active ? 1u : 0u);
+				return 1;
+			}
+		}
+	}
+	if (handle >= 0) {
+		static std::atomic_bool first_open = false;
+		if (!first_open.exchange(true)) {
+			LOGF("FIRST_FRAME_AUDIT first_videoout_open user=%d bus=%d index=%d handle=%d\n",
+			     user_id, bus_type, index, handle);
+		}
+	}
+	return handle;
 }
+
+KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
+	PRINT_NAME();
+	return OpenVideoOut(user_id, bus_type, index, param, nullptr);
+}
+
 int VideoOutNativeAcquireSplashHandle(int*      native_display_handle,
                                       uint64_t* native_display_generation) {
 	if (!VideoOutIsInitialized() || native_display_handle == nullptr ||
@@ -1447,8 +1929,8 @@ int VideoOutNativeAcquireSplashHandle(int*      native_display_handle,
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {
 	PRINT_NAME();
-
-	return DriverState().Close(handle) ? OK : VIDEO_OUT_ERROR_INVALID_HANDLE;
+	return DriverState().Close(handle, 0, VideoOutCloseMode::User) ? OK
+	                                                               : VIDEO_OUT_ERROR_INVALID_HANDLE;
 }
 
 KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribute,
@@ -1489,6 +1971,7 @@ static int RegisterBuffersWithGeneration(int handle, int set_index, int buffer_i
                                          void* option, uint64_t expected_generation);
 static int SubmitFlipWithGeneration(int handle, int index, int flip_mode, int64_t flip_arg,
                                     uint64_t expected_generation);
+
 int VideoOutNativeProgramDisplayClock(uint32_t requested_rate, uint32_t* applied_rate) {
 	// 120000 = SysAvControl PLL_SET_DISPCLK (0x45A110)
 	if (!VideoOutIsInitialized() || applied_rate == nullptr || requested_rate != 120000u) {
@@ -1502,6 +1985,7 @@ int VideoOutNativeProgramDisplayClock(uint32_t requested_rate, uint32_t* applied
 	     requested_rate);
 	return OK;
 }
+
 int VideoOutNativeGetControllerSnapshot(uint32_t                          original_port,
                                         VideoOutNativeControllerSnapshot* snapshot) {
 	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
@@ -1513,11 +1997,13 @@ int VideoOutNativeGetControllerSnapshot(uint32_t                          origin
 	snapshot->display_clock_10khz = g_native_virtual_display_clock.load(std::memory_order_acquire);
 	return OK;
 }
+
 uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle) {
 	if (!VideoOutIsInitialized()) return 0;
 	uint64_t generation = 0;
 	return DriverState().Get(native_display_handle, generation) != nullptr ? generation : 0;
 }
+
 int VideoOutNativeProgramMasterUpdateLock(uint32_t original_port, uint32_t enabled) {
 	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() || enabled > 1) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
@@ -1533,6 +2019,7 @@ int VideoOutNativeProgramMasterUpdateLock(uint32_t original_port, uint32_t enabl
 	     original_port, enabled, controller.transaction_id);
 	return OK;
 }
+
 int VideoOutNativeProgramPixelClock(uint32_t original_port, uint32_t raw_rate_100hz) {
 	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
 	    raw_rate_100hz < 200000u || raw_rate_100hz > 12000000u) {
@@ -1562,6 +2049,7 @@ int VideoOutNativeProgramPixelClock(uint32_t original_port, uint32_t raw_rate_10
 	     original_port, raw_rate_100hz, controller.transaction_id);
 	return OK;
 }
+
 int VideoOutNativeProgramOtgTiming(uint32_t original_port, const uint32_t* original_registers,
                                    size_t register_count) {
 	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
@@ -1611,6 +2099,7 @@ int VideoOutNativeProgramOtgTiming(uint32_t original_port, const uint32_t* origi
 	     original_port, controller.transaction_id);
 	return OK;
 }
+
 int VideoOutNativeProgramOtgControl(uint32_t original_request, uint32_t original_port,
                                     uint32_t original_value) {
 	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
@@ -1680,6 +2169,7 @@ int VideoOutNativeProgramOtgControl(uint32_t original_request, uint32_t original
 	}
 	return update(nullptr);
 }
+
 int VideoOutNativeProgramFormatControl(uint32_t original_request, uint32_t original_port,
                                        uint32_t original_value) {
 	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size() ||
@@ -1706,6 +2196,7 @@ int VideoOutNativeProgramFormatControl(uint32_t original_request, uint32_t origi
 	     original_request, original_port, original_value, controller.transaction_id);
 	return OK;
 }
+
 int VideoOutNativeConfigureDisplaySignal(int* native_display_handle, uint32_t original_port,
                                          uint32_t signal_width, uint32_t signal_height,
                                          uint32_t h_total, uint32_t v_total, float refresh_hz,
@@ -1796,6 +2287,7 @@ int VideoOutNativeConfigureDisplaySignal(int* native_display_handle, uint32_t or
 	if (result != OK && opened_here) (void)DriverState().Close(handle, generation);
 	return result;
 }
+
 int VideoOutNativeFinishDisplaySignal(uint32_t original_port, uint64_t expected_generation) {
 	if (!VideoOutIsInitialized() || original_port >= g_native_controllers.size()) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
@@ -1848,6 +2340,7 @@ int VideoOutNativeFinishDisplaySignal(uint32_t original_port, uint64_t expected_
 	     controller.timing_generation);
 	return OK;
 }
+
 int VideoOutNativeConfigureSplashAttributes(const uint64_t* original_words,
                                             size_t original_word_count, int handle,
                                             uint64_t expected_generation) {
@@ -1886,6 +2379,7 @@ int VideoOutNativeConfigureSplashAttributes(const uint64_t* original_words,
 	     handle, generation);
 	return OK;
 }
+
 int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_index,
                                        uint64_t  original_guest_address,
                                        uint64_t* native_display_generation) {
@@ -1937,6 +2431,7 @@ int VideoOutNativeRegisterSplashBuffer(int* native_display_handle, int buffer_in
 	     handle, buffer_index, original_guest_address);
 	return OK;
 }
+
 void VideoOutNativeReleaseSplashHandle(int* native_display_handle, uint64_t expected_generation) {
 	if (native_display_handle != nullptr && *native_display_handle >= 0) {
 		if (VideoOutIsInitialized()) {
@@ -1946,12 +2441,14 @@ void VideoOutNativeReleaseSplashHandle(int* native_display_handle, uint64_t expe
 		*native_display_handle = -1;
 	}
 }
+
 void VideoOutNativeReleaseClientHandle(int* handle, uint64_t expected_generation) {
 	if (handle == nullptr || *handle < 0) return;
 	if (VideoOutIsInitialized() && expected_generation != 0)
 		(void)DriverState().Close(*handle, expected_generation, VideoOutCloseMode::NativeClient);
 	*handle = -1;
 }
+
 int VideoOutNativeSubmitSplashFlip(int native_display_handle, int buffer_index, int flip_mode,
                                    int64_t flip_arg, uint64_t original_guest_address,
                                    uint64_t expected_generation) {
@@ -1989,6 +2486,7 @@ int VideoOutNativeSubmitSplashFlip(int native_display_handle, int buffer_index, 
 	}
 	return rc;
 }
+
 int VideoOutNativeGetFlipStatus(int native_display_handle, uint64_t* original_words,
                                 size_t original_word_count, uint64_t expected_generation) {
 	if (!VideoOutIsInitialized() || original_words == nullptr || original_word_count != 16) {
@@ -2028,6 +2526,7 @@ int VideoOutNativeGetFlipStatus(int native_display_handle, uint64_t* original_wo
 	     status.flipPendingNum, status.gcQueueNum);
 	return OK;
 }
+
 KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
@@ -2045,6 +2544,23 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	Common::LockGuard lock(ctx->mutex);
 	ctx->flip_rate = rate;
 
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutSetBlankAfterResume(int handle) {
+	PRINT_NAME();
+
+	auto* ctx = DriverState().Get(handle);
+	if (ctx == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+
+	Common::LockGuard lock(ctx->mutex);
+	if (!ctx->opened || ctx->closing) {
+		return VIDEO_OUT_ERROR_INVALID_HANDLE;
+	}
+	ctx->blank_after_resume = true;
+	LOGF("\t blank after resume armed, handle=%d\n", handle);
 	return OK;
 }
 
@@ -2078,6 +2594,7 @@ int VideoOutNativeRegisterOriginalSplashFlipEvent(EventQueue::KernelEqueue eq,
 	}
 	return rc;
 }
+
 KYTY_SYSV_ABI int VideoOutDeleteVblankEvent(EventQueue::KernelEqueue eq, int handle) {
 	PRINT_NAME();
 	return DeleteVideoOutEvent(handle, eq, VideoOutEventKind::Vblank);
@@ -2091,7 +2608,12 @@ KYTY_SYSV_ABI int VideoOutDeletePreVblankStartEvent(EventQueue::KernelEqueue eq,
 KYTY_SYSV_ABI int VideoOutAddVblankEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                          void* udata) {
 	PRINT_NAME();
-	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Vblank, udata);
+	const int result = RegisterVideoOutEvent(handle, eq, VideoOutEventKind::Vblank, udata);
+	LOGF("FIRST_FRAME_AUDIT vblank_event eq=0x%016" PRIx64 " handle=%d udata=0x%016" PRIx64
+	     " result=0x%08x\n",
+	     static_cast<uint64_t>(eq), handle, reinterpret_cast<uint64_t>(udata),
+	     static_cast<unsigned>(result));
+	return result;
 }
 
 KYTY_SYSV_ABI int VideoOutAddPreVblankStartEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
@@ -2111,11 +2633,14 @@ KYTY_SYSV_ABI int VideoOutAddSetModeEvent(LibKernel::EventQueue::KernelEqueue eq
 	PRINT_NAME();
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::SetMode, udata);
 }
+
 KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer_index_start,
                                            const VideoOutBuffers* buffers, int buffer_num,
                                            const VideoOutBufferAttribute2* attribute, int category,
                                            void* option) {
 	PRINT_NAME();
+	return RegisterBuffersWithGeneration(handle, set_index, buffer_index_start, buffers, buffer_num,
+	                                     attribute, category, option, 0);
 }
 
 static int RegisterBuffersWithGeneration(int handle, int set_index, int buffer_index_start,
@@ -2191,7 +2716,8 @@ static int RegisterBuffersWithGeneration(int handle, int set_index, int buffer_i
 	}
 
 	Common::LockGuard lock(ctx->mutex);
-	if (ctx->closing) {
+	if (!ctx->opened || ctx->closing || ctx->generation != generation ||
+	    (expected_generation != 0 && expected_generation != generation)) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	if (ctx->groups[set_index].occupied) {
@@ -2210,6 +2736,11 @@ static int RegisterBuffersWithGeneration(int handle, int set_index, int buffer_i
 		LOGF("\tbuffers[%d] = %016" PRIx64 " metadata = %016" PRIx64 " dcc = %08" PRIx32 "\n",
 		     buffer_index_start + i, buffer.data_address, buffer.metadata_address,
 		     attribute->dcc_control);
+	}
+	static std::atomic_bool first_register = false;
+	if (!first_register.exchange(true)) {
+		LOGF("FIRST_FRAME_AUDIT first_videoout_register handle=%d set=%d start=%d count=%d\n",
+		     handle, set_index, buffer_index_start, buffer_num);
 	}
 
 	return OK;
@@ -2287,13 +2818,14 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+	return SubmitFlipWithGeneration(handle, index, flip_mode, flip_arg, 0);
 }
 
 static int SubmitFlipWithGeneration(int handle, int index, int flip_mode, int64_t flip_arg,
                                     uint64_t expected_generation) {
 	uint64_t  request_id = 0;
-	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
-	                                          FlipRequestSource::Cpu, request_id);
+	const int result = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
+	                                      FlipRequestSource::Cpu, request_id, expected_generation);
 	if (result == VIDEO_OUT_ERROR_INVALID_FLIP_MODE) {
 		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
 	}
@@ -2301,6 +2833,11 @@ static int SubmitFlipWithGeneration(int handle, int index, int flip_mode, int64_
 		return result;
 	}
 	g_video_out_driver->SubmitFlipPreparation(request_id);
+	static std::atomic_bool first_cpu_flip = false;
+	if (!first_cpu_flip.exchange(true)) {
+		LOGF("FIRST_FRAME_AUDIT first_cpu_flip handle=%d index=%d request=%" PRIu64 "\n", handle,
+		     index, request_id);
+	}
 
 	return OK;
 }
@@ -2432,6 +2969,7 @@ KYTY_SYSV_ABI int VideoOutGetEventId(const EventQueue::KernelEvent* ev) {
 		case VIDEO_OUT_EVENT_VBLANK:
 		case VIDEO_OUT_EVENT_PRE_VBLANK_START:
 		case VIDEO_OUT_EVENT_SET_MODE: return static_cast<int>(ev->ident);
+		case VIDEO_OUT_EVENT_SET_MODE_INTERNAL: return VIDEO_OUT_EVENT_SET_MODE;
 		default: return VIDEO_OUT_ERROR_INVALID_EVENT;
 	}
 }
@@ -2521,6 +3059,37 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	return OK;
 }
 
+KYTY_SYSV_ABI int VideoOutSysGetResolutionStatus2(uint32_t bus, VideoOutResolutionStatus* status) {
+	PRINT_NAME();
+
+	if (bus > 1) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	if (status == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+
+	// bus 0 = the 4K output VideoOutGetOutputStatus reports, bus 1 (HMD) has no mode
+	*status       = VideoOutResolutionStatus();
+	status->flags = 6;
+	if (bus == 0) {
+		status->fullWidth  = 3840;
+		status->fullHeight = 2160;
+		status->paneWidth  = 3840;
+		status->paneHeight = 2160;
+		status->refreshRate =
+		    (Config::GetVblankFrequency() >= 119 ? VIDEO_OUT_REFRESH_RATE_119_88HZ
+			                                     : VIDEO_OUT_REFRESH_RATE_59_94HZ);
+	}
+	static std::atomic_uint logged = 0;
+	if (logged.fetch_add(1) < 2) {
+		LOGF("FIRST_FRAME_AUDIT VIDEOOUT_SYS_RESOLUTION bus=%u %ux%u refresh=%" PRIu64
+		     " EMULATOR_DEFINED_NO_DCE\n",
+		     bus, status->fullWidth, status->fullHeight, status->refreshRate);
+	}
+	return OK;
+}
+
 KYTY_SYSV_ABI int VideoOutSysGetVblankStatus2(uint32_t head, VideoOutVblankStatus* status) {
 	PRINT_NAME();
 
@@ -2539,6 +3108,49 @@ KYTY_SYSV_ABI int VideoOutSysGetVblankStatus2(uint32_t head, VideoOutVblankStatu
 	}
 	return OK;
 }
+
+KYTY_SYSV_ABI int VideoOutSysIsUserStatusSystemDefault(int handle, uint32_t bus, uint64_t /*arg*/,
+                                                       int option, void* reserved) {
+	PRINT_NAME();
+
+	if (handle != 0xff) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	if (option != 0) {
+		return VIDEO_OUT_ERROR_INVALID_OPTION;
+	}
+	if (reserved != nullptr || bus > 1) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	return 1;
+}
+
+KYTY_SYSV_ABI int VideoOutSysIsUserStatusVr(int handle, uint32_t bus, uint64_t /*arg*/, int option,
+                                            void* reserved) {
+	PRINT_NAME();
+
+	if (handle != 0xff) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	if (option != 0) {
+		return VIDEO_OUT_ERROR_INVALID_OPTION;
+	}
+	if (reserved != nullptr || bus > 1) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	return 0;
+}
+
+KYTY_SYSV_ABI int VideoOutSysGetPipelineStatus(uint32_t* status, void* reserved) {
+	PRINT_NAME();
+
+	if (status == nullptr || reserved != nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+	std::fill_n(status, 8, 0u);
+	return OK;
+}
+
 KYTY_SYSV_ABI int VideoOutSysAddSetModeEvent2(LibKernel::EventQueue::KernelEqueue eq, uint32_t head,
                                               void* udata) {
 	PRINT_NAME();
@@ -2557,6 +3169,21 @@ KYTY_SYSV_ABI int VideoOutSysAddSetModeEvent2(LibKernel::EventQueue::KernelEqueu
 
 	return DriverState().AddSysSetModeEvent(eq, head, udata);
 }
+
+extern "C" size_t KytyVideoOutSysSetModeRegistrationCountForTest(uint32_t head) {
+	if (head > 1 || !VideoOutIsInitialized()) {
+		return 0;
+	}
+	return DriverState().SysSetModeRegistrationCountForTest(head);
+}
+
+extern "C" size_t KytyVideoOutSysVblankRegistrationCountForTest(uint32_t head) {
+	if (head > 1 || !VideoOutIsInitialized()) {
+		return 0;
+	}
+	return DriverState().SysVblankRegistrationCountForTest(head);
+}
+
 KYTY_SYSV_ABI int VideoOutSysAddVblankEvent2(LibKernel::EventQueue::KernelEqueue eq, uint32_t head,
                                              void* udata) {
 	PRINT_NAME();
@@ -2571,6 +3198,24 @@ KYTY_SYSV_ABI int VideoOutSysAddVblankEvent2(LibKernel::EventQueue::KernelEqueue
 	}
 	return DriverState().AddSysVblankEvent(eq, head, udata);
 }
+
+KYTY_SYSV_ABI int VideoOutSysAddVblankEvent(LibKernel::EventQueue::KernelEqueue eq, int bus_type,
+                                            void* udata) {
+	PRINT_NAME();
+
+	LOGF("\t eq       = 0x%016" PRIx64 "\n"
+	     "\t bus_type = 0x%x\n"
+	     "\t udata    = 0x%016" PRIx64 "\n",
+	     static_cast<uint64_t>(eq), bus_type, reinterpret_cast<uint64_t>(udata));
+
+	// XXX: no authinfo check for bus 0x100
+	const auto& buses = VideoOutDriver::Impl::VIDEO_OUT_BUSES;
+	if (std::find(buses.begin(), buses.end(), bus_type) == buses.end()) {
+		return VIDEO_OUT_ERROR_INVALID_VALUE;
+	}
+	return DriverState().AddSysVblankEvent(eq, 0, udata);
+}
+
 KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
 	if (!DriverState().IsOpened(handle)) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
@@ -2682,6 +3327,8 @@ KYTY_SYSV_ABI int VideoOutConfigureOutput(int handle, uint64_t mode,
 	ctx->mutex.Lock();
 	ctx->output_mode = mode;
 	TriggerVideoOutEvents(*ctx, VideoOutEventKind::OutputMode,
+	                      reinterpret_cast<void*>(ctx->output_mode));
+	TriggerVideoOutEvents(*ctx, VideoOutEventKind::SetMode,
 	                      reinterpret_cast<void*>(ctx->output_mode));
 	ctx->mutex.Unlock();
 

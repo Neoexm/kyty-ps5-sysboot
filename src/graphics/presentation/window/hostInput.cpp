@@ -1,12 +1,11 @@
 #include "graphics/presentation/window/hostInput.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -46,9 +45,9 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {"Cross", Controller::PAD_BUTTON_CROSS},
     ControlInfo {"Square", Controller::PAD_BUTTON_SQUARE},
     ControlInfo {"TouchPad", Controller::PAD_BUTTON_TOUCH_PAD, Controller::Axis::AxisMax, false,
-                 0.25f},
+	             0.25f},
     ControlInfo {"TouchPadRight", Controller::PAD_BUTTON_TOUCH_PAD, Controller::Axis::AxisMax,
-                 false, 0.75f},
+	             false, 0.75f},
     ControlInfo {"LeftStickLeft", 0, Controller::Axis::LeftX, false},
     ControlInfo {"LeftStickRight", 0, Controller::Axis::LeftX, true},
     ControlInfo {"LeftStickUp", 0, Controller::Axis::LeftY, false},
@@ -60,7 +59,7 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {.name = "SpeakerVolume", .setting = Controller::Setting::SpeakerVolume},
     ControlInfo {.name = "VibrationIntensity", .setting = Controller::Setting::VibrationIntensity},
     ControlInfo {.name    = "TriggerEffectIntensity",
-                 .setting = Controller::Setting::TriggerEffectIntensity},
+	             .setting = Controller::Setting::TriggerEffectIntensity},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
@@ -145,8 +144,8 @@ public:
 				}
 			}
 
-			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_F1 ||
-			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
+			const bool reserved =
+			    binding.key == SDLK_F1 || binding.key == SDLK_F7 || binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());
@@ -161,7 +160,7 @@ public:
 		key_code = NormalizeKey(static_cast<SDL_Keycode>(key_code));
 		const auto binding =
 		    std::find_if(m_bindings.begin(), m_bindings.begin() + m_size,
-		                 [key_code](const auto& item) { return item.key == key_code; });
+			             [key_code](const auto& item) { return item.key == key_code; });
 		return binding != m_bindings.begin() + m_size ? binding->control : INVALID_CONTROL;
 	}
 
@@ -211,12 +210,18 @@ void SetTouchPad(float x, bool down) {
 	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 0, down, x, 0.5f);
 }
 
-uint32_t DefaultKeyboardButton(int key_code) {
+uint32_t NavigationKeyboardButton(int key_code) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_UP: return Controller::PAD_BUTTON_UP;
 		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+	}
+}
+
+uint32_t DefaultKeyboardButton(int key_code) {
+	if (const auto button = NavigationKeyboardButton(key_code); button != 0) return button;
+	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_J: return Controller::PAD_BUTTON_CROSS;
 		case SDLK_I: return Controller::PAD_BUTTON_TRIANGLE;
 		case SDLK_K: return Controller::PAD_BUTTON_SQUARE;
@@ -227,8 +232,6 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_C: return Controller::PAD_BUTTON_R2;
 		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
 		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
-		case SDLK_RETURN:
-		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
 		default: return 0;
 	}
 }
@@ -239,6 +242,15 @@ struct StickKeys {
 	bool up    = false;
 	bool down  = false;
 };
+
+struct AxisKeys {
+	bool negative = false;
+	bool positive = false;
+};
+
+StickKeys               g_left_keys;
+StickKeys               g_right_keys;
+std::array<AxisKeys, 4> g_custom_axes;
 
 void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	int value = 128;
@@ -275,26 +287,17 @@ void SetControl(std::size_t control, bool down) {
 		return;
 	}
 
-	struct AxisKeys {
-		bool negative = false;
-		bool positive = false;
-	};
-	static std::array<AxisKeys, 4> axes;
-
 	const auto axis = static_cast<std::size_t>(info.axis);
-	EXIT_IF(axis >= axes.size());
+	EXIT_IF(axis >= g_custom_axes.size());
 	if (info.positive) {
-		axes[axis].positive = down;
+		g_custom_axes[axis].positive = down;
 	} else {
-		axes[axis].negative = down;
+		g_custom_axes[axis].negative = down;
 	}
-	SetStickAxis(info.axis, axes[axis].negative, axes[axis].positive);
+	SetStickAxis(info.axis, g_custom_axes[axis].negative, g_custom_axes[axis].positive);
 }
 
 void DefaultKeyboardInput(int key_code, bool down) {
-	static StickKeys left;
-	static StickKeys right;
-
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
 		case SDLK_TAB: SetTouchPad(0.75f, down); return;
@@ -302,39 +305,46 @@ void DefaultKeyboardInput(int key_code, bool down) {
 		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
 		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
 		case SDLK_A:
-			left.left = down;
-			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
+			g_left_keys.left = down;
+			SetStickAxis(Controller::Axis::LeftX, g_left_keys.left, g_left_keys.right);
 			return;
 		case SDLK_D:
-			left.right = down;
-			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
+			g_left_keys.right = down;
+			SetStickAxis(Controller::Axis::LeftX, g_left_keys.left, g_left_keys.right);
 			return;
 		case SDLK_W:
-			left.up = down;
-			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
+			g_left_keys.up = down;
+			SetStickAxis(Controller::Axis::LeftY, g_left_keys.up, g_left_keys.down);
 			return;
 		case SDLK_S:
-			left.down = down;
-			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
+			g_left_keys.down = down;
+			SetStickAxis(Controller::Axis::LeftY, g_left_keys.up, g_left_keys.down);
 			return;
 		case SDLK_F:
-			right.left = down;
-			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
+			g_right_keys.left = down;
+			SetStickAxis(Controller::Axis::RightX, g_right_keys.left, g_right_keys.right);
 			return;
 		case SDLK_H:
-			right.right = down;
-			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
+			g_right_keys.right = down;
+			SetStickAxis(Controller::Axis::RightX, g_right_keys.left, g_right_keys.right);
 			return;
 		case SDLK_T:
-			right.up = down;
-			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
+			g_right_keys.up = down;
+			SetStickAxis(Controller::Axis::RightY, g_right_keys.up, g_right_keys.down);
 			return;
 		case SDLK_G:
-			right.down = down;
-			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
+			g_right_keys.down = down;
+			SetStickAxis(Controller::Axis::RightY, g_right_keys.up, g_right_keys.down);
 			return;
 		default: SetButton(DefaultKeyboardButton(key_code), down); return;
 	}
+}
+
+void ResetKeyboardInput() {
+	g_left_keys   = {};
+	g_right_keys  = {};
+	g_custom_axes = {};
+	Controller::ResetInputState();
 }
 
 void MouseToJoystick(float delta_x, float delta_y) {
@@ -425,7 +435,12 @@ void HostInputShutdown() {
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
-		SetControl(map.FindKey(key_code), down);
+		const auto control = map.FindKey(key_code);
+		if (control != INVALID_CONTROL) {
+			SetControl(control, down);
+		} else {
+			SetButton(NavigationKeyboardButton(key_code), down);
+		}
 	} else {
 		DefaultKeyboardInput(key_code, down);
 	}
@@ -491,6 +506,7 @@ bool HostInputWaitEvent(SDL_Event* event) {
 	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
+		ResetKeyboardInput();
 	}
 	return has_event;
 }

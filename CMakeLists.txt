@@ -534,6 +534,18 @@ add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioO
 target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
 
+if(WIN32)
+	add_executable(host_window_policy_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostWindowPolicyTests.cpp")
+	target_link_libraries(host_window_policy_tests SDL3::SDL3-static)
+	target_include_directories(host_window_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	add_executable(host_input_shared_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputSharedTests.cpp")
+	target_include_directories(host_input_shared_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	if(BUILD_TESTING)
+		add_test(NAME host_window_policy COMMAND $<TARGET_FILE:host_window_policy_tests>)
+		add_test(NAME host_input_shared COMMAND $<TARGET_FILE:host_input_shared_tests>)
+	endif()
+endif()
+
 add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/Ngs2SamplerTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"

@@ -353,6 +353,160 @@ struct Presenter::Impl {
 		cache.UpdateImage(image_id);
 		return image;
 	}
+
+	// KYTY_DIAGNOSTIC_PRESENT_READBACK=<path prefix>: copies the scan-out source back, logs a
+	// summary and writes it raw.
+	void ReadbackSurface(Image& image) {
+		static std::atomic_uint prepared = 0;
+		const auto              ordinal  = prepared.fetch_add(1);
+		// plus one per counted client submission; the fixed ordinals land before any client draws
+		static std::atomic_uint client_taken = 0;
+		const bool after_client = client_taken < renderer.GetGpu().GetClientSubmitNum();
+		if (after_client) {
+			client_taken++;
+		}
+		// KYTY_DIAGNOSTIC_PRESENT_READBACK_INTERVAL_MS=<n>: one more every n ms, for content after
+		// the counted submissions run out
+		static const char* const interval_text =
+		    std::getenv("KYTY_DIAGNOSTIC_PRESENT_READBACK_INTERVAL_MS");
+		static const uint64_t interval =
+		    interval_text != nullptr ? std::strtoull(interval_text, nullptr, 10) : 0;
+		static std::atomic<uint64_t> timed_next = 0;
+		const uint64_t               now        = GetTickCount64();
+		const bool                   timed      = interval != 0 && now >= timed_next;
+		if (timed) {
+			timed_next = now + interval;
+		}
+		const bool full = ordinal < 4 || ordinal == 16 || ordinal == 64 || after_client;
+		if (!full && !timed) {
+			return;
+		}
+		const auto     format = image.backing.format;
+		const auto     width  = image.backing.extent.width;
+		const auto     height = image.backing.extent.height;
+		const uint32_t bpp    = vk::blockSize(format);
+		const uint64_t size   = static_cast<uint64_t>(width) * height * bpp;
+		LOGF("FIRST_FRAME_AUDIT PRESENT_SOURCE ordinal=%u data=0x%016" PRIx64
+		     " extent=%ux%u format=%d"
+		     " render_target=%d gpu_modified=%d metadata_kind=%d metadata=0x%016" PRIx64
+		     " compression=%d after_client=%d timed=%d monotonic_ms=%" PRIu64 "\n",
+		     ordinal, image.info.data.address, width, height, static_cast<int>(format),
+		     image.usage.render_target ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+		     static_cast<int>(image.info.metadata.kind), image.info.metadata.range.address,
+		     static_cast<int>(image.info.metadata.compression), after_client ? 1 : 0, timed ? 1 : 0,
+		     now);
+		auto& download        = renderer.GetBufferCache().GetUtilityBuffer(MemoryUsage::Download);
+		auto [mapped, offset] = download.Map(size, 4);
+		if (mapped == nullptr) {
+			EXIT("failed to map the present readback buffer\n");
+		}
+		download.Commit();
+		vk::BufferImageCopy copy {};
+		copy.bufferOffset     = offset;
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent      = vk::Extent3D {width, height, 1};
+		image.Download({&copy, 1}, download.Handle(), offset, size);
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite |
+		                              vk::AccessFlagBits::eTransferWrite |
+		                              vk::AccessFlagBits::eShaderWrite;
+		barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download.Handle();
+		barrier.offset              = offset;
+		barrier.size                = size;
+		auto& scheduler             = renderer.GetCommandScheduler();
+		scheduler.EndRendering();
+		scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                             vk::PipelineStageFlagBits::eHost, {}, 0,
+		                                             nullptr, 1, &barrier, 0, nullptr);
+		const std::string prefix = std::getenv("KYTY_DIAGNOSTIC_PRESENT_READBACK");
+		scheduler.DeferPriorityOperation([&download, mapped, offset, size, width, height, bpp,
+		                                  format, ordinal, prefix, full, now] {
+			download.Invalidate(offset, size);
+			// Every 4th pixel of every 4th row (_step4.raw). A full 4K pass delays the queued flip
+			// completion by >80 ms.
+			const uint32_t          step_width  = width / 4;
+			const uint32_t          step_height = height / 4;
+			std::vector<uint8_t>    stepped(static_cast<size_t>(step_width) * step_height * bpp);
+			const auto              pixels  = static_cast<uint64_t>(step_width) * step_height;
+			uint64_t                nonzero = 0;
+			uint64_t                varied  = 0;
+			uint32_t                left = width, top = height, right = 0, bottom = 0;
+			std::array<uint64_t, 4> first_words {};
+			std::array<uint64_t, 4> first_counts {};
+			size_t                  distinct = 0;
+			// 8-byte load + mask; a bpp-sized copy stalls on the reload. Safe since 3 more rows
+			// follow each sampled row.
+			const uint64_t mask = bpp < 8 ? (1ull << (bpp * 8)) - 1 : ~0ull;
+			for (uint32_t y = 0; y < step_height; y++) {
+				for (uint32_t x = 0; x < step_width; x++) {
+					const uint8_t* sample =
+					    mapped + (static_cast<size_t>(y) * 4 * width + x * 4) * bpp;
+					std::memcpy(stepped.data() + (static_cast<size_t>(y) * step_width + x) * bpp,
+					            sample, bpp);
+					uint64_t word = 0;
+					std::memcpy(&word, sample, 8);
+					word &= mask;
+					nonzero += word != 0 ? 1 : 0;
+					size_t slot = 0;
+					while (slot < distinct && first_words[slot] != word) {
+						slot++;
+					}
+					if (slot < distinct) {
+						first_counts[slot]++;
+					} else if (distinct < first_words.size()) {
+						first_words[distinct]    = word;
+						first_counts[distinct++] = 1;
+					}
+					if (word != first_words[0]) {
+						varied++;
+						left   = std::min(left, x * 4);
+						top    = std::min(top, y * 4);
+						right  = std::max(right, x * 4);
+						bottom = std::max(bottom, y * 4);
+					}
+				}
+			}
+			const uint64_t hash = XXH3_64bits(stepped.data(), stepped.size());
+			LOGF("FIRST_FRAME_AUDIT PRESENT_READBACK ordinal=%u extent=%ux%u format=%d bpp=%u "
+			     "pixels=%" PRIu64 " nonzero=%" PRIu64 " differing_from_first=%" PRIu64
+			     " box=%u,%u-%u,%u"
+			     " words=%016" PRIx64 ":%" PRIu64 ",%016" PRIx64 ":%" PRIu64 ",%016" PRIx64
+			     ":%" PRIu64 ",%016" PRIx64 ":%" PRIu64 " hash=%016" PRIx64 " monotonic_ms=%" PRIu64
+			     " sample_step=4 hash_fn=xxh3_64\n",
+			     ordinal, width, height, static_cast<int>(format), bpp, pixels, nonzero, varied,
+			     left, top, right, bottom, first_words[0], first_counts[0], first_words[1],
+			     first_counts[1], first_words[2], first_counts[2], first_words[3], first_counts[3],
+			     hash, now);
+			if (!prefix.empty() && full) {
+				Common::File file;
+				if (file.Create(prefix + "_" + std::to_string(ordinal) + "_" +
+				                std::to_string(width) + "x" + std::to_string(height) + "_fmt" +
+				                std::to_string(static_cast<int>(format)) + ".raw")) {
+					file.Write(mapped, static_cast<uint32_t>(size));
+					file.Close();
+				}
+			}
+			// Timed presents are written once per hash, stepped. Two Presenters' priority threads
+			// can get here at once.
+			static Common::Mutex                timed_hashes_mutex;
+			static std::unordered_set<uint64_t> timed_hashes;
+			Common::LockGuard                   lock(timed_hashes_mutex);
+			if (!prefix.empty() && !full && timed_hashes.size() < 1500 &&
+			    timed_hashes.insert(hash).second) {
+				Common::File file;
+				if (file.Create(prefix + "_" + std::to_string(ordinal) + "_" +
+				                std::to_string(step_width) + "x" + std::to_string(step_height) +
+				                "_fmt" + std::to_string(static_cast<int>(format)) + "_step4.raw")) {
+					file.Write(stepped.data(), static_cast<uint32_t>(stepped.size()));
+					file.Close();
+				}
+			}
+		});
+	}
+
 	void Present();
 
 	RenderContext&        renderer;
@@ -905,6 +1059,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	if (std::getenv("KYTY_DIAGNOSTIC_PRESENT_READBACK") != nullptr) {
+		m_impl->ReadbackSurface(image);
+	}
 	return *frame;
 }
 

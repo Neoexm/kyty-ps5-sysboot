@@ -4,6 +4,8 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <cstdlib>
+
 namespace Libs {
 
 namespace LibGen5 {
@@ -13,6 +15,10 @@ LIB_VERSION("VideoOut", 1, "VideoOut", 1, 1);
 LIB_DEFINE(InitVideoOut_1) {
 	PRINT_NAME_ENABLE(true);
 
+	if (std::getenv("KYTY_DIAGNOSTIC_DCE_PRIVACY_MASK_BASELINE") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT DCE_PRIVACY_BASELINE=0x1 NOT_AUTHENTIC_LIFETIME\n");
+		LIB_FUNC("pTxsULu4Nh0", VideoOut::VideoOutGetOccupiedPrivacyMask);
+	}
 	LIB_FUNC("Up36PTk687E", VideoOut::VideoOutOpen);
 	LIB_FUNC("uquVH4-Du78", VideoOut::VideoOutClose);
 	LIB_FUNC("WkYtyOg30do", VideoOut::VideoOutSetFlipMaster);
@@ -22,6 +28,7 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("HuViW4HnrOw", VideoOut::VideoOutSubmitChangeBufferAttribute2);
 	LIB_FUNC("N5KDtkIjjJ4", VideoOut::VideoOutUnregisterBuffers);
 	LIB_FUNC("CBiu4mCE1DA", VideoOut::VideoOutSetFlipRate);
+	LIB_FUNC("zILy8t+5bPo", VideoOut::VideoOutSetBlankAfterResume);
 	LIB_FUNC("HXzjK9yI30k", VideoOut::VideoOutAddFlipEvent);
 	LIB_FUNC("Xru92wHJRmg", VideoOut::VideoOutAddVblankEvent);
 	LIB_FUNC("keipklF0pMY", VideoOut::VideoOutAddPreVblankStartEvent);
@@ -34,6 +41,7 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("1FZBKy8HeNU", VideoOut::VideoOutGetVblankStatus);
 	LIB_FUNC("MTxxrOCeSig", VideoOut::VideoOutSetWindowModeMargins);
 	LIB_FUNC("kmSe30JTs+E", VideoOut::VideoOutAddOutputModeEvent);
+	LIB_FUNC("AjtlFa2HRws", VideoOut::VideoOutAddSetModeEvent);
 	LIB_FUNC("U2JJtSqNKZI", VideoOut::VideoOutGetEventId);
 	LIB_FUNC("rWUTcKdkUzQ", VideoOut::VideoOutGetEventData);
 	LIB_FUNC("Mt4QHHkxkOc", VideoOut::VideoOutGetEventCount);
@@ -49,6 +57,14 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
 	LIB_FUNC("w7Ipp9Xl7hg", VideoOut::VideoOutAllowOutputResolutionWqhdDetection);
+	LIB_FUNC("qLDCAl8ygCw", VideoOut::VideoOutSysGetResolutionStatus2);
+	LIB_FUNC("iYrCszX93AM", VideoOut::VideoOutSysGetVblankStatus2);
+	LIB_FUNC("O57F5ikhGxo", VideoOut::VideoOutSysIsUserStatusSystemDefault);
+	LIB_FUNC("4XsQdhiOaAc", VideoOut::VideoOutSysIsUserStatusVr);
+	LIB_FUNC("dFhciCfO31s", VideoOut::VideoOutSysGetPipelineStatus);
+	LIB_FUNC("fYWVVDKZOCk", VideoOut::VideoOutSysAddSetModeEvent2);
+	LIB_FUNC("Am8Hlr7tlxA", VideoOut::VideoOutSysAddVblankEvent2);
+	LIB_FUNC("Ek+VR4lcJQI", VideoOut::VideoOutSysAddVblankEvent);
 }
 
 } // namespace LibGen5

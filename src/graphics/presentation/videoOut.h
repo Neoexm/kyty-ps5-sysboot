@@ -21,6 +21,7 @@ struct VideoOutBufferAttribute2;
 struct VideoOutFlipStatus;
 struct VideoOutVblankStatus;
 struct VideoOutOutputStatus;
+struct VideoOutResolutionStatus;
 struct VideoOutOutputOptions;
 struct VideoOutBuffers;
 struct VideoOutColorSettings;
@@ -51,6 +52,8 @@ private:
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
 bool                          VideoOutIsInitialized() noexcept;
+// A DCE command-1 client can only attach to a MAIN head the DCE side already configured.
+bool VideoOutNativeCanAttachOriginalDceClient();
 // Binds a raw EVFILT_VIDEO_OUT change to the MAIN head's flip-completion queue.
 int  VideoOutNativeRegisterOriginalSplashFlipEvent(LibKernel::EventQueue::KernelEqueue eq,
                                                    uint64_t original_ident, int handle = -1,
@@ -92,6 +95,7 @@ struct VideoOutNativeControllerSnapshot {
 	VideoOutNativeTimingSnapshot committed_timing;
 	bool operator==(const VideoOutNativeControllerSnapshot&) const = default;
 };
+
 int      VideoOutNativeGetControllerSnapshot(uint32_t                          original_port,
                                              VideoOutNativeControllerSnapshot* snapshot);
 uint64_t VideoOutNativeGetHandleGeneration(int native_display_handle);
@@ -129,6 +133,8 @@ int  VideoOutNativeGetFlipStatus(int native_display_handle, uint64_t* original_w
                                  size_t original_word_count, uint64_t expected_generation = 0);
 void VideoOutNativeReleaseSplashHandle(int*     native_display_handle,
                                        uint64_t expected_generation = 0);
+
+KYTY_SYSV_ABI int  VideoOutGetOccupiedPrivacyMask(uint64_t* mask);
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
 KYTY_SYSV_ABI int  VideoOutSetFlipMaster(int slave_handle, int master_handle);
@@ -140,6 +146,7 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
                                                uint32_t dcc_control,
                                                uint64_t dcc_cb_register_clear_color);
 KYTY_SYSV_ABI int  VideoOutSetFlipRate(int handle, int rate);
+KYTY_SYSV_ABI int  VideoOutSetBlankAfterResume(int handle);
 KYTY_SYSV_ABI int  VideoOutAddFlipEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                         void* udata);
 KYTY_SYSV_ABI int  VideoOutAddVblankEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
@@ -171,11 +178,19 @@ KYTY_SYSV_ABI int VideoOutGetEventData(const LibKernel::EventQueue::KernelEvent*
 KYTY_SYSV_ABI int VideoOutGetEventCount(const LibKernel::EventQueue::KernelEvent* ev);
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle);
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status);
+KYTY_SYSV_ABI int  VideoOutSysGetResolutionStatus2(uint32_t bus, VideoOutResolutionStatus* status);
 KYTY_SYSV_ABI int  VideoOutSysGetVblankStatus2(uint32_t head, VideoOutVblankStatus* status);
+KYTY_SYSV_ABI int  VideoOutSysIsUserStatusSystemDefault(int handle, uint32_t bus, uint64_t arg,
+                                                        int option, void* reserved);
+KYTY_SYSV_ABI int  VideoOutSysIsUserStatusVr(int handle, uint32_t bus, uint64_t arg, int option,
+                                             void* reserved);
+KYTY_SYSV_ABI int  VideoOutSysGetPipelineStatus(uint32_t* status, void* reserved);
 KYTY_SYSV_ABI int VideoOutSysAddSetModeEvent2(LibKernel::EventQueue::KernelEqueue eq, uint32_t head,
                                               void* udata);
 KYTY_SYSV_ABI int VideoOutSysAddVblankEvent2(LibKernel::EventQueue::KernelEqueue eq, uint32_t head,
                                              void* udata);
+KYTY_SYSV_ABI int VideoOutSysAddVblankEvent(LibKernel::EventQueue::KernelEqueue eq, int bus_type,
+                                            void* udata);
 KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle);
 KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2);
 KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle);
