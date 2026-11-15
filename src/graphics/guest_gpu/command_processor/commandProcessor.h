@@ -28,6 +28,7 @@ enum class GfxPipeLockMode : uint32_t {
 	ContextManagerOnly = 1,
 	Enabled            = 3,
 };
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
@@ -44,6 +45,7 @@ private:
 	std::span<const uint32_t> m_next_buffer;
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
+	bool                      m_resuming      = false;
 	bool                      m_made_progress = false;
 };
 
@@ -104,6 +106,8 @@ public:
 	void SynchronizeGpu();
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
+	void ReleaseNativeMemory(uint64_t address, uint64_t value, bool write_data,
+	                         uint32_t context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
@@ -135,6 +139,8 @@ public:
 	void SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
 	                    const volatile void* address, uint32_t count_in_dwords);
 	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
+	[[nodiscard]] bool            SetGfxPipeLockMode(uint32_t control);
+	[[nodiscard]] GfxPipeLockMode GetGfxPipeLockMode() const { return m_gfx_pipe_lock_mode; }
 
 	Pm4ProcessResult Process(Pm4Execution& execution, std::span<const uint32_t> commands);
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
@@ -182,6 +188,7 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	GfxPipeLockMode m_gfx_pipe_lock_mode          = GfxPipeLockMode::Disabled;
 };
 
 } // namespace Libs::Graphics

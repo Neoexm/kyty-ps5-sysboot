@@ -31,6 +31,20 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
+	struct CrossProcessValidation {
+		uint64_t generation   = 0;
+		bool     intersects   = false;
+		bool     gpu_conflict = false;
+	};
+
+	struct ImageBufferSource {
+		Buffer*  first        = nullptr;
+		uint64_t second       = 0;
+		uint64_t generation   = 0;
+		bool     intersects   = false;
+		bool     gpu_conflict = false;
+	};
+
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
@@ -56,6 +70,7 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	void                   WritebackGpuMemory();
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t>
@@ -73,7 +88,7 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] ImageBufferSource ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
@@ -84,6 +99,13 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void               RegisterCrossProcessMemory(uint64_t vaddr, uint64_t size);
+	void               UnregisterCrossProcessMemory(uint64_t vaddr, uint64_t size);
+	void               AdvanceCrossProcessEpoch();
+	[[nodiscard]] CrossProcessValidation ValidateCrossProcessMemory(uint64_t vaddr, uint64_t size,
+	                                                                bool force = false);
+	[[nodiscard]] uint64_t CrossProcessGeneration(uint64_t vaddr, uint64_t size) const;
+	void                   AcknowledgeCrossProcessWrite(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:
@@ -104,6 +126,14 @@ private:
 	};
 
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
+	struct CrossProcessPage {
+		uint64_t hash                = 0;
+		uint64_t generation          = 0;
+		uint64_t validated_epoch     = 0;
+		bool     valid               = false;
+		bool     pending_cpu_refresh = false;
+	};
+
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
@@ -115,11 +145,14 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
-	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                           bool is_written, bool is_texel_buffer,
+	                                           bool cross_process_prevalidated = false);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::vector<GuestRange> CrossProcessRangesIn(uint64_t vaddr, uint64_t size) const;
+	void                                  StampCrossProcessMemory(uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -135,12 +168,19 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;
+	mutable std::shared_mutex                          m_cross_process_mutex;
+	RangeSet                                           m_cross_process_ranges;
+	mutable std::mutex                                 m_cross_process_page_mutex;
+	std::unordered_map<uint64_t, CrossProcessPage>     m_cross_process_pages;
+	std::atomic_bool                                   m_cross_process_ranges_present = false;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                           m_total_used_memory        = 0;
+	uint64_t                                           m_cross_process_epoch      = 1;
+	uint64_t                                           m_cross_process_generation = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

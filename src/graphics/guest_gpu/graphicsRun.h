@@ -42,6 +42,8 @@ public:
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
+	// submissions from the compositor's client range, KYTY_DIAGNOSTIC_PRESENT_READBACK only
+	[[nodiscard]] uint32_t GetClientSubmitNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
@@ -65,6 +67,7 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		bool                      from_client       = false;
 		uint64_t                  flip_request_id   = 0;
 	};
 
@@ -82,6 +85,7 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::atomic_uint32_t                           m_client_submit_num {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;

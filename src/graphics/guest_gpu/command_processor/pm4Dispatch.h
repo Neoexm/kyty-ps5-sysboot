@@ -138,6 +138,7 @@ uint32_t CpOpEventWriteEop(CommandProcessor&, uint32_t, const uint32_t*, uint32_
 uint32_t CpOpEventWriteEos(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpDmaData(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpAcquireMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpGfxPipeLock(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetContextReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetShaderReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpSetUconfigReg(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
@@ -159,6 +160,7 @@ uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, u
 uint32_t CpOpWaitRegMem64(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpFlip(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpReleaseMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpNativeReleaseMem(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 
 } // namespace Libs::Graphics
 

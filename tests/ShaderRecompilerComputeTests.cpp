@@ -67,6 +67,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <bit>
 #include <chrono>
 #include <cinttypes>
@@ -87,6 +88,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -177,6 +179,36 @@ struct BufferCacheTestAccess {
 
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
+  }
+
+  static uint64_t CrossProcessEpoch(const BufferCache &cache) {
+    std::lock_guard lock(cache.m_cross_process_page_mutex);
+    return cache.m_cross_process_epoch;
+  }
+
+  static size_t CrossProcessRangeCount(const BufferCache &cache,
+                                       uint64_t address, uint64_t size) {
+    return cache.CrossProcessRangesIn(address, size).size();
+  }
+
+  static bool CrossProcessContains(const BufferCache &cache, uint64_t address,
+                                   uint64_t size) {
+    const auto ranges = cache.CrossProcessRangesIn(address, size);
+    return ranges.size() == 1 && ranges[0].address == address &&
+           ranges[0].size == size;
+  }
+
+  static void SeedCrossProcessPage(BufferCache &cache, uint64_t address) {
+    std::lock_guard lock(cache.m_cross_process_page_mutex);
+    auto &state = cache.m_cross_process_pages[Common::AlignDown(
+        address, TRACKER_PAGE_SIZE)];
+    state.valid = true;
+  }
+
+  static bool HasCrossProcessPage(const BufferCache &cache, uint64_t address) {
+    std::lock_guard lock(cache.m_cross_process_page_mutex);
+    return cache.m_cross_process_pages.contains(
+        Common::AlignDown(address, TRACKER_PAGE_SIZE));
   }
 };
 
@@ -2328,6 +2360,590 @@ public:
     std::printf("[host]    %-32s ok\n", "SchedulerTimeline");
   }
 
+  static std::array<uint32_t, 8> NativeReleaseMemPacket(
+      uint64_t address, uint64_t value, uint32_t token) {
+    return {0xc0064900u, 0x06200504u, 0x42010000u,
+            static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+            static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u), token};
+  }
+
+  void CheckNativeReleaseMem(const char *death_case = nullptr) {
+    namespace Memory = LibKernel::Memory;
+    constexpr const char *name = "NativeReleaseMem";
+    constexpr uint64_t base = 0x0000000204d00000ull;
+    constexpr uint64_t page = 0x4000;
+    constexpr uint64_t allocation_size = 4 * page;
+    constexpr uint64_t label = base + 0x100;
+    constexpr uint64_t second_label = base + 0x200;
+    constexpr uint64_t buffer_address = base + page + 0x100;
+    constexpr uint64_t image_address = base + 2 * page;
+    constexpr uint64_t continuation = base + 3 * page;
+    constexpr uint64_t custom_label = continuation + 0x100;
+    constexpr uint64_t sentinel = 0xa5a5a5a5a5a5a5a5ull;
+    constexpr uint64_t value = 0x1122334487654321ull;
+    constexpr uint64_t second_value = 0xfedcba9876543210ull;
+    constexpr uint32_t token = 0x08012345u;
+    constexpr uint32_t custom_token = 0xf8123456u;
+    constexpr uint32_t buffer_value = 0x31415926u;
+    constexpr uint32_t image_value = 0x27182818u;
+    const auto is_death = [&](const char *kind) {
+      return death_case != nullptr && std::strcmp(death_case, kind) == 0;
+    };
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Memory::KernelAllocateDirectMemory(
+                0, Memory::KernelGetDirectMemorySize(), allocation_size, page,
+                0, &direct_offset) == 0,
+            "failed to allocate release and witness backing");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x33, 0x10, direct_offset, page) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "failed to map the CPU/GPU writable backing");
+    std::memset(mapped, 0xa5, allocation_size);
+    Require(name, "independent CPU and GPU rights",
+            Memory::KernelMprotect(mapped, page,
+                                   is_death("gpu-read-only") ? 0x13 : 0x21) == 0,
+            "failed to set the label page's semantic permissions");
+    uint64_t private_address = 0;
+    if (is_death("private")) {
+      private_address = Memory::AllocateRuntimeMemory(
+          base + allocation_size, page, Common::VirtualMemory::Mode::ReadWrite,
+          "native-release-private", true);
+      Require(name, "private runtime fixture",
+              private_address == base + allocation_size &&
+                  Memory::KernelMprotect(
+                      reinterpret_cast<void *>(private_address), page, 0x33) == 0 &&
+                  !Memory::CanWriteGpuBacking(private_address, sizeof(uint64_t)),
+              "private runtime memory unexpectedly became backing-store memory");
+    }
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    Memory::InstallGpuResources(&context);
+    auto &gpu = context.GetGpu();
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    auto &textures = context.GetTextureCache();
+    CommandProcessor processor(context, 0);
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      if (is_death("short-destination")) {
+        context.MapMemory(base + page, allocation_size - page);
+        context.MapMemory(label, sizeof(uint32_t));
+      } else {
+        context.MapMemory(base, allocation_size);
+      }
+      if (private_address != 0) {
+        context.MapMemory(private_address, page);
+      }
+    });
+
+    if (death_case != nullptr && !is_death("revoked")) {
+      auto packet = NativeReleaseMemPacket(label, value, token);
+      if (is_death("header")) {
+        packet[0] = 0xc0054900u;
+      } else if (is_death("controls")) {
+        packet[1] ^= 1u << 12u;
+      } else if (is_death("context")) {
+        packet[7] |= 0x10000000u;
+      } else if (is_death("unaligned")) {
+        packet[3] += 4;
+      } else if (is_death("high-address")) {
+        packet[4] |= 0x40000000u;
+      } else if (is_death("private")) {
+        packet[3] = static_cast<uint32_t>(private_address);
+        packet[4] = static_cast<uint32_t>(private_address >> 32u);
+      }
+      gpu.SendCommandSync([&] {
+        if (is_death("image-overlap")) {
+          auto writable = cache.ObtainBuffer(image_address + 4, 4, true);
+          Require(name, "overlap buffer", writable.first != nullptr,
+                  "failed to create the overlapping buffer writer");
+          writable.first->Fill(writable.second, 4, buffer_value);
+          auto desc = MakeLinearDesc(
+              image_address, 8 * sizeof(uint32_t), vk::Format::eR32Uint,
+              Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+              {8, 1, 1}, 1, 4, 1);
+          const auto id = textures.FindImage(desc);
+          vk::ClearValue clear{};
+          clear.color.uint32 = std::array{image_value, 0u, 0u, 0u};
+          TextureCacheTestAccess::ClearImage(
+              textures, scheduler.Current(), id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+          Require(name, "conflicting GPU owners",
+                  cache.HasGpuDirtyBytes(image_address + 4, 4) &&
+                      textures.GetImage(id).IsGpuModified() &&
+                      textures.GetImage(id).SafeToDownload(),
+                  "overlap case did not retain both GPU writers");
+        }
+        std::span<const uint32_t> commands = packet;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+        if (is_death("native-truncated") || is_death("custom-truncated")) {
+          SYSTEM_INFO system{};
+          GetSystemInfo(&system);
+          auto *guarded = static_cast<uint8_t *>(VirtualAlloc(
+              nullptr, 2 * system.dwPageSize, MEM_RESERVE | MEM_COMMIT,
+              PAGE_READWRITE));
+          DWORD previous = 0;
+          Require(name, "guarded packet",
+                  guarded != nullptr &&
+                      VirtualProtect(guarded + system.dwPageSize,
+                                     system.dwPageSize, PAGE_NOACCESS,
+                                     &previous) != 0,
+                  "failed to create the bounded packet fixture");
+          if (is_death("custom-truncated")) {
+            packet[0] = 0xc0061060u;
+          }
+          auto *short_packet = reinterpret_cast<uint32_t *>(
+              guarded + system.dwPageSize - 7 * sizeof(uint32_t));
+          std::memcpy(short_packet, packet.data(), 7 * sizeof(uint32_t));
+          commands = {short_packet, 7};
+        }
+#endif
+        Pm4Execution execution;
+        (void)processor.Process(execution, commands);
+      });
+      Require(name, "explicit rejection", false,
+              std::string("native release death case returned: ") + death_case);
+      return;
+    }
+
+    Require(name, "GPU-write admission",
+            Memory::CanWriteGpuBacking(label, sizeof(uint64_t)),
+            "CPU read-only/GPU writable label was not admitted");
+    LibKernel::EventQueue::KernelEqueue queue =
+        LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
+    uint32_t udata = 0x1099u;
+    Require(name, "interrupt registration",
+            LibKernel::EventQueue::KernelCreateEqueue(
+                &queue, "native-release") == 0 &&
+                Sync::AddEqEvent(context, queue, 0, &udata) == 0,
+            "failed to register the existing graphics interrupt");
+    const auto poll_event = [&](LibKernel::EventQueue::KernelEvent &event,
+                                int &count) {
+      LibKernel::KernelUseconds timeout = 0;
+      return LibKernel::EventQueue::KernelWaitEqueue(
+          queue, &event, 1, &count, &timeout);
+    };
+    const auto expect_event = [&](uint32_t expected) {
+      LibKernel::EventQueue::KernelEvent event{};
+      int count = 0;
+      Require(name, "ordered interrupt",
+              poll_event(event, count) == 0 && count == 1 &&
+                  event.ident == 0 &&
+                  event.filter == LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS &&
+                  event.data == expected && event.udata == &udata,
+              "graphics interrupt lost its order, full token or registration");
+    };
+    const auto expect_empty = [&] {
+      LibKernel::EventQueue::KernelEvent event{};
+      int count = 0;
+      Require(name, "no extra interrupt",
+              poll_event(event, count) == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+                  count == 0,
+              "release emitted an extra graphics interrupt");
+    };
+
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo timeline_create{};
+    timeline_create.pNext = &timeline_type;
+    vk::Semaphore external_timeline = nullptr;
+    Require(name, "external semaphore",
+            m_runtime_context.device.createSemaphore(
+                &timeline_create, nullptr, &external_timeline) ==
+                    vk::Result::eSuccess &&
+                external_timeline != nullptr,
+            "failed to create the external Vulkan timeline");
+    constexpr uint64_t external_value = 7;
+    std::binary_semaphore entered{0};
+    std::binary_semaphore completed{0};
+    std::atomic<bool> finished{false};
+    uint64_t before_native_tick = 0;
+    uint64_t held_tick = 0;
+    ImageId image_id{};
+    BufferId buffer_id{};
+    bool resumed_wait = false;
+    bool stream_complete = false;
+    bool buffer_retained = false;
+    bool image_retained = false;
+    const std::array<uint32_t, 9> wait_packet{
+        0xc0079300u, 0x06000113u, static_cast<uint32_t>(label),
+        static_cast<uint32_t>(label >> 32u), static_cast<uint32_t>(value),
+        static_cast<uint32_t>(value >> 32u), UINT32_MAX, UINT32_MAX, 40u};
+    const std::array<uint32_t, 5> continuation_packet{
+        0xc0033700u, 0u, static_cast<uint32_t>(continuation),
+        static_cast<uint32_t>(continuation >> 32u), 0xc001feedu};
+    const auto native = NativeReleaseMemPacket(label, value, token);
+    std::vector<uint32_t> stream(native.begin(), native.end());
+    stream.insert(stream.end(), wait_packet.begin(), wait_packet.end());
+    stream.insert(stream.end(), continuation_packet.begin(),
+                  continuation_packet.end());
+    const std::array<uint32_t, 8> prior_custom{
+        0xc0061060u, 0x00000528u, 0x01000000u, 0u, 0u, 0u, 0u,
+        custom_token};
+
+    gpu.SendCommand([&] {
+      processor.BufferInit();
+      Pm4Execution waiting;
+      Require(name, "WAIT64 suspension",
+              processor.Process(waiting, wait_packet) ==
+                      Pm4ProcessResult::Blocked &&
+                  !waiting.MadeProgress(),
+              "WAIT64 advanced before the native label was published");
+      auto writable = cache.ObtainBuffer(buffer_address, 4 * sizeof(uint32_t),
+                                         true);
+      Require(name, "GPU buffer writer", writable.first != nullptr,
+              "failed to obtain the writable GPU buffer");
+      writable.first->Fill(writable.second, 4 * sizeof(uint32_t), buffer_value);
+      buffer_id = BufferCacheTestAccess::PageOwner(cache, buffer_address);
+      auto desc = MakeLinearDesc(
+          image_address, 8 * sizeof(uint32_t), vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {8, 1, 1}, 1, 4, 1);
+      image_id = textures.FindImage(desc);
+      vk::ClearValue clear{};
+      clear.color.uint32 = std::array{image_value, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(
+          textures, scheduler.Current(), image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      Require(name, "dirty witnesses",
+              buffer_id && cache.HasGpuDirtyBytes(buffer_address, 16) &&
+                  textures.GetImage(image_id).registered &&
+                  textures.GetImage(image_id).IsGpuModified() &&
+                  textures.GetImage(image_id).SafeToDownload(),
+              "buffer and image writes were not retained in GPU ownership");
+      SubmitInfo gated;
+      gated.AddWait(external_timeline, external_value);
+      held_tick = scheduler.CurrentTick();
+      scheduler.Flush(gated);
+      Pm4Execution custom_execution;
+      Require(name, "prior custom dispatch",
+              processor.Process(custom_execution, prior_custom) ==
+                  Pm4ProcessResult::Complete,
+              "existing custom release did not dispatch");
+      before_native_tick = scheduler.CurrentTick();
+      entered.release();
+      Pm4Execution execution;
+      stream_complete =
+          processor.Process(execution, stream) == Pm4ProcessResult::Complete &&
+          execution.MadeProgress();
+      resumed_wait =
+          processor.Process(waiting, wait_packet) == Pm4ProcessResult::Complete &&
+          waiting.MadeProgress();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      buffer_retained =
+          BufferCacheTestAccess::PageOwner(cache, buffer_address) == buffer_id &&
+          !cache.HasGpuDirtyBytes(buffer_address, 16);
+      image_retained =
+          textures.GetImage(image_id).registered &&
+          textures.GetImage(image_id).IsGpuModified() &&
+          textures.GetImage(image_id).SafeToDownload();
+      finished.store(true, std::memory_order_release);
+      completed.release();
+    });
+
+    const bool began = entered.try_acquire_for(std::chrono::seconds(10));
+    bool submitted = false;
+    if (began) {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (scheduler.CurrentTick() <= before_native_tick &&
+             !finished.load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      submitted = scheduler.CurrentTick() > before_native_tick;
+    }
+    uint64_t observed_tick = UINT64_MAX;
+    const bool tick_read =
+        m_runtime_context.device.getSemaphoreCounterValue(
+            scheduler.GetMasterSemaphore().Handle(), &observed_tick) ==
+        vk::Result::eSuccess;
+    std::array<uint64_t, 3> held_label{};
+    std::array<uint32_t, 4> held_buffer{};
+    std::array<uint32_t, 8> held_image{};
+    uint32_t held_continuation = 0;
+    const bool held_backing =
+        Memory::TryReadBacking(label - 8, held_label.data(), sizeof(held_label)) &&
+        Memory::TryReadBacking(buffer_address, held_buffer.data(),
+                               sizeof(held_buffer)) &&
+        Memory::TryReadBacking(image_address, held_image.data(),
+                               sizeof(held_image)) &&
+        Memory::TryReadBacking(continuation, &held_continuation,
+                               sizeof(held_continuation));
+    LibKernel::EventQueue::KernelEvent early_event{};
+    int early_count = 0;
+    const bool no_early_event =
+        poll_event(early_event, early_count) == LibKernel::KERNEL_ERROR_ETIMEDOUT &&
+        early_count == 0;
+    const bool incomplete = !finished.load(std::memory_order_acquire);
+    const bool unpublished =
+        began && submitted && tick_read && observed_tick < held_tick &&
+        incomplete && held_backing &&
+        held_label == std::array<uint64_t, 3>{sentinel, sentinel, sentinel} &&
+        std::ranges::all_of(held_buffer, [](uint32_t word) {
+          return word == 0xa5a5a5a5u;
+        }) &&
+        std::ranges::all_of(held_image, [](uint32_t word) {
+          return word == 0xa5a5a5a5u;
+        }) &&
+        held_continuation == 0xa5a5a5a5u && no_early_event;
+    bool revocation_verified = false;
+    if (is_death("revoked") && began && submitted && unpublished) {
+      const bool denied =
+          Memory::KernelMprotect(mapped, page, 0x11) == 0 &&
+          !Memory::CanWriteGpuBacking(label, sizeof(uint64_t));
+      std::array<uint64_t, 3> after_denied_write{};
+      revocation_verified =
+          denied && !Memory::TryWriteGpuBacking64(label, second_value) &&
+          Memory::TryReadBacking(label - 8, after_denied_write.data(),
+                                 sizeof(after_denied_write)) &&
+          after_denied_write == held_label;
+      if (revocation_verified) {
+        std::printf("NATIVE_RELEASE_MEM_REVOKED after_submission=1"
+                    " failed_store_unchanged=1 before_tick=%" PRIu64
+                    " submitted_tick=%" PRIu64 " gpu_tick=%" PRIu64 "\n",
+                    before_native_tick, scheduler.CurrentTick(), observed_tick);
+      }
+    }
+    vk::SemaphoreSignalInfo signal{};
+    signal.semaphore = external_timeline;
+    signal.value = external_value;
+    const auto signal_result = m_runtime_context.device.signalSemaphore(&signal);
+    const bool ended = completed.try_acquire_for(std::chrono::seconds(10));
+    if (is_death("revoked")) {
+      Require(name, "mid-flight rights fixture",
+              revocation_verified && signal_result == vk::Result::eSuccess,
+              "failed to revoke GPU writes after native admission without changing backing");
+      Require(name, "native revocation rejection", false,
+              "native EOP returned instead of rejecting the changed destination");
+    }
+    Require(name, "bounded timeline completion",
+            began && submitted && signal_result == vk::Result::eSuccess && ended,
+            "native EOP did not submit, wait and resume across the external gate");
+    Require(name, "no early publication", unpublished,
+            "label, witness, interrupt or PM4 suffix became visible before the GPU");
+    Require(name, "PM4 continuation and cache residency",
+            stream_complete && resumed_wait && buffer_retained && image_retained,
+            "native completion lost WAIT progression or resident cache ownership");
+    std::array<uint64_t, 3> final_label{};
+    std::array<uint32_t, 4> final_buffer{};
+    std::array<uint32_t, 8> final_image{};
+    uint32_t final_continuation = 0;
+    Require(name, "buffer and image publication",
+            Memory::TryReadBacking(label - 8, final_label.data(),
+                                   sizeof(final_label)) &&
+                final_label == std::array<uint64_t, 3>{sentinel, value, sentinel} &&
+                Memory::TryReadBacking(buffer_address, final_buffer.data(),
+                                       sizeof(final_buffer)) &&
+                std::ranges::all_of(final_buffer, [](uint32_t word) {
+                  return word == buffer_value;
+                }) &&
+                Memory::TryReadBacking(image_address, final_image.data(),
+                                       sizeof(final_image)) &&
+                std::ranges::all_of(final_image, [](uint32_t word) {
+                  return word == image_value;
+                }) &&
+                Memory::TryReadBacking(continuation, &final_continuation,
+                                       sizeof(final_continuation)) &&
+                final_continuation == 0xc001feedu,
+            "native EOP did not publish complete GPU contents before its label");
+    expect_event(custom_token & 0x07ffffffu);
+    expect_event(token);
+    expect_empty();
+    m_runtime_context.device.destroySemaphore(external_timeline, nullptr);
+    std::printf("[gpu]     NativeReleaseMem external_gate held_tick=%" PRIu64
+                " native_tick=%" PRIu64
+                " buffer_image_visible=1 label64=1 ordered_interrupts=1 wait64=1\n",
+                held_tick, before_native_tick);
+
+    gpu.SendCommandSync([&] {
+      processor.BufferInit();
+      vk::ClearValue clear{};
+      clear.color.uint32 = std::array{image_value + 1u, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(
+          textures, scheduler.Current(), image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      auto second = NativeReleaseMemPacket(second_label, second_value, 0x0fffffffu);
+      second[1] = 0x0620062fu;
+      Pm4Execution execution;
+      Require(name, "alternate original event tuple",
+              processor.Process(execution, second) == Pm4ProcessResult::Complete,
+              "the native shader-done release tuple did not complete");
+      std::array<uint32_t, 8> again{};
+      std::array<uint64_t, 3> second_result{};
+      Require(name, "resident image republished",
+              Memory::TryReadBacking(image_address, again.data(), sizeof(again)) &&
+                  std::ranges::all_of(again, [](uint32_t word) {
+                    return word == image_value + 1u;
+                  }) &&
+                  Memory::TryReadBacking(second_label - 8, second_result.data(),
+                                         sizeof(second_result)) &&
+                  second_result ==
+                      std::array<uint64_t, 3>{sentinel, second_value, sentinel} &&
+                  textures.GetImage(image_id).registered,
+              "a later image write or the full high label DWORD was lost");
+      auto no_write = NativeReleaseMemPacket(0, value, 0x0800abcdu);
+      no_write[2] = 0x02010000u;
+      Pm4Execution no_write_execution;
+      Require(name, "native no-write null destination",
+              processor.Process(no_write_execution, no_write) ==
+                      Pm4ProcessResult::Complete &&
+                  Memory::TryReadBacking(second_label - 8, second_result.data(),
+                                         sizeof(second_result)) &&
+                  second_result ==
+                      std::array<uint64_t, 3>{sentinel, second_value, sentinel},
+              "native no-write touched label bytes or rejected the original null address");
+      const std::array<uint32_t, 8> custom{
+          0xc0061060u, 0x0000062fu, 0x42000000u,
+          static_cast<uint32_t>(custom_label),
+          static_cast<uint32_t>(custom_label >> 32u),
+          static_cast<uint32_t>(second_value),
+          static_cast<uint32_t>(second_value >> 32u), 0xf856789au};
+      Pm4Execution custom_execution;
+      Require(name, "custom release preservation",
+              processor.Process(custom_execution, custom) ==
+                  Pm4ProcessResult::Complete,
+              "the existing custom 64-bit release failed");
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    expect_event(0x0fffffffu);
+    expect_event(0x0800abcdu);
+    expect_event(0x0056789au);
+    expect_empty();
+    uint64_t custom_result = 0;
+    Require(name, "custom 64-bit value",
+            Memory::TryReadBacking(custom_label, &custom_result,
+                                   sizeof(custom_result)) &&
+                custom_result == second_value,
+            "the native route changed the existing custom label operation");
+
+    gpu.SendCommandSync([&] {
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    Require(name, "interrupt cleanup",
+            Sync::DeleteEqEvent(context, queue, 0) == 0 &&
+                LibKernel::EventQueue::KernelDeleteEqueue(queue) == 0,
+            "failed to remove the owned graphics event");
+    Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "mapping cleanup",
+            Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "failed to release the owned direct mapping");
+    std::printf("[gpu]     %-32s ok cpu_read_only_gpu_write=1"
+                " alternate_event=1 no_write=1 custom_preserved=1\n", name);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    CheckNativeReleaseMemFailures();
+#endif
+  }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  static void CheckNativeReleaseMemFailures() {
+    constexpr const char *name = "NativeReleaseMem";
+    struct DeathCase {
+      const char *kind;
+      const char *marker;
+      const char *prerequisite = nullptr;
+    };
+    constexpr std::array cases{
+        DeathCase{"native-truncated", "RELEASE_MEM_TRUNCATED route=native"},
+        DeathCase{"custom-truncated", "RELEASE_MEM_TRUNCATED route=custom"},
+        DeathCase{"header", "NATIVE_RELEASE_MEM_REJECTED reason=header"},
+        DeathCase{"controls", "NATIVE_RELEASE_MEM_REJECTED reason=controls"},
+        DeathCase{"context", "NATIVE_RELEASE_MEM_REJECTED reason=context"},
+        DeathCase{"unaligned", "NATIVE_RELEASE_MEM_REJECTED reason=destination"},
+        DeathCase{"high-address", "NATIVE_RELEASE_MEM_REJECTED reason=destination"},
+        DeathCase{"short-destination", "NATIVE_RELEASE_MEM_REJECTED reason=destination"},
+        DeathCase{"gpu-read-only", "NATIVE_RELEASE_MEM_REJECTED reason=destination"},
+        DeathCase{"private", "NATIVE_RELEASE_MEM_REJECTED reason=destination"},
+        DeathCase{"image-overlap", "NATIVE_RELEASE_MEM_REJECTED reason=image_overlap"},
+        DeathCase{"revoked", "NATIVE_RELEASE_MEM_REJECTED reason=destination_changed",
+                  "NATIVE_RELEASE_MEM_REVOKED after_submission=1 failed_store_unchanged=1"}};
+    char executable[MAX_PATH]{};
+    char temporary[MAX_PATH]{};
+    Require(name, "child host paths",
+            GetModuleFileNameA(nullptr, executable, MAX_PATH) != 0 &&
+                GetTempPathA(MAX_PATH, temporary) != 0,
+            "failed to obtain the bounded child paths");
+    for (const auto &test : cases) {
+      char output_path[MAX_PATH]{};
+      Require(name, "child output path",
+              GetTempFileNameA(temporary, "nrm", 0, output_path) != 0,
+              "failed to create the unique child output");
+      SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+      HANDLE output = CreateFileA(
+          output_path, GENERIC_READ | GENERIC_WRITE,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security,
+          OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+          nullptr);
+      Require(name, "child output handle", output != INVALID_HANDLE_VALUE,
+              "failed to open the child output");
+      std::string command = std::string("\"") + executable +
+          "\" --native-release-mem-death " + test.kind;
+      std::vector<char> mutable_command(command.begin(), command.end());
+      mutable_command.push_back('\0');
+      STARTUPINFOA startup{sizeof(startup)};
+      startup.dwFlags = STARTF_USESTDHANDLES;
+      startup.hStdInput = output;
+      startup.hStdOutput = output;
+      startup.hStdError = output;
+      PROCESS_INFORMATION process{};
+      const bool launched = CreateProcessA(
+          nullptr, mutable_command.data(), nullptr, nullptr, TRUE,
+          CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0;
+      DWORD wait = WAIT_FAILED;
+      DWORD exit_code = STILL_ACTIVE;
+      if (launched) {
+        wait = WaitForSingleObject(process.hProcess, 10000);
+        if (wait != WAIT_OBJECT_0) {
+          (void)TerminateProcess(process.hProcess, 322);
+          (void)WaitForSingleObject(process.hProcess, 5000);
+        }
+        (void)GetExitCodeProcess(process.hProcess, &exit_code);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+      }
+      LARGE_INTEGER size{};
+      LARGE_INTEGER start{};
+      std::string captured;
+      bool read = GetFileSizeEx(output, &size) != 0 && size.QuadPart >= 0 &&
+                  size.QuadPart <= 1024 * 1024 &&
+                  SetFilePointerEx(output, start, nullptr, FILE_BEGIN) != 0;
+      if (read) {
+        captured.resize(static_cast<size_t>(size.QuadPart));
+        DWORD bytes = 0;
+        read = ReadFile(output, captured.data(), static_cast<DWORD>(captured.size()),
+                        &bytes, nullptr) != 0 && bytes == captured.size();
+      }
+      CloseHandle(output);
+      Require(name, "bounded explicit child rejection",
+              launched && wait == WAIT_OBJECT_0 && exit_code == 321 && read &&
+                  captured.find(test.marker) != std::string::npos &&
+                  (test.prerequisite == nullptr ||
+                   captured.find(test.prerequisite) != std::string::npos),
+              std::string(test.kind) + " failed explicit rejection, exit=" +
+                  std::to_string(exit_code) + ", output=" +
+                  captured.substr(captured.size() > 2048 ? captured.size() - 2048 : 0));
+      std::printf("[host]    NativeReleaseMem rejected case=%s marker=%s exit=321\n",
+                  test.kind, test.marker);
+      if (test.prerequisite != nullptr) {
+        std::printf("[host]    NativeReleaseMem prerequisite=%s verified=1\n",
+                    test.prerequisite);
+      }
+    }
+  }
+#endif
+
   void CheckGpuMappedRangeLifecycle() {
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -2366,6 +2982,110 @@ public:
     Require("GpuMappedRangeLifecycle", "clear",
             !resources.IsMapped(base, page * 6),
             "full unmap did not clear the interval union");
+
+    constexpr uint64_t shared = base + page * 32;
+    auto &cache = resources.GetBufferCache();
+    resources.MapMemory(shared, page * 4, true);
+    resources.MapMemory(shared + page * 2, page * 4, true);
+    Require("GpuMappedRangeLifecycle", "shared union",
+            BufferCacheTestAccess::CrossProcessContains(cache, shared,
+                                                        page * 6),
+            "overlapping cross-process maps did not form one interval union");
+
+    resources.UnmapMemory(shared + page * 2, page * 2);
+    Require(
+        "GpuMappedRangeLifecycle", "shared subtract",
+        BufferCacheTestAccess::CrossProcessRangeCount(cache, shared, page * 6) ==
+                2 &&
+            BufferCacheTestAccess::CrossProcessContains(cache, shared,
+                                                        page * 2) &&
+            BufferCacheTestAccess::CrossProcessContains(cache, shared + page * 4,
+                                                        page * 2) &&
+            BufferCacheTestAccess::CrossProcessRangeCount(cache, shared + page * 2,
+                                                          page * 2) == 0,
+        "partial unmap did not preserve the neighboring shared intervals");
+
+    resources.UnmapMemory(shared + page * 2, page * 2);
+    Require("GpuMappedRangeLifecycle", "shared idempotent unmap",
+            BufferCacheTestAccess::CrossProcessContains(cache, shared,
+                                                        page * 2) &&
+                BufferCacheTestAccess::CrossProcessContains(
+                    cache, shared + page * 4, page * 2),
+            "repeated shared unmap changed neighboring intervals");
+
+    resources.UnmapMemory(shared, page * 6);
+    Require("GpuMappedRangeLifecycle", "shared clear",
+            BufferCacheTestAccess::CrossProcessRangeCount(cache, shared,
+                                                          page * 6) == 0,
+            "full unmap left cross-process virtual state behind");
+
+    constexpr uint64_t promoted = shared + page * 12;
+    resources.MapMemory(promoted, page * 2);
+    resources.SetCrossProcessMemory(promoted, page * 2, true);
+    Require("GpuMappedRangeLifecycle", "shared promotion",
+            resources.IsMapped(promoted, page * 2) &&
+                BufferCacheTestAccess::CrossProcessContains(cache, promoted,
+                                                            page * 2),
+            "GPU promotion did not register the shared subrange");
+    resources.SetCrossProcessMemory(promoted, page * 2, false);
+    Require("GpuMappedRangeLifecycle", "shared demotion",
+            resources.IsMapped(promoted, page * 2) &&
+                BufferCacheTestAccess::CrossProcessRangeCount(
+                    cache, promoted, page * 2) == 0,
+            "GPU demotion removed the mapping or retained shared state");
+    resources.UnmapMemory(promoted, page * 2);
+
+    constexpr uint64_t tracker_page = shared + page * 8;
+    cache.RegisterCrossProcessMemory(tracker_page, 0x800);
+    cache.RegisterCrossProcessMemory(tracker_page + 0x800, 0x800);
+    BufferCacheTestAccess::SeedCrossProcessPage(cache, tracker_page);
+    cache.UnregisterCrossProcessMemory(tracker_page, 0x800);
+    Require("GpuMappedRangeLifecycle", "shared page retention",
+            BufferCacheTestAccess::HasCrossProcessPage(cache, tracker_page),
+            "partial shared unregister discarded a page still covered by another range");
+    cache.UnregisterCrossProcessMemory(tracker_page + 0x800, 0x800);
+    Require("GpuMappedRangeLifecycle", "shared page cleanup",
+            !BufferCacheTestAccess::HasCrossProcessPage(cache, tracker_page),
+            "final shared unregister retained stale page detector state");
+
+    constexpr uint64_t stress_page = shared + page * 20;
+    constexpr int stress_iterations = 2000;
+    cache.RegisterCrossProcessMemory(stress_page, 0x800);
+    std::barrier stress_start(4);
+    {
+      std::jthread validator([&] {
+        stress_start.arrive_and_wait();
+        for (int i = 0; i < stress_iterations; i++) {
+          (void)cache.ValidateCrossProcessMemory(stress_page, 0x800, true);
+          cache.AdvanceCrossProcessEpoch();
+        }
+      });
+      std::jthread publisher([&] {
+        stress_start.arrive_and_wait();
+        for (int i = 0; i < stress_iterations; i++) {
+          cache.AcknowledgeCrossProcessWrite(stress_page, 0x800);
+        }
+      });
+      std::jthread lifecycle([&] {
+        stress_start.arrive_and_wait();
+        for (int i = 0; i < stress_iterations; i++) {
+          cache.UnregisterCrossProcessMemory(stress_page, 0x800);
+          cache.RegisterCrossProcessMemory(stress_page, 0x800);
+        }
+      });
+      stress_start.arrive_and_wait();
+    }
+    cache.RegisterCrossProcessMemory(stress_page, 0x800);
+    (void)cache.CrossProcessGeneration(stress_page, 0x800);
+    Require("GpuMappedRangeLifecycle", "shared state concurrency",
+            BufferCacheTestAccess::CrossProcessContains(cache, stress_page,
+                                                        0x800),
+            "concurrent validation, publication, and lifecycle lost the shared range");
+    BufferCacheTestAccess::SeedCrossProcessPage(cache, stress_page);
+    cache.UnregisterCrossProcessMemory(stress_page, 0x800);
+    Require("GpuMappedRangeLifecycle", "shared concurrent cleanup",
+            !BufferCacheTestAccess::HasCrossProcessPage(cache, stress_page),
+            "final concurrent shared unregister retained page state");
 
     constexpr uint64_t old_prt = base + page * 8;
     constexpr uint64_t new_prt = base + page * 16;
@@ -40473,6 +41193,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
 void CheckPm4WaitResume(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
+  auto &cache = renderer.GetBufferCache();
 
   uint32_t label = 0;
   uint32_t prefix = 0;
@@ -40517,14 +41238,32 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   commands[12] = static_cast<uint32_t>(address(&suffix) >> 32u);
   commands[13] = 22;
 
+  std::array<uint32_t, 7> immediate{};
+  immediate[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+  immediate[1] = 0x10u | 3u;
+  immediate[2] = static_cast<uint32_t>(address(&label));
+  immediate[3] = static_cast<uint32_t>(address(&label) >> 32u);
+  immediate[4] = 0;
+  immediate[5] = UINT32_MAX;
+
+  const auto initial_epoch = BufferCacheTestAccess::CrossProcessEpoch(cache);
+  Pm4Execution immediate_execution;
+  Require("Pm4WaitResume", "immediate pass epoch",
+          processor.Process(immediate_execution, immediate) ==
+                  Pm4ProcessResult::Complete &&
+              BufferCacheTestAccess::CrossProcessEpoch(cache) == initial_epoch,
+          "an immediately satisfied wait advanced the cross-process epoch");
+
   Pm4Execution execution;
   Require("Pm4WaitResume", "suspend",
           processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
-              prefix == 11 && child_observation == 0 && suffix == 0,
+              prefix == 11 && child_observation == 0 && suffix == 0 &&
+              BufferCacheTestAccess::CrossProcessEpoch(cache) == initial_epoch,
           "blocked indirect wait did not preserve its command position");
   Require("Pm4WaitResume", "still blocked",
           processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
-              !execution.MadeProgress() && suffix == 0,
+              !execution.MadeProgress() && suffix == 0 &&
+              BufferCacheTestAccess::CrossProcessEpoch(cache) == initial_epoch,
           "blocked wait advanced or replayed its caller");
 
   label = 1;
@@ -40532,7 +41271,8 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   Require(
       "Pm4WaitResume", "resume",
       processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
-          prefix == 11 && child_observation == 0 && suffix == 22,
+          prefix == 11 && child_observation == 0 && suffix == 22 &&
+          BufferCacheTestAccess::CrossProcessEpoch(cache) == initial_epoch + 1,
       "resumed indirect wait replayed a child or did not finish its parent");
   std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
 }
@@ -40621,6 +41361,200 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckPm4GfxPipeLockFailures();
+#endif
+
+void CheckPm4GfxPipeLock(RenderContext &renderer,
+                         const char *death_case = nullptr) {
+  constexpr const char *name = "Pm4GfxPipeLock";
+  static_assert(KYTY_PM4(2, Pm4::IT_GFX_PIPE_LOCK, Pm4::R_ZERO) ==
+                0xc0007500u);
+  GraphicsInitJmpTables();
+  const bool compute_death =
+      death_case != nullptr && std::strcmp(death_case, "compute") == 0;
+  CommandProcessor processor(renderer, compute_death ? 0x20 : 0);
+  processor.Reset();
+
+  if (death_case != nullptr) {
+    std::array<uint32_t, 2> packet{0xc0007500u, 3u};
+    std::span<const uint32_t> commands = packet;
+    if (std::strcmp(death_case, "control") == 0) {
+      packet[1] = 2u;
+    } else if (std::strcmp(death_case, "unknown-bits") == 0) {
+      packet[1] = 0x80000003u;
+    } else if (std::strcmp(death_case, "header") == 0) {
+      packet[0] = KYTY_PM4(3, Pm4::IT_GFX_PIPE_LOCK, Pm4::R_ZERO);
+    } else if (std::strcmp(death_case, "predicated") == 0) {
+      packet[0] |= 1u;
+    } else if (std::strcmp(death_case, "truncated") == 0) {
+      commands = commands.first(1);
+    } else if (!compute_death) {
+      Require(name, "death case", false,
+              std::string("unknown pipe-lock death case: ") + death_case);
+    }
+    Pm4Execution execution;
+    (void)processor.Process(execution, commands);
+    Require(name, "explicit rejection", false,
+            std::string("pipe-lock death case returned: ") + death_case);
+    return;
+  }
+
+  uint32_t marker = 0;
+  const auto marker_address = reinterpret_cast<uint64_t>(&marker);
+  std::array<uint32_t, 7> captured{
+      0xc0007500u,
+      3u,
+      KYTY_PM4(5, Pm4::IT_WRITE_DATA, Pm4::R_ZERO),
+      0u,
+      static_cast<uint32_t>(marker_address),
+      static_cast<uint32_t>(marker_address >> 32u),
+      0x2363u,
+  };
+  const auto tick = renderer.GetCommandScheduler().CurrentTick();
+  Pm4Execution captured_execution;
+  Require(name, "captured producer stream",
+          processor.Process(captured_execution, captured) ==
+                  Pm4ProcessResult::Complete &&
+              marker == 0x2363u &&
+              processor.GetGfxPipeLockMode() == GfxPipeLockMode::Enabled,
+          "the captured lock packet did not retain state or advance to its suffix");
+
+  std::array<uint32_t, 2> unlock{0xc0007500u, 0u};
+  Pm4Execution first_unlock_execution;
+  Require(name, "enabled unlock transition",
+          processor.Process(first_unlock_execution, unlock) ==
+                  Pm4ProcessResult::Complete &&
+              processor.GetGfxPipeLockMode() == GfxPipeLockMode::Disabled,
+          "the original enabled lock bracket did not release");
+
+  std::array<uint32_t, 2> context_only{0xc0007500u, 1u};
+  Pm4Execution context_execution;
+  Require(name, "context-manager transition",
+          processor.Process(context_execution, context_only) ==
+                  Pm4ProcessResult::Complete &&
+              processor.GetGfxPipeLockMode() == GfxPipeLockMode::ContextManagerOnly,
+          "the context-manager-only mode was not retained across submissions");
+  Require(name, "invalid state preservation",
+          !processor.SetGfxPipeLockMode(2u) &&
+              processor.GetGfxPipeLockMode() ==
+                  GfxPipeLockMode::ContextManagerOnly,
+          "an unsupported control changed the retained pipe-lock state");
+
+  Pm4Execution duplicate_execution;
+  Require(name, "idempotent lock",
+          processor.Process(duplicate_execution, context_only) ==
+                  Pm4ProcessResult::Complete &&
+              processor.GetGfxPipeLockMode() ==
+                  GfxPipeLockMode::ContextManagerOnly,
+          "a repeated supported lock changed the state contract");
+
+  Pm4Execution unlock_execution;
+  Require(name, "unlock transition",
+          processor.Process(unlock_execution, unlock) ==
+                  Pm4ProcessResult::Complete &&
+              processor.GetGfxPipeLockMode() == GfxPipeLockMode::Disabled &&
+              renderer.GetCommandScheduler().CurrentTick() == tick,
+          "unlock failed or the packet issued a host queue operation");
+  Require(name, "reset fixture", processor.SetGfxPipeLockMode(3u),
+          "failed to establish the pre-reset pipe-lock state");
+  processor.Reset();
+  Require(name, "reset",
+          processor.GetGfxPipeLockMode() == GfxPipeLockMode::Disabled,
+          "processor reset retained a stale pipe lock");
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  CheckPm4GfxPipeLockFailures();
+#endif
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void CheckPm4GfxPipeLockFailures() {
+  constexpr const char *name = "Pm4GfxPipeLock";
+  struct DeathCase {
+    const char *kind;
+    const char *marker;
+  };
+  constexpr std::array cases{
+      DeathCase{"control", "GFX_PIPE_LOCK_REJECTED reason=control"},
+      DeathCase{"unknown-bits", "GFX_PIPE_LOCK_REJECTED reason=control"},
+      DeathCase{"header", "GFX_PIPE_LOCK_REJECTED reason=header"},
+      DeathCase{"predicated", "GFX_PIPE_LOCK_REJECTED reason=header"},
+      DeathCase{"truncated", "GFX_PIPE_LOCK_REJECTED reason=truncated"},
+      DeathCase{"compute", "GFX_PIPE_LOCK_REJECTED reason=queue"},
+  };
+  char executable[MAX_PATH]{};
+  char temporary[MAX_PATH]{};
+  Require(name, "child host paths",
+          GetModuleFileNameA(nullptr, executable, MAX_PATH) != 0 &&
+              GetTempPathA(MAX_PATH, temporary) != 0,
+          "failed to obtain bounded child paths");
+  for (const auto &test : cases) {
+    char output_path[MAX_PATH]{};
+    Require(name, "child output path",
+            GetTempFileNameA(temporary, "gpl", 0, output_path) != 0,
+            "failed to create a unique child output");
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    HANDLE output = CreateFileA(
+        output_path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &security,
+        OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    Require(name, "child output handle", output != INVALID_HANDLE_VALUE,
+            "failed to open the child output");
+    std::string command = std::string("\"") + executable +
+                          "\" --pm4-pipe-lock-death " + test.kind;
+    std::vector<char> mutable_command(command.begin(), command.end());
+    mutable_command.push_back('\0');
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = output;
+    startup.hStdOutput = output;
+    startup.hStdError = output;
+    PROCESS_INFORMATION process{};
+    const bool launched = CreateProcessA(
+        nullptr, mutable_command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &startup, &process) != 0;
+    DWORD wait = WAIT_FAILED;
+    DWORD exit_code = STILL_ACTIVE;
+    if (launched) {
+      wait = WaitForSingleObject(process.hProcess, 30000);
+      if (wait != WAIT_OBJECT_0) {
+        (void)TerminateProcess(process.hProcess, 322);
+        (void)WaitForSingleObject(process.hProcess, 5000);
+      }
+      (void)GetExitCodeProcess(process.hProcess, &exit_code);
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+    }
+    LARGE_INTEGER size{};
+    LARGE_INTEGER start{};
+    std::string captured_output;
+    bool read = GetFileSizeEx(output, &size) != 0 && size.QuadPart >= 0 &&
+                size.QuadPart <= 1024 * 1024 &&
+                SetFilePointerEx(output, start, nullptr, FILE_BEGIN) != 0;
+    if (read) {
+      captured_output.resize(static_cast<size_t>(size.QuadPart));
+      DWORD bytes = 0;
+      read = ReadFile(output, captured_output.data(),
+                      static_cast<DWORD>(captured_output.size()), &bytes,
+                      nullptr) != 0 &&
+             bytes == captured_output.size();
+    }
+    CloseHandle(output);
+    Require(name, "bounded explicit child rejection",
+            launched && wait == WAIT_OBJECT_0 && exit_code == 321 && read &&
+                captured_output.find(test.marker) != std::string::npos,
+            std::string(test.kind) + " failed explicit rejection, exit=" +
+                std::to_string(exit_code) + ", output=" +
+                captured_output.substr(captured_output.size() > 2048
+                                           ? captured_output.size() - 2048
+                                           : 0));
+  }
+}
+#endif
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -40630,6 +41564,16 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 3 && std::strcmp(argv[1], "--native-release-mem-death") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckNativeReleaseMem(argv[2]);
+    return 1;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--pm4-pipe-lock-death") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4GfxPipeLock(vulkan.RuntimeRenderer(), argv[2]);
+    return 1;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
@@ -40995,6 +41939,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    vulkan.CheckNativeReleaseMem();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
@@ -41227,6 +42172,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pm4-pipe-lock-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4GfxPipeLock(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-draw-multi-only") == 0) {
@@ -41495,6 +42445,7 @@ int main(int argc, char **argv) {
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
   CheckShaderFusion();
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());
+  CheckPm4GfxPipeLock(vulkan.RuntimeRenderer());
   CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
@@ -41513,6 +42464,7 @@ int main(int argc, char **argv) {
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckNativeReleaseMem();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();

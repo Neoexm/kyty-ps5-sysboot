@@ -51,9 +51,10 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
-	void               MapMemory(uint64_t vaddr, uint64_t size);
+	void               MapMemory(uint64_t vaddr, uint64_t size, bool cross_process = false);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               SetCrossProcessMemory(uint64_t vaddr, uint64_t size, bool cross_process);
+	void               AdvanceCrossProcessEpoch();
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
@@ -79,6 +80,8 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	std::vector<GuestRange>   m_mapped_ranges_snapshot;
+	bool                      m_mapped_ranges_snapshot_dirty = true;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

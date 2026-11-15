@@ -7,6 +7,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -87,9 +89,15 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
-void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	std::lock_guard lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.Add(vaddr, size);
+void RenderContext::MapMemory(uint64_t vaddr, uint64_t size, bool cross_process) {
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.Add(vaddr, size);
+		m_mapped_ranges_snapshot_dirty = true;
+	}
+	if (cross_process) {
+		m_buffer_cache.RegisterCrossProcessMemory(vaddr, size);
+	}
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -111,8 +119,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_buffer_cache.UnregisterCrossProcessMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapped_ranges_snapshot_dirty = true;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -123,15 +133,43 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+void RenderContext::SetCrossProcessMemory(uint64_t vaddr, uint64_t size, bool cross_process) {
+	const auto update = [this, vaddr, size, cross_process] {
+		if (cross_process) {
+			m_buffer_cache.RegisterCrossProcessMemory(vaddr, size);
+		} else {
+			m_buffer_cache.UnregisterCrossProcessMemory(vaddr, size);
+		}
+	};
+	if (m_gpu == nullptr || m_gpu->IsStopping()) {
+		update();
+		return;
+	}
+	m_gpu->SendCommandSync(update);
+}
+
+void RenderContext::AdvanceCrossProcessEpoch() {
+	m_buffer_cache.AdvanceCrossProcessEpoch();
+}
+
 void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	{
+		std::lock_guard lock(m_mapped_ranges_mutex);
+		if (m_mapped_ranges_snapshot_dirty) {
+			m_mapped_ranges_snapshot.clear();
+			m_mapped_ranges.ForEach([&](uint64_t start, uint64_t end) {
+				m_mapped_ranges_snapshot.push_back({start, end - start});
+			});
+			m_mapped_ranges_snapshot_dirty = false;
+		}
+	}
+	for (const auto& range: m_mapped_ranges_snapshot) {
+		m_buffer_cache.SynchronizeBuffersInRange(range.address, range.size);
+	}
 	m_fault_process_pending = true;
 }
 
@@ -156,6 +194,10 @@ void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int e
 	}
 
 	m_interrupt_eqs.push_back({eq, event_id});
+	if (std::getenv("KYTY_DIAGNOSTIC_GPU_EOP_AUDIT") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT GPU_EOP_REGISTER queue=0x%016" PRIx64 " event_id=%d total=%zu\n",
+		     static_cast<uint64_t>(eq), event_id, m_interrupt_eqs.size());
+	}
 }
 
 void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
@@ -182,6 +224,13 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 		}
 	}
 
+	if (std::getenv("KYTY_DIAGNOSTIC_GPU_EOP_AUDIT") != nullptr) {
+		static std::atomic_uint logged = 0;
+		if (logged.fetch_add(1) < 36) {
+			LOGF("FIRST_FRAME_AUDIT GPU_EOP_TRIGGER event_id=%d ctx=%u matching_queues=%zu\n",
+			     event_id, context_id, registrations.size());
+		}
+	}
 	for (const auto& registration: registrations) {
 		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
 		    registration.eq, static_cast<uintptr_t>(registration.event_id),

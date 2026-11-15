@@ -9,6 +9,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -50,10 +52,70 @@ struct ShaderMapEntry {
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
 
+// Shaders are created by the process building a command buffer and looked up by the one executing
+// it, so a diagnostic scope shares its records here. Never freed, like g_shader_map.
+struct ScopeShaders {
+	static constexpr uint32_t MaxShaders = 4096;
+
+	struct Record {
+		uint64_t       addr;
+		ShaderMapEntry entry;
+	};
+
+	uint32_t count;
+	Record   records[MaxShaders];
+};
+
+static ScopeShaders* g_scope_shaders = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static HANDLE g_scope_shaders_lock = nullptr;
+#endif
+
+// Taken after g_shader_map_mutex. An abandoned mutex still goes to the next waiter.
+class ScopeShadersLock {
+public:
+	ScopeShadersLock() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		WaitForSingleObject(g_scope_shaders_lock, INFINITE);
+#endif
+	}
+	~ScopeShadersLock() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		ReleaseMutex(g_scope_shaders_lock);
+#endif
+	}
+
+	KYTY_CLASS_NO_COPY(ScopeShadersLock);
+};
+
+static bool GuestRangeIsMapped(const void* addr, uint64_t size) {
+	const auto start  = reinterpret_cast<uint64_t>(addr);
+	uint64_t   mapped = 0;
+	return GuestRange {start, size}.Valid() &&
+	       HostMemoryQueryRange(start, size, HostMemoryAccess::Mapped, mapped) && mapped >= size;
+}
+
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
 
 	g_shader_map = std::make_unique<std::unordered_map<uint64_t, ShaderMapEntry>>();
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	std::string scope;
+	if (LibKernel::Process::GetScope(&scope)) {
+		const auto name      = "kyty_ps5_" + scope + "_shd";
+		g_scope_shaders_lock = CreateMutexA(nullptr, FALSE, (name + "_lock").c_str());
+		EXIT_IF(g_scope_shaders_lock == nullptr);
+		// a fresh section is zeroed, i.e. empty
+		const auto section = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+		                                        sizeof(ScopeShaders), (name + "_state").c_str());
+		EXIT_IF(section == nullptr);
+		g_scope_shaders = static_cast<ScopeShaders*>(
+		    MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(ScopeShaders)));
+		EXIT_IF(g_scope_shaders == nullptr);
+		LOGF("scope shaders: %s, records = %u\n", name.c_str(), g_scope_shaders->count);
+	}
+#endif
 }
 
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
@@ -66,6 +128,21 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
 	std::scoped_lock lock(g_shader_map_mutex);
 	(*g_shader_map)[addr] = {data, hash};
+
+	if (g_scope_shaders != nullptr) {
+		ScopeShadersLock scope_lock;
+		uint32_t         index = 0;
+		while (index < g_scope_shaders->count && g_scope_shaders->records[index].addr != addr) {
+			index++;
+		}
+		if (index == ScopeShaders::MaxShaders) {
+			EXIT("too many shaders in scope: 0x%016" PRIx64 "\n", addr);
+		}
+		g_scope_shaders->records[index] = {addr, {data, hash}};
+		if (index == g_scope_shaders->count) {
+			g_scope_shaders->count++;
+		}
+	}
 }
 
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -75,6 +152,40 @@ static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
 		return iter->second;
+	}
+
+	if (g_scope_shaders != nullptr) {
+		ShaderMapEntry entry {};
+		{
+			ScopeShadersLock scope_lock;
+			for (uint32_t i = 0; i < g_scope_shaders->count; i++) {
+				if (g_scope_shaders->records[i].addr == addr) {
+					entry = g_scope_shaders->records[i].entry;
+					break;
+				}
+			}
+		}
+		const auto& data = entry.data;
+		const auto* code = reinterpret_cast<const void*>(addr);
+		// The record is from the creating process; use it only if code and tables are mapped here
+		// and the code hash matches.
+		if (data.code_size_bytes != 0 && GuestRangeIsMapped(code, data.code_size_bytes) &&
+		    (data.user_data == nullptr ||
+		     (GuestRangeIsMapped(data.user_data, sizeof(ShaderUserData)) &&
+		      (data.user_data->direct_resource_count == 0 ||
+		       GuestRangeIsMapped(data.user_data->direct_resource_offset,
+		                          data.user_data->direct_resource_count * sizeof(uint16_t))))) &&
+		    (data.num_input_semantics == 0 ||
+		     GuestRangeIsMapped(data.input_semantics,
+		                        data.num_input_semantics * sizeof(ShaderSemantic))) &&
+		    XXH3_64bits(code, data.code_size_bytes) == entry.hash) {
+			return entry;
+		}
+		if (data.code_size_bytes != 0) {
+			LOGF("%s shader=0x%016" PRIx64
+			     " has a scope record that is not valid in this process\n",
+			     label, addr);
+		}
 	}
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);

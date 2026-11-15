@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -61,7 +62,12 @@ static bool GraphicsRunDebugDumpEnabled() {
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
-	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	const bool diagnostic_eop_id8 = std::getenv("KYTY_DIAGNOSTIC_GFX_EOP_EVENT_ID8") != nullptr;
+	if (diagnostic_eop_id8) {
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_GFX_EOP_EVENT_ID8"
+		     " emitter_id=8 observed_compositor_equeue_registration=8 NON_AUTHENTIC\n");
+	}
+	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, diagnostic_eop_id8 ? 8 : 0);
 	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
 }
@@ -139,11 +145,25 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	if (draw_commands.empty()) {
 		return;
 	}
+	static std::atomic_bool first_graphics_submit = false;
+	if (!first_graphics_submit.exchange(true)) {
+		LOGF("FIRST_FRAME_AUDIT first_gpu_graphics_submit draw_dwords=%zu const_dwords=%zu\n",
+		     draw_commands.size(), constant_commands.size());
+	}
 	Submission submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
+	if (m_client_submit_num < 8 && std::getenv("KYTY_DIAGNOSTIC_PRESENT_READBACK") != nullptr) {
+		// the compositor's client command range carries this name
+		LibKernel::Memory::VirtualQueryInfo range {};
+		if (LibKernel::Memory::KernelVirtualQuery(draw_commands.data(), 0, &range, sizeof(range)) ==
+		        0 &&
+		    std::strcmp(range.name, "CompositorShmClient") == 0) {
+			submission.from_client = true;
+		}
+	}
 	Enqueue(std::move(submission));
 }
 
@@ -183,6 +203,10 @@ int GuestGpu::GetFrameNum() const {
 	return m_done_num;
 }
 
+uint32_t GuestGpu::GetClientSubmitNum() const {
+	return m_client_submit_num;
+}
+
 CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	EXIT_IF(queue_id >= QueueCount);
 	if (queue_id == 0) {
@@ -206,11 +230,23 @@ void CommandProcessor::Reset() {
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
 	m_predicate_skip                   = false;
+	m_gfx_pipe_lock_mode               = GfxPipeLockMode::Disabled;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
+}
+
+bool CommandProcessor::SetGfxPipeLockMode(uint32_t control) {
+	switch (control) {
+		case static_cast<uint32_t>(GfxPipeLockMode::Disabled):
+		case static_cast<uint32_t>(GfxPipeLockMode::ContextManagerOnly):
+		case static_cast<uint32_t>(GfxPipeLockMode::Enabled):
+			m_gfx_pipe_lock_mode = static_cast<GfxPipeLockMode>(control);
+			return true;
+		default: return false;
+	}
 }
 
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
@@ -317,6 +353,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
+	} else if (g_current_execution != nullptr && g_current_execution->m_resuming) {
+		m_renderer.AdvanceCrossProcessEpoch();
 	}
 }
 
@@ -426,6 +464,16 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	if (std::getenv("KYTY_DIAGNOSTIC_GPU_QUEUE_TRACE") != nullptr) {
+		static std::atomic_uint logged_enqueue = 0;
+		if (logged_enqueue.fetch_add(1) < 160) {
+			LOGF("FIRST_FRAME_AUDIT GPU_QUEUE_ENQUEUE queue=%u type=%u draw_ptr=0x%016" PRIx64
+			     " draw_dw=%zu const_dw=%zu pending_before=%u\n",
+			     submission.queue_id, static_cast<unsigned>(submission.type),
+			     reinterpret_cast<uint64_t>(submission.commands.data()), submission.commands.size(),
+			     submission.constant_commands.size(), m_submission_count);
+		}
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -515,7 +563,24 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		const bool audit_queue = std::getenv("KYTY_DIAGNOSTIC_GPU_QUEUE_TRACE") != nullptr;
+		static std::atomic_uint logged_process = 0;
+		const bool              audit_slice    = audit_queue && logged_process.fetch_add(1) < 160;
+		if (audit_slice) {
+			LOGF("FIRST_FRAME_AUDIT GPU_QUEUE_BEGIN queue=%u type=%u resume=%u draw_dw=%zu "
+			     "const_dw=%zu serial_before=%" PRIu64 "\n",
+			     submission.queue_id, static_cast<unsigned>(submission.type),
+			     submission.started ? 1u : 0u, submission.commands.size(),
+			     submission.constant_commands.size(), gpu->m_submit_id);
+		}
 		const bool complete = gpu->Process(submission);
+		if (audit_slice) {
+			LOGF("FIRST_FRAME_AUDIT GPU_QUEUE_END queue=%u type=%u complete=%u command_complete=%u "
+			     "constant_complete=%u serial=%" PRIu64 "\n",
+			     submission.queue_id, static_cast<unsigned>(submission.type), complete ? 1u : 0u,
+			     submission.command_complete ? 1u : 0u, submission.constant_complete ? 1u : 0u,
+			     gpu->m_submit_id);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -542,9 +607,17 @@ bool GuestGpu::Process(Submission& submission) {
 
 	if (first_slice) {
 		submission.started = true;
+		m_renderer.AdvanceCrossProcessEpoch();
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		if (submission.from_client && m_client_submit_num < 8) {
+			// Counted here, not in Submit, which can run ahead of this thread.
+			LOGF("FIRST_FRAME_AUDIT PRESENT_READBACK_CLIENT_SUBMIT index=%u data=0x%016" PRIx64
+			     " draw_dwords=%zu\n",
+			     m_client_submit_num++, reinterpret_cast<uint64_t>(submission.commands.data()),
+			     submission.commands.size());
+		}
 	}
 
 	cp.BufferInit();
@@ -635,6 +708,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
 	}
+	execution.m_resuming      = execution.m_suspended;
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
 
@@ -688,6 +762,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
+		if (opcode == Pm4::IT_GFX_PIPE_LOCK &&
+		    packet_header != KYTY_PM4(2, Pm4::IT_GFX_PIPE_LOCK, Pm4::R_ZERO)) {
+			EXIT("GFX_PIPE_LOCK_REJECTED reason=header cmd_id=0x%08" PRIx32 "\n", packet_header);
+		}
+		if (remaining_dw < 2 && opcode == Pm4::IT_GFX_PIPE_LOCK) {
+			EXIT("GFX_PIPE_LOCK_REJECTED reason=truncated remaining_dw=%" PRIu32 "\n",
+			     remaining_dw);
+		}
 
 		if (packet_header == 0x80000000u) {
 			cursor.offset_dw++;
@@ -695,6 +777,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		if (remaining_dw < 8 &&
+		    (opcode == Pm4::IT_RELEASE_MEM ||
+		     (opcode == Pm4::IT_NOP && KYTY_PM4_R(packet_header) == Pm4::R_RELEASE_MEM))) {
+			EXIT("RELEASE_MEM_TRUNCATED route=%s remaining_dw=%u\n",
+			     opcode == Pm4::IT_RELEASE_MEM ? "native" : "custom", remaining_dw);
+		}
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
 		if (GraphicsRunDebugDumpEnabled()) {
@@ -754,6 +842,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		if (execution.m_suspended) {
 			return;
 		}
+		execution.m_resuming = false;
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
@@ -1249,6 +1338,33 @@ void CommandProcessor::EmitGlobalBarrier() {
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), m_interrupt_event_id, interrupt_context_id);
+}
+
+void CommandProcessor::ReleaseNativeMemory(uint64_t address, uint64_t value, bool write_data,
+                                           uint32_t context_id) {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	if (write_data && ((address & 7u) != 0 || !m_renderer.IsMapped(address, sizeof(value)) ||
+	                   !LibKernel::Memory::CanWriteGpuBacking(address, sizeof(value)))) {
+		EXIT("NATIVE_RELEASE_MEM_REJECTED reason=destination address=%016" PRIx64 "\n", address);
+	}
+
+	m_renderer.GetTextureCache().WritebackGpuMemory();
+	if (write_data) {
+		if (!m_renderer.InvalidateMemory(address, sizeof(value)) ||
+		    !LibKernel::Memory::TryWriteGpuBacking64(address, value)) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=destination_changed address=%016" PRIx64 "\n",
+			     address);
+		}
+	}
+	m_renderer.TriggerInterrupt(m_interrupt_event_id, context_id);
+	if (std::getenv("KYTY_DIAGNOSTIC_GPU_QUEUE_TRACE") != nullptr) {
+		static std::atomic_uint logged = 0;
+		if (logged.fetch_add(1) < 128) {
+			LOGF("FIRST_FRAME_AUDIT GPU_NATIVE_RELEASE_MEM_COMPLETE address=%016" PRIx64
+			     " value=%016" PRIx64 " write=%u event_id=%d context=%08" PRIx32 "\n",
+			     address, value, write_data ? 1u : 0u, m_interrupt_event_id, context_id);
+		}
+	}
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,

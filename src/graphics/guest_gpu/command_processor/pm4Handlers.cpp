@@ -20,6 +20,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -1309,6 +1310,32 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
+KYTY_CP_OP_PARSER(CpOpGfxPipeLock) {
+	KYTY_PROFILER_FUNCTION();
+
+	if (cmd_id != KYTY_PM4(2, Pm4::IT_GFX_PIPE_LOCK, Pm4::R_ZERO)) {
+		EXIT("GFX_PIPE_LOCK_REJECTED reason=header cmd_id=0x%08" PRIx32 "\n", cmd_id);
+	}
+	if (dw < 2u) {
+		EXIT("GFX_PIPE_LOCK_REJECTED reason=truncated remaining_dw=%" PRIu32 "\n", dw);
+	}
+	if (cp.IsAsyncComputeQueue()) {
+		EXIT("GFX_PIPE_LOCK_REJECTED reason=queue queue=compute\n");
+	}
+	const auto previous = static_cast<uint32_t>(cp.GetGfxPipeLockMode());
+	if (!cp.SetGfxPipeLockMode(buffer[0])) {
+		EXIT("GFX_PIPE_LOCK_REJECTED reason=control control=0x%08" PRIx32 " previous=%" PRIu32 "\n",
+		     buffer[0], previous);
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
+		LOGF("FIRST_FRAME_AUDIT GFX_PIPE_LOCK previous=%" PRIu32 " control=%" PRIu32
+		     " submit=%" PRIu64 "\n",
+		     previous, buffer[0], cp.GetSubmitId());
+	}
+	return 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2004,6 +2031,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
+			if (std::getenv("KYTY_DIAGNOSTIC_SH_INDIRECT_FULL_DUMP") != nullptr) {
+				const auto* regs = indirect_buffer - i * 2;
+				LOGF("FIRST_FRAME_AUDIT unknown_cx offset=0x%03" PRIx32 " value=0x%08" PRIx32
+				     " entry=%" PRIu32 "/%" PRIu32 "\n",
+				     cmd_offset, value, i, indirect_num_dw);
+				for (uint32_t j = 0; j < indirect_num_dw && j < 1024u; ++j) {
+					LOGF("\t cx_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32
+					     "\n",
+					     j, regs[j * 2], regs[j * 2 + 1]);
+				}
+			}
 			if (raw_cmd_offset == 0x24au && value == 0u) {
 				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
 				if (!logged.test_and_set(std::memory_order_relaxed)) {
@@ -2071,7 +2109,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 			     i, indirect_num_dw, indirect_address, cmd_offset, value);
 			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+			const uint32_t dump_limit =
+			    std::getenv("KYTY_DIAGNOSTIC_SH_INDIRECT_FULL_DUMP") != nullptr ? 256u : 16u;
+			for (uint32_t j = 0; j < indirect_num_dw && j < dump_limit; j++) {
 				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
@@ -2126,7 +2166,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 
 		if (pfunc == nullptr) {
 			auto* dump_regs = indirect_buffer - i * 2;
-			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+			const uint32_t dump_limit =
+			    std::getenv("KYTY_DIAGNOSTIC_SH_INDIRECT_FULL_DUMP") != nullptr ? 256u : 16u;
+			for (uint32_t j = 0; j < indirect_num_dw && j < dump_limit; j++) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
@@ -2240,7 +2282,20 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 
+	if (dw < 8) {
+		EXIT("RELEASE_MEM_TRUNCATED route=custom remaining_dw=%u\n", dw);
+	}
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
+	if (std::getenv("KYTY_DIAGNOSTIC_GPU_QUEUE_TRACE") != nullptr) {
+		static std::atomic_uint logged_release = 0;
+		if (logged_release.fetch_add(1) < 48) {
+			LOGF("FIRST_FRAME_AUDIT GPU_RELEASE_MEM packet=0x%016" PRIx64 " header=%08" PRIx32
+			     " dw0=%08" PRIx32 " dw1=%08" PRIx32 " dw2=%08" PRIx32 " dw3=%08" PRIx32
+			     " dw4=%08" PRIx32 " dw5=%08" PRIx32 " dw6=%08" PRIx32 "\n",
+			     reinterpret_cast<uint64_t>(buffer - 1), cmd_id, buffer[0], buffer[1], buffer[2],
+			     buffer[3], buffer[4], buffer[5], buffer[6]);
+		}
+	}
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t eop_event_type     = buffer[0] & 0x3fu;
@@ -2359,6 +2414,33 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                      data_sel, dst_gpu_addr, value, interrupt_selector, interrupt_context_id);
 
+	return 7;
+}
+
+KYTY_CP_OP_PARSER(CpOpNativeReleaseMem) {
+	KYTY_PROFILER_FUNCTION();
+
+	if (dw < 8) {
+		EXIT("RELEASE_MEM_TRUNCATED route=native remaining_dw=%u\n", dw);
+	}
+	if (cmd_id != 0xc0064900u) {
+		EXIT("NATIVE_RELEASE_MEM_REJECTED reason=header header=%08" PRIx32 "\n", cmd_id);
+	}
+	if ((buffer[0] != 0x06200504u && buffer[0] != 0x0620062fu) ||
+	    (buffer[1] != 0x42010000u && buffer[1] != 0x02010000u)) {
+		EXIT("NATIVE_RELEASE_MEM_REJECTED reason=controls event=%08" PRIx32 " control=%08" PRIx32
+		     "\n",
+		     buffer[0], buffer[1]);
+	}
+	if ((buffer[6] & 0xf0000000u) != 0) {
+		EXIT("NATIVE_RELEASE_MEM_REJECTED reason=context context=%08" PRIx32 "\n", buffer[6]);
+	}
+
+	const auto address    = buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u);
+	const auto value      = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
+	const auto context_id = buffer[6] & 0x0fffffffu;
+	const bool write_data = buffer[1] == 0x42010000u;
+	cp.ReleaseNativeMemory(address, value, write_data, context_id);
 	return 7;
 }
 
@@ -3436,6 +3518,53 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::PA_SC_FOV_WINDOW_LR] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreFovWindow(value);
 	};
+	if (std::getenv("KYTY_DIAGNOSTIC_UC_ZERO_RESTORE") != nullptr) {
+		for (uint32_t offset = Pm4::PA_SC_RIGHT_VERT_GRID; offset <= Pm4::PA_SC_HORIZ_GRID;
+		     ++offset) {
+			g_hw_ctx_indirect_func[offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+				(void)cp;
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_GRID_ZERO_ONLY register=0x%03" PRIx32
+				     " value=0x%08" PRIx32 " SEMANTICS_UNVERIFIED\n",
+				     cmd_offset, value);
+				EXIT_NOT_IMPLEMENTED(value != 0);
+			};
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_UC_ZERO_RESTORE") != nullptr) {
+		g_hw_ctx_indirect_func[Pm4::SPI_INTERP_CONTROL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			EXIT_NOT_IMPLEMENTED((value & ~1u) != 0);
+			cp.GetCtx().SetPsInterpControl(value);
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_INTERP_CONTROL flat_shade=%u "
+			     "OTHER_INTERPOLATION_SEMANTICS_UNVERIFIED\n",
+			     value & 1u);
+		};
+		g_hw_ctx_indirect_func[Pm4::PA_SU_SMALL_PRIM_FILTER_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
+			cp.GetCtx().SetSmallPrimitiveFilter(value);
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_SMALL_PRIM_FILTER value=0x%08" PRIx32
+			     " RASTER_EFFECT_UNVERIFIED\n",
+			     value);
+		};
+		g_hw_ctx_indirect_func[Pm4::PA_STEREO_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			EXIT_NOT_IMPLEMENTED(value != 0 && value != 0x04000000u);
+			cp.GetCtx().SetStereoControl(value);
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_STEREO_CONTROL value=0x%08" PRIx32
+			     " BIT26_SEMANTICS_UNVERIFIED\n",
+			     value);
+		};
+		g_hw_ctx_indirect_func[Pm4::PA_STATE_STEREO_X] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			EXIT_NOT_IMPLEMENTED(value != 0);
+			cp.GetCtx().SetStereoXOffset(value);
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_STEREO_X_ZERO value=0x%08" PRIx32 "\n", value);
+		};
+		g_hw_ctx_indirect_func[Pm4::PA_SC_NGG_MODE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			EXIT_NOT_IMPLEMENTED((value & ~0x00ff07ffu) != 0);
+			cp.GetCtx().SetNggModeControl(value);
+			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_NGG_MODE value=0x%08" PRIx32
+			     " MAX_DEALLOCS=%u MAX_FPOVS=%u SCHEDULING_UNVERIFIED\n",
+			     value, value & 0x7ffu, (value >> 16u) & 0xffu);
+		};
+	}
 	g_hw_ctx_indirect_func[Pm4::PA_SC_FOV_WINDOW_TB] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreFovWindow(value);
 	};
@@ -3560,11 +3689,25 @@ void GraphicsInitJmpTablesShIndirect() {
 	g_hw_sh_indirect_func[Pm4::COMPUTE_RESOURCE_LIMITS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
+	for (uint32_t offset:
+	     {Pm4::COMPUTE_STATIC_THREAD_MGMT_SE0, Pm4::COMPUTE_STATIC_THREAD_MGMT_SE1,
+	      Pm4::COMPUTE_STATIC_THREAD_MGMT_SE2, Pm4::COMPUTE_STATIC_THREAD_MGMT_SE3}) {
+		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+			const uint32_t engine = cmd_offset <= Pm4::COMPUTE_STATIC_THREAD_MGMT_SE1
+			                            ? cmd_offset - Pm4::COMPUTE_STATIC_THREAD_MGMT_SE0
+			                            : cmd_offset - Pm4::COMPUTE_STATIC_THREAD_MGMT_SE2 + 2;
+			cp.GetShCtx().SetCsStaticThreadMgmt(engine, value);
+		};
+	}
 	g_hw_sh_indirect_func[Pm4::COMPUTE_TMPRING_SIZE] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
 	};
 	g_hw_sh_indirect_func[Pm4::COMPUTE_PGM_RSRC3] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
+	};
+	g_hw_sh_indirect_func[Pm4::COMPUTE_DISPATCH_TUNNEL] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		EXIT_NOT_IMPLEMENTED((value & ~0x7ffu) != 0);
+		cp.GetShCtx().SetCsDispatchTunnel(value);
 	};
 	g_hw_sh_indirect_func[Pm4::COMPUTE_PACE_ID] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShSetCsRegister(cp, cmd_offset, value);
@@ -3616,6 +3759,9 @@ void GraphicsInitJmpTablesShIndirect() {
 			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
 		    };
 	}
+	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC4_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
+		cp.GetShCtx().SetPsShaderResource4(value);
+	};
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);
 	};
@@ -3849,6 +3995,22 @@ void GraphicsInitJmpTablesUcIndirect() {
 		};
 	}
 
+	if (std::getenv("KYTY_DIAGNOSTIC_UC_ZERO_RESTORE") != nullptr) {
+		constexpr uint32_t zero_only_offsets[][2] = {
+		    {0x2bbu, 0x2bbu}, {0x2c0u, 0x2c3u}, {0x2d4u, 0x2e3u}, {0x2ecu, 0x2f3u}};
+		for (const auto& range: zero_only_offsets) {
+			for (uint32_t offset = range[0]; offset <= range[1]; ++offset) {
+				g_hw_uc_indirect_func[offset] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+					(void)cp;
+					LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_UC_ZERO_ONLY register=0x%03" PRIx32
+					     " value=0x%08" PRIx32 " SEMANTICS_UNVERIFIED\n",
+					     cmd_offset, value);
+					EXIT_NOT_IMPLEMENTED(value != 0);
+				};
+			}
+		}
+	}
+
 	g_hw_uc_indirect_func[Pm4::GE_CNTL] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeControl r;
 		r.primitive_group_size = KYTY_PM4_GET(value, GE_CNTL, PRIM_GRP_SIZE);
@@ -3860,6 +4022,11 @@ void GraphicsInitJmpTablesUcIndirect() {
 		(void)cmd_offset;
 		(void)value;
 	};
+	for (uint32_t offset = Pm4::GE_USER_VGPR1; offset <= Pm4::GE_USER_VGPR3; ++offset) {
+		g_hw_uc_indirect_func[offset] = [](KYTY_HW_UC_INDIRECT_ARGS) {
+			cp.GetUcfg().SetGeUserVgpr(cmd_offset - Pm4::GE_USER_VGPR1, value);
+		};
+	}
 	g_hw_uc_indirect_func[Pm4::GE_USER_VGPR_EN] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 		HW::GeUserVgprEn r;
 		r.vgpr1 = KYTY_PM4_GET(value, GE_USER_VGPR_EN, EN_USER_VGPR1) != 0;

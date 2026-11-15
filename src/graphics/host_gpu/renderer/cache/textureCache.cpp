@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -14,12 +15,15 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1107,6 +1111,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	TrackImage(id);
+	RefreshCrossProcessImage(image);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
 			image.RefreshComplete();
@@ -1118,12 +1123,16 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto [source, source_offset] =
+		const bool image_gpu_conflict = image.IsGpuModified();
+		const auto source =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		if (source == nullptr) {
+		if (source.first == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
-		UploadImage(image, *source, source_offset);
+		UploadImage(image, *source.first, source.second);
+		if (source.intersects && !source.gpu_conflict && !image_gpu_conflict && !image.depth_id) {
+			image.SetCrossProcessGeneration(source.generation);
+		}
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -1176,7 +1185,18 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
-		if (!DecodeColorClear(desc, code, clear.color)) {
+		const bool     decoded = DecodeColorClear(desc, code, clear.color);
+		const bool     audit   = std::getenv("KYTY_DIAGNOSTIC_PRESENT_READBACK") != nullptr;
+		// per binding type, so render targets don't use up the video-out lines
+		static std::array<std::atomic_uint, 5> scanned {};
+		if (audit && scanned[static_cast<size_t>(desc.type)].fetch_add(1) < 24) {
+			LOGF("FIRST_FRAME_AUDIT METADATA_SCAN binding=%d data=0x%016" PRIx64
+			     " metadata=0x%016" PRIx64 " slice=%u slice_size=0x%" PRIx64
+			     " control=0x%x code=0x%02x decoded=%d\n",
+			     static_cast<int>(desc.type), desc.info.data.address, address, slice, slice_size,
+			     desc.info.metadata.control, code, decoded ? 1 : 0);
+		}
+		if (!decoded) {
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
@@ -1185,6 +1205,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
+		}
+		static std::array<std::atomic_uint, 5> cleared {};
+		if (audit && cleared[static_cast<size_t>(desc.type)].fetch_add(1) < 24) {
+			LOGF("FIRST_FRAME_AUDIT METADATA_CLEAR binding=%d data=0x%016" PRIx64
+			     " metadata=0x%016" PRIx64 " code=0x%02x clear=%g,%g,%g,%g\n",
+			     static_cast<int>(desc.type), desc.info.data.address, address, code,
+			     clear.color.float32[0], clear.color.float32[1], clear.color.float32[2],
+			     clear.color.float32[3]);
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1198,12 +1226,52 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			m_buffer_cache.AcknowledgeCrossProcessWrite(address, bytes.size());
 		}
 	}
 }
 
+void TextureCache::RefreshCrossProcessImage(Image& image) {
+	if (image.info.data.Empty()) {
+		return;
+	}
+	const auto validation =
+	    m_buffer_cache.ValidateCrossProcessMemory(image.info.data.address, image.info.data.size);
+	const auto generation = validation.generation;
+	if (generation <= image.CrossProcessGeneration()) {
+		return;
+	}
+	if (image.IsGpuModified() || validation.gpu_conflict) {
+		static std::atomic_uint64_t conflicts = 0;
+		const auto                  ordinal   = conflicts.fetch_add(1) + 1;
+		if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
+			LOGF("FIRST_FRAME_AUDIT SHARED_IMAGE_GPU_CONFLICT addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " generation=%" PRIu64 " ordinal=%" PRIu64 "\n",
+			     image.info.data.address, image.info.data.size, generation, ordinal);
+		}
+		return;
+	}
+	if (image.info.metadata.compression != VideoOutCompression::Uncompressed ||
+	    image.info.samples > 1 || image.depth_id) {
+		static std::atomic_uint64_t unsupported = 0;
+		const auto                  ordinal     = unsupported.fetch_add(1) + 1;
+		if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
+			LOGF("FIRST_FRAME_AUDIT SHARED_IMAGE_UNSUPPORTED addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64
+			     " compressed=%d samples=%u depth_association=%d generation=%" PRIu64
+			     " ordinal=%" PRIu64 "\n",
+			     image.info.data.address, image.info.data.size,
+			     image.info.metadata.compression != VideoOutCompression::Uncompressed ? 1 : 0,
+			     image.info.samples, image.depth_id ? 1 : 0, generation, ordinal);
+		}
+		return;
+	}
+	image.InvalidateCpuWrite(image.info.data.address, image.info.data.size);
+}
+
 void TextureCache::RefreshImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	RefreshCrossProcessImage(image);
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
@@ -1874,9 +1942,10 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		m_buffer_cache.AcknowledgeCrossProcessWrite(range.address, range.size);
 	});
 	return true;
 }
@@ -2059,6 +2128,67 @@ void TextureCache::ProcessDownloadImages() {
 		}
 	}
 	m_download_images.clear();
+}
+
+void TextureCache::WritebackGpuMemory() {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	std::scoped_lock        lock {m_lock};
+	std::vector<ImageId>    images;
+	std::vector<GuestRange> ranges;
+	m_slot_images.ForEach([&](ImageId id, const Image& image) {
+		if (!image.registered || !image.IsGpuModified()) {
+			return;
+		}
+		if (!image.SafeToDownload()) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=image_state address=%016" PRIx64 "\n",
+			     image.info.data.address);
+		}
+		const auto range     = image.info.data;
+		const auto alignment = std::max<uint64_t>(image.info.bytes_per_block, 4);
+		if (image.depth_id || image.backing.image == nullptr || !range.Valid() ||
+		    image.info.samples != 1 || image.backing.samples != 1 ||
+		    image.info.metadata.compression != VideoOutCompression::Uncompressed ||
+		    image.info.HasStencil() || image.info.HasMetadata() ||
+		    !std::has_single_bit(alignment) ||
+		    range.size > m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size() ||
+		    !BuildDownload(image).valid) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=image_layout address=%016" PRIx64 "\n",
+			     range.address);
+		}
+		if (!m_scheduler.Context().IsMapped(range.address, range.size) ||
+		    !LibKernel::Memory::CanWriteGpuBacking(range.address, range.size)) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=image_backing address=%016" PRIx64
+			     " size=%016" PRIx64 "\n",
+			     range.address, range.size);
+		}
+		if (m_buffer_cache.HasGpuDirtyBytes(range.address, range.size) ||
+		    std::any_of(ranges.begin(), ranges.end(), [&](const GuestRange& other) {
+			    return range.address < other.End() && other.address < range.End();
+		    })) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=image_overlap address=%016" PRIx64 "\n",
+			     range.address);
+		}
+		images.push_back(id);
+		ranges.push_back(range);
+	});
+
+	m_buffer_cache.WritebackGpuMemory();
+	if (images.empty()) {
+		return;
+	}
+	for (size_t i = 0; i < images.size(); i++) {
+		const auto range = ranges[i];
+		m_buffer_cache.InvalidateMemory(range.address, range.size);
+		if (!DownloadImageMemory(images[i])) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=writeback image_download\n");
+		}
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto id: images) {
+		m_download_images.erase(id);
+	}
 }
 
 } // namespace Libs::Graphics

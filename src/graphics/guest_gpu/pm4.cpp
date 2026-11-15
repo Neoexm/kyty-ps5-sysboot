@@ -77,6 +77,7 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_SET_UCONFIG_REG_INDIRECT]  = "IT_SET_UCONFIG_REG_INDIRECT";
 	names[IT_SET_CONFIG_REG]            = "IT_SET_CONFIG_REG";
 	names[IT_SET_CONTEXT_REG]           = "IT_SET_CONTEXT_REG";
+	names[IT_GFX_PIPE_LOCK]              = "IT_GFX_PIPE_LOCK";
 	names[IT_SET_SH_REG]                = "IT_SET_SH_REG";
 	names[IT_SET_QUEUE_REG]             = "IT_SET_QUEUE_REG";
 	names[IT_SET_UCONFIG_REG]           = "IT_SET_UCONFIG_REG";

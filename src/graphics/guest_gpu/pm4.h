@@ -59,6 +59,7 @@ constexpr uint32_t IT_SET_SH_REG_INDIRECT       = 0x63;
 constexpr uint32_t IT_SET_UCONFIG_REG_INDIRECT  = 0x64;
 constexpr uint32_t IT_SET_CONFIG_REG            = 0x68;
 constexpr uint32_t IT_SET_CONTEXT_REG           = 0x69;
+constexpr uint32_t IT_GFX_PIPE_LOCK             = 0x75;
 constexpr uint32_t IT_SET_SH_REG                = 0x76;
 constexpr uint32_t IT_SET_QUEUE_REG             = 0x78;
 constexpr uint32_t IT_SET_UCONFIG_REG           = 0x79;
@@ -582,6 +583,7 @@ constexpr uint32_t PA_SC_SHADER_CONTROL                  = 0x310;
 constexpr uint32_t PA_SC_BINNER_CNTL_0                   = 0x311;
 constexpr uint32_t PA_SC_BINNER_CNTL_1                   = 0x312;
 constexpr uint32_t PA_SC_CONSERVATIVE_RASTERIZATION_CNTL = 0x313;
+constexpr uint32_t PA_SC_NGG_MODE_CNTL                   = 0x314;
 constexpr uint32_t CB_COLOR0_BASE                        = 0x318;
 
 constexpr uint32_t CB_COLOR0_VIEW                   = 0x31B;
@@ -697,6 +699,7 @@ constexpr uint32_t CX_NUM = 0x3FF + 1;
 
 /* Shader registers */
 
+constexpr uint32_t SPI_SHADER_PGM_RSRC4_PS           = 0x1;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_PS = 0x2;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_PS = 0x3;
 constexpr uint32_t SPI_SHADER_PACE_ID_PS            = 0x6;
@@ -942,12 +945,17 @@ constexpr uint32_t COMPUTE_PGM_RSRC2_LDS_SIZE_SHIFT       = 15;
 constexpr uint32_t COMPUTE_PGM_RSRC2_LDS_SIZE_MASK        = 0x1FF;
 
 constexpr uint32_t COMPUTE_RESOURCE_LIMITS    = 0x215;
+constexpr uint32_t COMPUTE_STATIC_THREAD_MGMT_SE0       = 0x216;
+constexpr uint32_t COMPUTE_STATIC_THREAD_MGMT_SE1       = 0x217;
+constexpr uint32_t COMPUTE_STATIC_THREAD_MGMT_SE2       = 0x219;
+constexpr uint32_t COMPUTE_STATIC_THREAD_MGMT_SE3       = 0x21A;
 constexpr uint32_t COMPUTE_TMPRING_SIZE       = 0x218;
 constexpr uint32_t COMPUTE_USER_ACCUM_0       = 0x224;
 constexpr uint32_t COMPUTE_PGM_RSRC3          = 0x228;
 constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT = 0;
 constexpr uint32_t COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK  = 0xF;
 constexpr uint32_t COMPUTE_PACE_ID             = 0x22A;
+constexpr uint32_t COMPUTE_DISPATCH_TUNNEL              = 0x27D;
 constexpr uint32_t COMPUTE_USER_DATA_0        = 0x240;
 constexpr uint32_t COMPUTE_USER_DATA_15       = 0x24F;
 

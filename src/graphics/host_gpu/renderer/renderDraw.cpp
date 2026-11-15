@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -972,6 +973,46 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 }
 
+static void LogStageDwords(const char* what, uint32_t index, const uint32_t* data, uint32_t count) {
+	for (uint32_t i = 0; i < count; i += 4) {
+		uint32_t raw[4] = {};
+		float    flt[4] = {};
+		std::memcpy(raw, data + i, std::min(count - i, 4u) * sizeof(uint32_t));
+		std::memcpy(flt, raw, sizeof(flt));
+		LOGF("  %s[%u] +0x%03x: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
+		     " f=(%g,%g,%g,%g)\n",
+		     what, index, i * 4u, raw[0], raw[1], raw[2], raw[3], flt[0], flt[1], flt[2], flt[3]);
+	}
+}
+
+static void LogDrawStageData(const char* stage_name, const ShaderStageRuntime& stage) {
+	const auto& program   = *stage.program;
+	const auto& resources = *stage.resources;
+	LOGF("DrawStageData: %s hash=0x%016" PRIx64 " buffers=%zu images=%zu user_data=%zu srt=%zu\n",
+	     stage_name, program.shader_hash, program.info.buffers.size(), program.info.images.size(),
+	     resources.user_data.size(), resources.flattened_srt.size());
+	LogStageDwords("user_data", 0, resources.user_data.data(),
+	               std::min<uint32_t>(static_cast<uint32_t>(resources.user_data.size()), 32u));
+	LogStageDwords("srt", 0, resources.flattened_srt.data(),
+	               std::min<uint32_t>(static_cast<uint32_t>(resources.flattened_srt.size()), 64u));
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto r = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		LOGF("  buffer[%u]: source=%u addr=0x%012" PRIx64 " stride=%u records=%u format=%u\n", i,
+		     program.info.buffers[i].source, r.Base48(), r.Stride(), r.NumRecords(), r.RawFormat());
+		const auto dwords = static_cast<uint32_t>(std::min<uint64_t>(r.GetSize() / 4u, 64u));
+		if (HostMemoryRangeIsReadable(r.Base48(), dwords * 4u)) {
+			LogStageDwords("buffer", i, reinterpret_cast<const uint32_t*>(r.Base48()), dwords);
+		}
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto r = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+		LOGF("  texture[%u]: source=%u addr=0x%010" PRIx64 " type=%u fmt=%u extent=%ux%u tile=%u\n",
+		     i, program.info.images[i].source, r.Base40(), static_cast<uint32_t>(r.Type()),
+		     static_cast<uint32_t>(r.Format()), static_cast<uint32_t>(r.Width5()) + 1u,
+		     static_cast<uint32_t>(r.Height5()) + 1u, static_cast<uint32_t>(r.TileMode()));
+	}
+}
+
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
 	                             const DrawRenderState& state, uint32_t index_type_and_size,
                                  const void* index_addr) {
@@ -980,6 +1021,32 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	}
 
 	if (!draw.IsIndexed() && !Prospero::IsRectList(buffer.GetUserConfig().GetPrimType())) {
+		// skipped by the capped logs below; dump a few per VS/PS pair
+		static std::unordered_map<uint64_t, uint32_t> seen;
+		const auto&                                   vs  = state.vertex_info[0];
+		uint64_t                                      key = vs.stage.program->shader_hash;
+		if (state.ps_active) {
+			key ^= std::rotl(state.ps_input_info.stage.program->shader_hash, 1);
+		}
+		if (seen[key]++ < 8) {
+			LOGF("DrawStageData: frame=%d target=0x%010" PRIx64 " vertices=%u vs_buffers=%d\n",
+			     buffer.GetContext().GetGpu().GetFrameNum(),
+			     state.color_info[0].desc.info.data.address, draw.index_count, vs.buffers_num);
+			for (int bi = 0; bi < vs.buffers_num; bi++) {
+				const auto& b = vs.buffers[bi];
+				LOGF("  vb[%d]: addr=0x%010" PRIx64 " stride=%u records=%u\n", bi, b.addr, b.stride,
+				     b.num_records);
+				const uint32_t dwords = std::min<uint32_t>(b.num_records * b.stride / 4u, 48u);
+				if (HostMemoryRangeIsReadable(b.addr, dwords * 4u)) {
+					LogStageDwords("vb", static_cast<uint32_t>(bi),
+					               reinterpret_cast<const uint32_t*>(b.addr), dwords);
+				}
+			}
+			LogDrawStageData("vs", vs.stage);
+			if (state.ps_active) {
+				LogDrawStageData("ps", state.ps_input_info.stage);
+			}
+		}
 		return;
 	}
 

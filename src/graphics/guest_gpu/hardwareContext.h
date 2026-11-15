@@ -463,6 +463,7 @@ struct PsStageRegisters {
 	uint64_t          auxiliary_table_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
+	uint32_t          rsrc4 = 0;
 };
 
 struct CsStageRegisters {
@@ -490,6 +491,9 @@ struct CsStageRegisters {
 	uint8_t  tidig_comp_cnt            = 0;
 	uint16_t lds_size                  = 0;
 	uint8_t  shared_vgprs              = 0;
+	uint32_t static_thread_mgmt[4]     = {};
+	uint16_t dispatch_off_delay        = 0;
+	bool     dispatch_immediate        = false;
 };
 
 struct EsStageRegisters {
@@ -564,6 +568,7 @@ struct ShaderRegisters {
 	uint32_t shader_z_format       = 0;
 	uint8_t  target_output_mode[8] = {};
 	uint32_t ps_input_ena          = 0;
+	uint32_t spi_interp_control_0  = 0;
 	uint32_t ps_input_addr         = 0;
 	uint32_t ps_in_control         = 0;
 	uint32_t baryc_cntl            = 0;
@@ -860,6 +865,11 @@ public:
 	void                   SetLineWidth(float width) { m_line_width = width; }
 	[[nodiscard]] uint32_t GetPrimitiveResetIndex() const { return m_primitive_reset_index; }
 	void SetPrimitiveResetIndex(uint32_t index) { m_primitive_reset_index = index; }
+	void SetSmallPrimitiveFilter(uint32_t value) { m_small_prim_filter_cntl = value; }
+	void SetNggModeControl(uint32_t value) { m_ngg_mode_control = value; }
+	void SetStereoControl(uint32_t value) { m_stereo_control = value; }
+	void SetStereoXOffset(uint32_t value) { m_stereo_x_offset = value; }
+	[[nodiscard]] uint32_t GetSmallPrimitiveFilter() const { return m_small_prim_filter_cntl; }
 
 	[[nodiscard]] const ShaderRegisters& GetShaderRegisters() const { return m_sh_regs; }
 
@@ -893,6 +903,7 @@ public:
 		m_sh_regs.target_output_mode[slot] = value;
 	}
 	void SetPsInputEna(uint32_t value) { m_sh_regs.ps_input_ena = value; }
+	void SetPsInterpControl(uint32_t value) { m_sh_regs.spi_interp_control_0 = value; }
 	void SetPsInputAddr(uint32_t value) { m_sh_regs.ps_input_addr = value; }
 	void SetPsInControl(uint32_t value) { m_sh_regs.ps_in_control = value; }
 	void SetBarycCntl(uint32_t value) { m_sh_regs.baryc_cntl = value; }
@@ -906,6 +917,10 @@ public:
 private:
 	float    m_line_width            = 1.0f;
 	uint32_t m_primitive_reset_index = 0xffffffffu;
+	uint32_t m_small_prim_filter_cntl = 0;
+	uint32_t m_ngg_mode_control       = 0;
+	uint32_t m_stereo_control         = 0;
+	uint32_t m_stereo_x_offset        = 0;
 
 	BlendControl    m_blend_control[8];
 	BlendColor      m_blend_color;
@@ -967,6 +982,8 @@ public:
 	void                           SetGeControl(const GeControl& control) { m_ge_cntl = control; }
 	[[nodiscard]] const GeUserVgprEn& GetGeUserVgprEn() const { return m_ge_user_vgpr_en; }
 	void SetGeUserVgprEn(const GeUserVgprEn& en) { m_ge_user_vgpr_en = en; }
+	void SetGeUserVgpr(uint32_t index, uint32_t value) { m_ge_user_vgpr[index] = value; }
+	[[nodiscard]] uint32_t GetGeUserVgpr(uint32_t index) const { return m_ge_user_vgpr[index]; }
 	[[nodiscard]] const GdsOaState&   GetGdsOaState() const { return m_gds_oa; }
 	[[nodiscard]] const GdsOaCounter& GetGdsOaCounter(uint32_t index) const {
 		return m_gds_oa.counters[index & 0x0fu];
@@ -992,6 +1009,7 @@ private:
 
 	GeControl    m_ge_cntl;
 	GeUserVgprEn m_ge_user_vgpr_en;
+	uint32_t     m_ge_user_vgpr[3] = {};
 	GdsOaState   m_gds_oa;
 };
 
@@ -1028,9 +1046,17 @@ public:
 	}
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
+	void SetPsShaderResource4(uint32_t rsrc4) { m_ps.ps_regs.rsrc4 = rsrc4; }
 
 	void SetCsShader(const CsStageRegisters& cs_regs) { m_cs.cs_regs = cs_regs; }
 	void SetCsWaveSize(uint8_t wave_size) { m_cs.cs_regs.wave_size = wave_size; }
+	void SetCsStaticThreadMgmt(uint32_t engine, uint32_t value) {
+		m_cs.cs_regs.static_thread_mgmt[engine] = value;
+	}
+	void SetCsDispatchTunnel(uint32_t value) {
+		m_cs.cs_regs.dispatch_off_delay = static_cast<uint16_t>(value & 0x3ffu);
+		m_cs.cs_regs.dispatch_immediate = (value & 0x400u) != 0;
+	}
 
 	void SetPsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
 		m_ps.ps_user_sgpr.value[id] = value;

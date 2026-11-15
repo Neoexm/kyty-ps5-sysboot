@@ -14,6 +14,7 @@
 #include "libs/errno.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 
 namespace Libs::Graphics::Sync {
@@ -228,6 +229,9 @@ void WriteAtEndOfPipeOnlyFlip(uint64_t submit_id, CommandBuffer& buffer, int han
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id) {
 	(void)buffer.Handle();
+	if (std::getenv("KYTY_DIAGNOSTIC_GPU_EOP_AUDIT") != nullptr) {
+		LOGF("FIRST_FRAME_AUDIT GPU_EOP_SCHEDULE event_id=%d ctx=%u\n", event_id, context_id);
+	}
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());

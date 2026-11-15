@@ -124,6 +124,12 @@ public:
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	[[nodiscard]] uint64_t CrossProcessGeneration() const noexcept {
+		return m_cross_process_generation;
+	}
+	void SetCrossProcessGeneration(uint64_t generation) noexcept {
+		m_cross_process_generation = generation;
+	}
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -166,6 +172,7 @@ private:
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
+	uint64_t          m_cross_process_generation = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;

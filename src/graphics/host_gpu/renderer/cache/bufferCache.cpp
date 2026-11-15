@@ -14,11 +14,16 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
+
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -95,6 +100,209 @@ void BufferCache::ChangeRegister(BufferId id) {
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+	}
+}
+
+std::vector<GuestRange> BufferCache::CrossProcessRangesIn(uint64_t vaddr, uint64_t size) const {
+	std::vector<GuestRange> ranges;
+	if (!m_cross_process_ranges_present.load(std::memory_order_acquire) ||
+	    !GuestRange {vaddr, size}.Valid()) {
+		return ranges;
+	}
+	std::shared_lock lock(m_cross_process_mutex);
+	m_cross_process_ranges.ForEachInRange(
+	    vaddr, size, [&](uint64_t begin, uint64_t end) { ranges.push_back({begin, end - begin}); });
+	return ranges;
+}
+
+void BufferCache::RegisterCrossProcessMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_cross_process_mutex);
+		m_cross_process_ranges.Add(vaddr, size);
+		m_cross_process_ranges_present.store(true, std::memory_order_release);
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_SHARED_REFRESH") != nullptr) {
+		static std::atomic_uint64_t registrations = 0;
+		const auto                  ordinal       = registrations.fetch_add(1) + 1;
+		if (ordinal <= 128 || (ordinal & (ordinal - 1)) == 0) {
+			LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_REGISTERED addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " ordinal=%" PRIu64 "\n",
+			     vaddr, size, ordinal);
+		}
+	}
+}
+
+void BufferCache::UnregisterCrossProcessMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	{
+		std::lock_guard range_lock(m_cross_process_mutex);
+		m_cross_process_ranges.Subtract(vaddr, size);
+		m_cross_process_ranges_present.store(!m_cross_process_ranges.Empty(),
+		                                     std::memory_order_release);
+	}
+	std::lock_guard  page_lock(m_cross_process_page_mutex);
+	std::shared_lock range_lock(m_cross_process_mutex);
+	for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+		if (!m_cross_process_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			m_cross_process_pages.erase(page);
+		}
+	}
+}
+
+void BufferCache::AdvanceCrossProcessEpoch() {
+	std::lock_guard lock(m_cross_process_page_mutex);
+	if (++m_cross_process_epoch == 0) {
+		m_cross_process_epoch = 1;
+		for (auto& [page, state]: m_cross_process_pages) {
+			(void)page;
+			state.validated_epoch = 0;
+		}
+	}
+}
+
+uint64_t BufferCache::CrossProcessGeneration(uint64_t vaddr, uint64_t size) const {
+	uint64_t        generation = 0;
+	const auto      ranges     = CrossProcessRangesIn(vaddr, size);
+	std::lock_guard lock(m_cross_process_page_mutex);
+	for (const auto& range: ranges) {
+		const auto begin = Common::AlignDown(range.address, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(range.End(), TRACKER_PAGE_SIZE);
+		for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			if (const auto it = m_cross_process_pages.find(page);
+			    it != m_cross_process_pages.end() && it->second.valid) {
+				generation = std::max(generation, it->second.generation);
+			}
+		}
+	}
+	return generation;
+}
+
+BufferCache::CrossProcessValidation
+BufferCache::ValidateCrossProcessMemory(uint64_t vaddr, uint64_t size, bool force) {
+	static std::atomic_uint64_t changes       = 0;
+	static std::atomic_uint64_t conflicts     = 0;
+	static std::atomic_uint64_t resolved      = 0;
+	static std::atomic_uint64_t read_failures = 0;
+	CrossProcessValidation      result {};
+	const auto                  ranges = CrossProcessRangesIn(vaddr, size);
+	if (ranges.empty()) {
+		return result;
+	}
+	const bool audit          = std::getenv("KYTY_DIAGNOSTIC_SHARED_REFRESH") != nullptr;
+	result.intersects         = true;
+	uint64_t        last_page = UINT64_MAX;
+	std::lock_guard lock(m_cross_process_page_mutex);
+	for (const auto& range: ranges) {
+		const auto begin = Common::AlignDown(range.address, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(range.End(), TRACKER_PAGE_SIZE);
+		for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			if (page == last_page) {
+				continue;
+			}
+			last_page   = page;
+			auto& state = m_cross_process_pages[page];
+			if (state.valid) {
+				result.generation = std::max(result.generation, state.generation);
+			}
+			const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE);
+			if (state.pending_cpu_refresh && !gpu_modified) {
+				state.pending_cpu_refresh = false;
+				m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
+				const auto ordinal = resolved.fetch_add(1) + 1;
+				if (audit && (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0)) {
+					LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_GPU_RESOLVED addr=0x%016" PRIx64
+					     " generation=%" PRIu64 " ordinal=%" PRIu64 "\n",
+					     page, state.generation, ordinal);
+				}
+			}
+			if (!force && state.validated_epoch == m_cross_process_epoch) {
+				result.gpu_conflict |= gpu_modified;
+				continue;
+			}
+			std::array<uint8_t, TRACKER_PAGE_SIZE> bytes {};
+			if (!Libs::LibKernel::Memory::TryReadSparseBacking(page, bytes.data(), bytes.size())) {
+				bool registered = false;
+				{
+					std::shared_lock range_lock(m_cross_process_mutex);
+					registered = m_cross_process_ranges.Intersects(page, TRACKER_PAGE_SIZE);
+				}
+				if (!registered) {
+					m_cross_process_pages.erase(page);
+					continue;
+				}
+				const auto ordinal = read_failures.fetch_add(1) + 1;
+				if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
+					LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_READ_FAILED addr=0x%016" PRIx64
+					     " epoch=%" PRIu64 " ordinal=%" PRIu64 "\n",
+					     page, m_cross_process_epoch, ordinal);
+				}
+				continue;
+			}
+			const auto hash       = XXH3_64bits(bytes.data(), bytes.size());
+			state.validated_epoch = m_cross_process_epoch;
+			if (state.valid && state.hash == hash) {
+				result.gpu_conflict |= gpu_modified;
+				continue;
+			}
+			const bool first  = !state.valid;
+			state.hash        = hash;
+			state.valid       = true;
+			state.generation  = ++m_cross_process_generation;
+			result.generation = std::max(result.generation, state.generation);
+			if (gpu_modified) {
+				state.pending_cpu_refresh = true;
+				result.gpu_conflict       = true;
+				const auto ordinal        = conflicts.fetch_add(1) + 1;
+				if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
+					LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_GPU_CONFLICT addr=0x%016" PRIx64
+					     " generation=%" PRIu64 " ordinal=%" PRIu64 "\n",
+					     page, state.generation, ordinal);
+				}
+				continue;
+			}
+			state.pending_cpu_refresh = false;
+			m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
+			const auto ordinal = changes.fetch_add(1) + 1;
+			if (audit && (ordinal <= 128 || (ordinal & (ordinal - 1)) == 0)) {
+				LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_CHANGED addr=0x%016" PRIx64
+				     " first=%d generation=%" PRIu64 " epoch=%" PRIu64 " ordinal=%" PRIu64 "\n",
+				     page, first ? 1 : 0, state.generation, m_cross_process_epoch, ordinal);
+			}
+		}
+	}
+	return result;
+}
+
+void BufferCache::StampCrossProcessMemory(uint64_t vaddr, uint64_t size) {
+	const auto      ranges = CrossProcessRangesIn(vaddr, size);
+	std::lock_guard lock(m_cross_process_page_mutex);
+	for (const auto& range: ranges) {
+		const auto begin = Common::AlignDown(range.address, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(range.End(), TRACKER_PAGE_SIZE);
+		for (auto page = begin; page < end; page += TRACKER_PAGE_SIZE) {
+			std::array<uint8_t, TRACKER_PAGE_SIZE> bytes {};
+			if (!Libs::LibKernel::Memory::TryReadSparseBacking(page, bytes.data(), bytes.size())) {
+				continue;
+			}
+			auto& state               = m_cross_process_pages[page];
+			state.hash                = XXH3_64bits(bytes.data(), bytes.size());
+			state.valid               = true;
+			state.validated_epoch     = m_cross_process_epoch;
+			state.pending_cpu_refresh = false;
+		}
+	}
+}
+
+void BufferCache::AcknowledgeCrossProcessWrite(uint64_t vaddr, uint64_t size) {
+	if (GuestRange {vaddr, size}.Valid()) {
+		StampCrossProcessMemory(vaddr, size);
 	}
 }
 
@@ -177,6 +385,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
+			AcknowledgeCrossProcessWrite(buffer_address + copy.srcOffset, copy.size);
 		}
 	};
 	if constexpr (async) {
@@ -265,6 +474,56 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+}
+
+void BufferCache::WritebackGpuMemory() {
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	std::vector<BufferId> dirty_buffers;
+	auto                  remaining = m_gpu_modified_ranges;
+	for (const auto& [address, id]: m_buffers) {
+		auto&      buffer          = m_slot_buffers[id];
+		const bool has_dirty_bytes = m_gpu_modified_ranges.Intersects(address, buffer.Size());
+		const bool has_dirty_pages = m_memory_tracker.IsRegionGpuModified(address, buffer.Size());
+		if (has_dirty_bytes != has_dirty_pages) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=buffer_ownership address=%016" PRIx64 "\n",
+			     address);
+		}
+		if (!has_dirty_bytes) {
+			continue;
+		}
+		m_gpu_modified_ranges.ForEachInRange(
+		    address, buffer.Size(), [this](uint64_t begin, uint64_t end) {
+			    if (!m_scheduler.Context().IsMapped(begin, end - begin) ||
+				    !LibKernel::Memory::CanWriteGpuBacking(begin, end - begin)) {
+				    EXIT("NATIVE_RELEASE_MEM_REJECTED reason=buffer_backing address=%016" PRIx64
+					     " size=%016" PRIx64 "\n",
+					     begin, end - begin);
+			    }
+		    });
+		remaining.Subtract(address, buffer.Size());
+		dirty_buffers.push_back(id);
+	}
+	if (!remaining.Empty()) {
+		EXIT("NATIVE_RELEASE_MEM_REJECTED reason=buffer_ownership unbound_dirty_bytes\n");
+	}
+
+	for (const auto id: dirty_buffers) {
+		auto& buffer = m_slot_buffers[id];
+		if (!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size())) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=writeback buffer_download\n");
+		}
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto id: dirty_buffers) {
+		auto& buffer = m_slot_buffers[id];
+		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size()) ||
+		    m_gpu_modified_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			EXIT("NATIVE_RELEASE_MEM_REJECTED reason=writeback retained_buffer_ownership\n");
+		}
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -371,7 +630,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    bool is_texel_buffer, bool cross_process_prevalidated) {
+	if (!cross_process_prevalidated) {
+		(void)ValidateCrossProcessMemory(vaddr, size);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -446,7 +708,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id) {
+                                                       BufferId id,
+                                                       bool     cross_process_prevalidated) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -470,28 +733,32 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer,
+	                        cross_process_prevalidated);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
-std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+BufferCache::ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
+	const auto  validation = ValidateCrossProcessMemory(vaddr, size, true);
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
-			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
-			return {&buffer, buffer.Offset(vaddr)};
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, false, true);
+			return {&buffer, buffer.Offset(vaddr), validation.generation, validation.intersects,
+			        validation.gpu_conflict};
 		}
 	}
 	if (IsRegionGpuModified(vaddr, size)) {
-		return ObtainBuffer(vaddr, size, false, false);
+		const auto [buffer, offset] = ObtainBuffer(vaddr, size, false, false, {}, true);
+		return {buffer, offset, validation.generation, validation.intersects, true};
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
@@ -499,7 +766,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	return {&m_staging_buffer, stage_offset, validation.generation, validation.intersects,
+	        validation.gpu_conflict};
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
