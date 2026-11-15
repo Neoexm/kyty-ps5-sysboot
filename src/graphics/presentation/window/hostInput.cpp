@@ -216,6 +216,12 @@ uint32_t NavigationKeyboardButton(int key_code) {
 		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDLK_RETURN:
+		case SDLK_RETURN2:
+		case SDLK_KP_ENTER: return Controller::PAD_BUTTON_CROSS;
+		case SDLK_ESCAPE: return Controller::PAD_BUTTON_CIRCLE;
+		case SDLK_SPACE: return Controller::PAD_BUTTON_OPTIONS;
+		default: return 0;
 	}
 }
 
@@ -420,6 +426,8 @@ void HostInputInit(SDL_Window* window) {
 }
 
 void HostInputShutdown() {
+	ResetKeyboardInput();
+	Controller::SetHostInputSharedProducer(false);
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();

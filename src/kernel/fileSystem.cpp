@@ -5679,6 +5679,37 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		}
 		return descriptor;
 	}
+	if (file->name == "/dev/metadbg") {
+		if (directory || creat || trunc || excl || append || direct) {
+			g_files->DeleteDescriptor(descriptor);
+			return directory ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_EINVAL;
+		}
+		file->real_name                = file->name;
+		file->special                  = SpecialFile::NativeMetadbg;
+		file->native_metadbg           = std::make_shared<NativeMetadbgOpen>();
+		file->native_metadbg->stream   = g_native_metadbg_stream;
+		file->native_metadbg->readable = file->readable;
+		file->opened                   = true;
+		LOGF("METADBG_DEVICE_OPEN guest_pid=%d fd=%d access=%u cloexec=%u"
+		     " shared_receive_stream=1 initial_bytes=0\n",
+		     Process::GetPid(), descriptor, flags_u, descriptor_flags != 0 ? 1u : 0u);
+		return descriptor;
+	}
+	if (file->name == "/dev/hid") {
+		if (directory || creat || trunc || excl || append || direct) {
+			g_files->DeleteDescriptor(descriptor);
+			return directory ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_EINVAL;
+		}
+		file->real_name = file->name;
+		file->special   = SpecialFile::Hid;
+		file->opened    = true;
+		LOGF("HID_DEVICE_OPEN guest_pid=%d fd=%d access=%u cloexec=%u"
+		     " diagnostic_pad_bridge=%u NON_AUTHENTIC_INPUT_BRIDGE=%u\n",
+		     Process::GetPid(), descriptor, flags_u, descriptor_flags != 0 ? 1u : 0u,
+		     DiagnosticHostInputHidPadEnabled() ? 1u : 0u,
+		     DiagnosticHostInputHidPadEnabled() ? 1u : 0u);
+		return descriptor;
+	}
 	if (file->name == "/dev/m2.ctl") {
 		if (directory || creat || trunc || excl || append || direct) {
 			g_files->DeleteDescriptor(descriptor);
@@ -6932,16 +6963,19 @@ struct HidPadOpenRequest {
 	uint32_t type;
 	uint32_t index;
 };
+static_assert(sizeof(HidPadOpenRequest) == 0x0c);
 
 struct HidPadHandleRequest {
 	int32_t  handle;
 	uint32_t value;
 };
+static_assert(sizeof(HidPadHandleRequest) == 0x08);
 
 struct HidPadCloseRequest {
 	uint32_t type;
 	int32_t  handle;
 };
+static_assert(sizeof(HidPadCloseRequest) == 0x08);
 
 struct HidPadSampleRequest {
 	uint8_t  command;
@@ -6957,6 +6991,10 @@ struct HidPadSampleRequest {
 	uint64_t reserved38;
 	uint64_t reports;
 };
+static_assert(sizeof(HidPadSampleRequest) == 0x48);
+static_assert(offsetof(HidPadSampleRequest, device_generation) == 0x20);
+static_assert(offsetof(HidPadSampleRequest, status) == 0x28);
+static_assert(offsetof(HidPadSampleRequest, reports) == 0x40);
 
 static int HidPadIoctl(File* file, int fd, uint64_t request, void* arg) {
 	if (!DiagnosticHostInputHidPadEnabled()) return KERNEL_ERROR_ENOTTY;
@@ -9712,7 +9750,15 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
 	}
 
-	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (A53StorageEnabled() && IsA53SsdDevice(path) && !FindSectorPayload(path)) {
+		std::lock_guard lock(g_a53_controller.mutex);
+		if (!g_a53_controller.namespace_present) return KERNEL_ERROR_ENOENT;
+		*sb            = {};
+		sb->st_mode    = 0020640u;
+		sb->st_nlink   = 1;
+		sb->st_blksize = 16384u;
+		return OK;
+	}
 
 	const char* iccnvs4_image    = std::getenv("KYTY_PS5_ICCNVS4_IMAGE");
 	const bool  original_iccnvs4 = std::strcmp(path, "/dev/iccnvs4") == 0 &&

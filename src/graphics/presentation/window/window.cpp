@@ -793,6 +793,16 @@ static void WindowCreate(WindowContext& context) {
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
+	if (!HostWindowPolicy::Apply(context.window, g_host_window_policy,
+	                             Config::FullscreenEnabled())) {
+		EXIT("Host display handoff failed: %s\n", SDL_GetError());
+	}
+	Controller::SetHostInputSharedProducer(
+	    (SDL_GetWindowFlags(context.window) & SDL_WINDOW_HIDDEN) == 0);
+	LOGF("HostWindow: role=%u visible=%d brokered=%d\n",
+	     static_cast<unsigned>(g_host_window_policy.role),
+	     (SDL_GetWindowFlags(context.window) & SDL_WINDOW_HIDDEN) == 0,
+	     HostWindowPolicy::UsesBroker() ? 1 : 0);
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {

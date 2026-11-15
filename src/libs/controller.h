@@ -73,6 +73,7 @@ void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
+void SetHostInputSharedProducer(bool enabled);
 int  GetActiveControllerId();
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };

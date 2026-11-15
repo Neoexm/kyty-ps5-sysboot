@@ -2,15 +2,96 @@
 #include "common/logging/log.h"
 #include "libs/controller.h"
 #include "libs/errno.h"
+#include "libs/hostInputMbus.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs {
 
 LIB_VERSION("Pad", 1, "Pad", 1, 1);
+
+static bool HostInputBridgeEnabled() {
+	const auto* value = std::getenv("KYTY_DIAGNOSTIC_HOST_INPUT_HID_PAD");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+struct PadUiState {
+	uint32_t                 buttons;
+	uint8_t                  axes[8];
+	float                    orientation[4];
+	float                    acceleration[3];
+	float                    angular_velocity[3];
+	Controller::PadTouchData touch_data;
+	uint8_t                  connected;
+	uint8_t                  connected_count;
+	uint8_t                  reserved_4e[2];
+	uint64_t                 timestamp;
+	uint32_t                 extension_unit_id;
+	uint8_t                  device_unique_data[16];
+	uint32_t                 reserved_6c;
+};
+
+static_assert(sizeof(PadUiState) == 0x70);
+static_assert(offsetof(PadUiState, connected) == 0x4c);
+static_assert(offsetof(PadUiState, timestamp) == 0x50);
+static_assert(offsetof(PadUiState, device_unique_data) == 0x5c);
+
+static std::atomic<uint32_t> g_device_open_log_count {0};
+static std::atomic<uint32_t> g_ui_read_log_count {0};
+static std::atomic<uint32_t> g_ui_transition_log_count {0};
+static std::atomic<uint64_t> g_ui_last_buttons {UINT64_MAX};
+
+static int KYTY_SYSV_ABI PadDeviceOpen(uint64_t device_id, int type, int index) {
+	constexpr int pad_error_invalid_arg = -2137915391; /* 0x80920001 */
+	if (!HostInputBridgeEnabled() ||
+	    !Mbus::HostInput::IsPadDeviceOpenRequest(device_id, type, index)) {
+		return pad_error_invalid_arg;
+	}
+	if (g_device_open_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("NON_AUTHENTIC_INPUT_BRIDGE scePadDeviceOpen device_id=0x%016" PRIx64
+		     " type=%d index=%d handle=1\n",
+		     device_id, type, index);
+	}
+	return 1;
+}
+
+static int KYTY_SYSV_ABI PadUiReadState(int handle, PadUiState* output) {
+	constexpr int pad_error_invalid_handle = -2137915389; /* 0x80920003 */
+	constexpr int pad_error_invalid_arg    = -2137915391; /* 0x80920001 */
+	if (!HostInputBridgeEnabled() || handle != 1) return pad_error_invalid_handle;
+	if (output == nullptr) return pad_error_invalid_arg;
+
+	Controller::PadData data {};
+	const int           result = Controller::PadReadState(handle, &data);
+	if (result != OK) return result;
+
+	PadUiState state {};
+	std::memcpy(&state, &data, 0x4c);
+	state.connected         = data.connected;
+	state.connected_count   = data.connected_count;
+	state.timestamp         = data.timestamp;
+	state.extension_unit_id = data.extension_unit_data_extension_unit_id;
+	std::memcpy(state.device_unique_data, &data.device_unique_data_len,
+	            sizeof(data.device_unique_data_len) + sizeof(data.device_unique_data));
+	*output               = state;
+	const auto read_index = g_ui_read_log_count.fetch_add(1, std::memory_order_relaxed);
+	const auto previous   = g_ui_last_buttons.exchange(state.buttons, std::memory_order_relaxed);
+	const bool transition = previous != UINT64_MAX && previous != state.buttons;
+	const auto transition_index =
+	    transition ? g_ui_transition_log_count.fetch_add(1, std::memory_order_relaxed) : 0;
+	if (read_index < 8 || (transition && transition_index < 64)) {
+		LOGF("NON_AUTHENTIC_INPUT_BRIDGE scePadUiReadState handle=%d buttons=0x%08x"
+		     " connected=%u connected_count=%u transition=%u\n",
+		     handle, state.buttons, state.connected, state.connected_count, transition ? 1u : 0u);
+	}
+	return OK;
+}
 
 static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	PRINT_NAME();
@@ -219,6 +300,10 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
 	LIB_FUNC("6ncge5+l5Qs", PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
+	if (HostInputBridgeEnabled()) {
+		LIB_FUNC("d7bXuEBycDI", PadDeviceOpen);
+		LIB_FUNC("FYqcaosYiIo", PadUiReadState);
+	}
 }
 
 namespace LibMouse {

@@ -41,8 +41,8 @@ constexpr PadControl PAD_CONTROLS[] = {
     {"RightStickLeft", "Right stick Left", "F"},
     {"RightStickRight", "Right stick Right", "H"},
     {"Triangle", "Triangle", "I"},
-    {"Circle", "Circle", "L"},
-    {"Cross", "Cross", "J"},
+    {"Circle", "Circle", "Escape"},
+    {"Cross", "Cross", "Return"},
     {"Square", "Square", "K"},
     {"L1", "L1", "Q"},
     {"R1", "R1", "E"},
@@ -50,7 +50,7 @@ constexpr PadControl PAD_CONTROLS[] = {
     {"R2", "R2", "C"},
     {"L3", "L3", "Left Shift"},
     {"R3", "R3", "Left Ctrl"},
-    {"Options", "Options", "Return"},
+    {"Options", "Options", "Space"},
     {"TouchPad", "Touch pad left (SELECT)", "Backspace"},
     {"TouchPadRight", "Touch pad right (START)", "Tab"},
     {"SpeakerVolume", "Speaker volume (cycle)", "1"},
@@ -94,6 +94,7 @@ QString KeyName(const QKeyEvent& event) {
 
 	switch (key) {
 		case Qt::Key_Space: return QStringLiteral("Space");
+		case Qt::Key_Escape: return QStringLiteral("Escape");
 		case Qt::Key_Return:
 		case Qt::Key_Enter: return QStringLiteral("Return");
 		case Qt::Key_Backspace: return QStringLiteral("Backspace");
@@ -135,8 +136,8 @@ public:
 		setMinimumWidth(360);
 
 		auto* layout = new QVBoxLayout(this);
-		m_label      = new QLabel(
-		    tr("Press a key or mouse button.\nF1, F7, and F11 are reserved; Esc cancels."), this);
+		m_label =
+		    new QLabel(tr("Press a key or mouse button.\nF1, F7, and F11 are reserved."), this);
 		m_label->setAlignment(Qt::AlignCenter);
 		layout->addWidget(m_label);
 	}
@@ -146,10 +147,6 @@ public:
 protected:
 	void keyPressEvent(QKeyEvent* event) override {
 		if (event->isAutoRepeat()) {
-			return;
-		}
-		if (event->key() == Qt::Key_Escape) {
-			reject();
 			return;
 		}
 		if (event->key() == Qt::Key_F1 || event->key() == Qt::Key_F7 ||
@@ -224,8 +221,8 @@ InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* pare
 	auto* layout = new QVBoxLayout(this);
 	layout->addWidget(
 	    new QLabel(tr("Map keyboard or mouse buttons to DualSense controls.\n"
-	                  "Press F7 in-game to toggle mouse movement on the right stick."),
-	               this));
+		              "Press F7 in-game to toggle mouse movement on the right stick."),
+		           this));
 
 	const auto parsed = ParseMapping(mapping);
 	m_custom_bindings = !parsed.isEmpty();

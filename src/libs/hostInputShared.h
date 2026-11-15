@@ -8,34 +8,51 @@
 #include <string>
 
 #ifdef _WIN32
-#include <windows.h>
+#ifndef NOMINMAX
+#define NOMINMAX
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#ifdef small
+#undef small
+#endif
+#endif
+
 namespace Libs::Controller::HostInputShared {
+
 struct Touch {
 	uint8_t  id   = 0;
 	uint8_t  down = 0;
 	uint16_t x    = 0;
 	uint16_t y    = 0;
 };
+
 struct State {
 	uint32_t             buttons = 0;
 	std::array<int, 6>   axes {128, 128, 128, 128, 0, 0};
 	std::array<Touch, 2> touch {};
 };
+
 struct Reader {
 	uint64_t sequence = 0;
 	bool     attached = false;
 };
+
 #ifdef _WIN32
 namespace Detail {
+
 constexpr uint32_t MAGIC           = 0x4b484953;
 constexpr uint32_t VERSION         = 1;
 constexpr size_t   CAPACITY        = 128;
 constexpr DWORD    LOCK_TIMEOUT_MS = 25;
+
 struct Record {
 	uint64_t sequence = 0;
 	State    state;
 };
+
 struct SharedState {
 	uint32_t                     magic      = 0;
 	uint32_t                     version    = 0;
@@ -43,6 +60,7 @@ struct SharedState {
 	uint64_t                     sequence   = 0;
 	std::array<Record, CAPACITY> records;
 };
+
 inline uint64_t Hash(const std::string& text) {
 	uint64_t hash = 0xcbf29ce484222325ull;
 	for (const unsigned char value: text) {
@@ -50,6 +68,7 @@ inline uint64_t Hash(const std::string& text) {
 	}
 	return hash;
 }
+
 inline std::string Environment(const char* name) {
 	const auto size = GetEnvironmentVariableA(name, nullptr, 0);
 	if (size == 0) return {};
@@ -59,11 +78,13 @@ inline std::string Environment(const char* name) {
 	value.resize(length);
 	return value;
 }
+
 inline std::string Scope() {
 	const auto scope       = Environment("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE");
 	const auto coordinated = Environment("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY");
 	return !scope.empty() && coordinated == "1" ? scope : std::string();
 }
+
 struct Context {
 	std::string  scope;
 	HANDLE       mutex   = nullptr;
@@ -129,14 +150,17 @@ struct Context {
 		return true;
 	}
 };
+
 inline Context& GetContext() {
 	static Context context;
 	return context;
 }
+
 inline std::mutex& GetContextMutex() {
 	static std::mutex mutex;
 	return mutex;
 }
+
 class Lock {
 public:
 	explicit Lock(HANDLE mutex): m_mutex(mutex) {
@@ -154,7 +178,9 @@ private:
 	HANDLE m_mutex  = nullptr;
 	bool   m_locked = false;
 };
+
 } // namespace Detail
+
 inline uint64_t Publish(const State& input) {
 	std::lock_guard context_lock(Detail::GetContextMutex());
 	auto&           context = Detail::GetContext();
@@ -167,6 +193,7 @@ inline uint64_t Publish(const State& input) {
 	record.sequence     = sequence;
 	return sequence;
 }
+
 inline size_t Read(Reader* reader, State* output, size_t capacity) {
 	if (reader == nullptr || output == nullptr || capacity == 0) return 0;
 	std::lock_guard context_lock(Detail::GetContextMutex());
@@ -197,6 +224,17 @@ inline size_t Read(Reader* reader, State* output, size_t capacity) {
 	}
 	return count;
 }
+
 #else
+
+inline uint64_t Publish(const State&) {
+	return 0;
+}
+
+inline size_t Read(Reader*, State*, size_t) {
+	return 0;
+}
+
 #endif
+
 } // namespace Libs::Controller::HostInputShared
