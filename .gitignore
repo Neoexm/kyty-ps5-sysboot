@@ -6,3 +6,11 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+_TempData/
+_DownloadData/
+_Textures/
+runtime/
+unresolved_symbols.log
+*.dmp
+evidence/
+kyty.ini

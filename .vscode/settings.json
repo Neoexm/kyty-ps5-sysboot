@@ -14,5 +14,12 @@
     },
     "C_Cpp.default.intelliSenseMode": "windows-clang-x64",
     "C_Cpp.default.compileCommands": "${workspaceFolder}/_Build/vscode-clang/compile_commands.json",
-    "C_Cpp.default.cppStandard": "c++20"
+    "C_Cpp.default.cppStandard": "c++20",
+    "cmake.configureOnOpen": false,
+    "dotnet.automaticallyCreateSolutionInWorkspace": false,
+    "dotnet.defaultSolution": "disable",
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/_Build/vsh"
+    ]
 }
