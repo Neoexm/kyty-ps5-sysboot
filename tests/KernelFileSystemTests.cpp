@@ -4266,15 +4266,21 @@ int main(int argc, char** argv) {
     Check(Libs::LibKernel::Process::InitializeExecChild(argv[2]),
           "initialize the fatal-UD2 exec-child handoff mapping");
   }
-  if (!readonly_providers_only && !readonly_provider_child && !guest_wait7_frontier_only && !auth_info_scope_only && !app_mount_contract_only && !app_registration_state_only && !local_socket_policy_only && !compositor_sockets_only &&
-      !sysav_audio_shm_only && !physhm_only && !audiod_extended_mmap_only && !host_exception_provenance_only && !guest_sigaction_only && !posix_sem_setname_only && !mono_native_memory_only && !psm_audio_openex_only && !psm_native_mutex_only && !psm_native_thread_rename_only && !psm_sched_range_only && !sysav_raw_syscall_trap_only && !app_classification_only && !envelope_only && !exec_fatal_classifier_child && !exec_fatal_ud2_child) {
+  // set by the --*-only and child modes, which run their own cases and skip the full suite
+  const bool focused_run = readonly_providers_only || readonly_provider_child || guest_wait7_frontier_only ||
+      auth_info_scope_only || app_mount_contract_only || app_registration_state_only ||
+      local_socket_policy_only || compositor_sockets_only || sysav_audio_shm_only || physhm_only ||
+      audiod_extended_mmap_only || host_exception_provenance_only || guest_sigaction_only ||
+      posix_sem_setname_only || mono_native_memory_only || psm_audio_openex_only || psm_native_mutex_only ||
+      psm_native_thread_rename_only || psm_sched_range_only || sysav_raw_syscall_trap_only ||
+      app_classification_only || envelope_only || exec_fatal_classifier_child || exec_fatal_ud2_child;
+  if (!focused_run) {
     CheckGuestExecAuthInfoSlotRejection();
     CheckRootOriginalSelfFromApp0();
     CheckGuestExecFatalSignalPublication();
     CheckGuestExecFatalSignalTermination();
   }
-  if (!readonly_providers_only && !readonly_provider_child && !guest_wait7_frontier_only && !auth_info_scope_only && !app_mount_contract_only && !app_registration_state_only && !local_socket_policy_only && !compositor_sockets_only && !exec_fatal_signal_only &&
-      !sysav_audio_shm_only && !physhm_only && !audiod_extended_mmap_only && !host_exception_provenance_only && !guest_sigaction_only && !posix_sem_setname_only && !mono_native_memory_only && !psm_audio_openex_only && !psm_native_mutex_only && !psm_native_thread_rename_only && !psm_sched_range_only && !sysav_raw_syscall_trap_only && !app_classification_only && !envelope_only && !exec_fatal_classifier_child && !exec_fatal_ud2_child) {
+  if (!focused_run && !exec_fatal_signal_only) {
     CheckLibcFinalization();
     CheckLibcExitStatus();
   }
@@ -4346,7 +4352,7 @@ int main(int argc, char** argv) {
     subsystems.Destroy();
     return 0;
   }
-  if (!readonly_providers_only && !readonly_provider_child && !guest_wait7_frontier_only && !auth_info_scope_only && !app_mount_contract_only && !app_registration_state_only && !local_socket_policy_only && !compositor_sockets_only && !sysav_audio_shm_only && !physhm_only && !audiod_extended_mmap_only && !host_exception_provenance_only && !psm_audio_openex_only && !psm_native_mutex_only && !psm_native_thread_rename_only && !psm_sched_range_only && !sysav_raw_syscall_trap_only && !app_classification_only && !envelope_only)
+  if (!focused_run)
     CheckGuestExecFatalSignalClassifier();
   if (exec_fatal_signal_only) {
     subsystems.Destroy();

@@ -118,19 +118,19 @@ def error_record_text(record):
     if not isinstance(event, dict):
         return None
     if event_id == "ErrorDialog":
-        code = event.get("shortErrorCode") or event.get("shortError") or "unknown code"
-        internal = event.get("vshErrorHexCode") or event.get("internalErrorCode") or "unknown internal code"
+        code = event.get("shortErrorCode") or "unknown code"
+        internal = event.get("vshErrorHexCode") or "unknown internal code"
         title = event.get("titleId") or "unknown title"
-        message = event.get("messageBuffer") or event.get("description") or "error dialog"
+        message = event.get("description") or "error dialog"
         return f"PS5 guest error dialog {code} ({internal}, {title}): {message}"
     if event_id == "ApplicationError":
         severity = str(event.get("severity", "")).lower()
         if severity not in {"major", "critical", "fatal"}:
             return None
-        code = event.get("vshErrorHexCode") or event.get("shortErrorCode") or "unknown code"
-        title = event.get("appTitleId") or event.get("titleId") or "unknown title"
+        code = event.get("vshErrorHexCode") or "unknown code"
+        title = event.get("appTitleId") or "unknown title"
         kind = event.get("errorType") or f"{severity} application error"
-        message = str(event.get("errorMessage") or event.get("messageBuffer") or "").strip()
+        message = str(event.get("errorMessage") or "").strip()
         return f"PS5 guest {kind} ({code}, {title}): {message}".rstrip()
     return None
 

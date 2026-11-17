@@ -2316,7 +2316,6 @@ Reply AudiodExtendedMmap(const SyscallRequest& request) {
 	return {static_cast<int64_t>(guest_addr), 0};
 }
 
-// 0x47543F names its first 16 KiB "stack guard" through 0x476E80 (syscall 0x24C)
 Reply SysAvNativeNanosleep(const SyscallRequest& request) {
 	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_TRAP_SYSCALLS") == nullptr ||
 	    request.args[0] == 0 || request.args[0] > UINT64_MAX - 16 ||
@@ -2775,6 +2774,7 @@ Reply SysAvNativeUmtx(const SyscallRequest& request) {
 	return {-1, Libs::Posix::POSIX_ENOSYS};
 }
 
+// 0x47543F names its first 16 KiB "stack guard" through 0x476E80 (syscall 0x24C)
 Reply SysAvNameStackGuard(const SyscallRequest& request) {
 	if (std::getenv("KYTY_DIAGNOSTIC_ORBIS_AUDIOD_NATIVE_HEAP") != nullptr) {
 		static std::atomic<uint32_t> audio_name_trace_count {0};
