@@ -928,4 +928,15 @@ if(KYTY_BUILD_LAUNCHER)
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+
+	# File > Boot sys front end; serves the envelope provider itself so only the console address is needed
+	add_executable(kyty_sysboot WIN32
+		"${KYTY_SOURCE_DIR}/sysboot/main.cpp"
+		"${KYTY_SOURCE_DIR}/sysboot/provider.cpp"
+		"${KYTY_SOURCE_DIR}/sysboot/sysboot.rc"
+		"${KYTY_SOURCE_DIR}/sysboot/kyty_sysboot.manifest"
+	)
+	target_include_directories(kyty_sysboot PRIVATE ${inc_headers})
+	target_link_libraries(kyty_sysboot nlohmann_json::nlohmann_json ws2_32 bcrypt ole32 uuid shell32 comdlg32)
+	install(TARGETS kyty_sysboot DESTINATION .)
 endif()

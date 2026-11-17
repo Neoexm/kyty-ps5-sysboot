@@ -20,17 +20,22 @@ git lfs pull
 
 If you already cloned without LFS, run `git lfs install` and then `git lfs pull` inside the repo.
 
+### Prebuilt exe
+
+Every push is built by GitHub Actions. To get the build without compiling, open the repo's **Actions** tab, pick the latest green **Build kyty-ps5-sysboot** run, and download the `kyty-ps5-sysboot-windows-x64` artifact at the bottom of the page. You have to be signed in to GitHub to download artifacts, and GitHub deletes them after 90 days.
+
+The zip has `kyty_sysboot.exe`, `kyty_emulator.exe`, `libwinpthread-1.dll` and the license files. It doesn't have the firmware, so you still need the LFS clone above. Extract it anywhere and point Preferences at the clone (see [Booting](#booting)), or extract it inside the clone and it finds the clone itself.
+
 ## Layout
 
-The boot reads `firmware/` and `kyty.ini`, and writes each run's output to `evidence/`.
+| Path | What it is |
+| --- | --- |
+| `firmware/` | Every file the boot reads, committed with LFS. Layout below. |
+| `scripts/boot_profile.json` | The environment variables the emulator boots with. |
+| `src/sysboot/` | `kyty_sysboot.exe`, the Boot sys front end. |
+| `scripts/start_kyty_ps5.py` | The older script launcher behind `start.bat`. |
 
-| Path | Git | What it is |
-| --- | --- | --- |
-| `firmware/` | committed (LFS) | Every file the boot reads. Layout below. |
-| `kyty.ini` | ignored | Your local settings. Copy from `kyty.example.ini`. |
-| `evidence/` | ignored | Run folders, plus research material the boot never touches. |
-
-`scripts/boot_profile.json` is the committed list of environment variables the emulator boots with. Paths in it are written as `{firmware}/...`, and the launcher replaces that with the `firmware` path from `kyty.ini`. Before starting, the launcher checks that every path it names exists.
+Paths in `boot_profile.json` are written as `{firmware}/...`, and both launchers replace that with the real `firmware/` folder. Before starting, they check that every path it names exists.
 
 ### firmware/
 
@@ -46,36 +51,7 @@ firmware/
   manifests/   captured_storage_manifest.json and system_ex_decrypted_overlay.manifest
 ```
 
-Both manifests are hash-pinned in `boot_profile.json`. Change a manifest or anything it lists and the emulator won't start until the pins in the profile are updated. The overlay manifest uses paths relative to itself, so you can move the whole `firmware/` folder anywhere. Point `kyty.ini` at the new location.
-
-### evidence/
-
-All non-boot material lives here:
-
-- `evidence/runs/manual_boots/<timestamp>/` holds one folder per launcher run, containing `boot.json`, `host_console.log`, `error_report.log`, and per-process logs.
-- `evidence/firmware/` holds firmware files the boot doesn't read: the PUP and its unpack, rollback research, and the kernel dump.
-- `evidence/ida/` holds IDA databases, kept out of `firmware/` so they don't show up in guest directory listings.
-- `evidence/ps5_remote/` holds the PC-side tooling for live work on a jailbroken console, plus the native traces captured with it.
-- `evidence/KernelRecovery_13.60/` holds the checkpoint history and diagnostic harnesses from bring-up.
-
-## Configuration
-
-```bat
-copy kyty.example.ini kyty.ini
-```
-
-| Section | Key | Meaning |
-| --- | --- | --- |
-| `paths` | `firmware` | The `firmware/` folder. Relative paths resolve from the repo root. |
-| `paths` | `evidence` | Where run folders go. |
-| `paths` | `emulator` | The built `kyty_emulator.exe`. |
-| `provider` | `token_file` | Path to the console provider's HMAC token file. Required. |
-| `provider` | `port` | Loopback port of the provider (default 9038). |
-| `provider` | `timeout_ms` | Per-request timeout. 100 to 300000. |
-| `boot` | `readbacks` | `yes` dumps presented frames to `<run>/present` every 200 ms. |
-| `boot` | `show_services` | `yes` gives every spawned service its own window, not just the main display window. |
-
-`--readbacks` and `--show-services` on the command line turn the same options on for one run.
+Both manifests are hash-pinned in `boot_profile.json`. Change a manifest or anything it lists and the emulator won't start until the pins in the profile are updated. The overlay manifest uses paths relative to itself, so you can move the whole `firmware/` folder anywhere. For `start.bat`, point `paths.firmware` in `kyty.ini` at the new location. `kyty_sysboot.exe` always uses the `firmware/` folder inside its repository folder.
 
 ## The console provider
 
@@ -86,12 +62,12 @@ Some of what the firmware does can only be done by real PS5 hardware. Two operat
 
 The emulator doesn't do these itself. It sends each request to a provider on `127.0.0.1:<port>`, signed with an HMAC keyed by the token file. The provider passes it to a jailbroken PS5 on the same firmware and hands back whatever the console says. If the provider is down the request just fails, and the firmware has to deal with that like it would on hardware.
 
-There is also an offline envelope backend for diagnostics. To use it, set `KYTY_PS5_ENVELOPE_BACKEND=local`, `KYTY_DIAGNOSTIC_ENVELOPE_LOCAL=1` and a `KYTY_PS5_ENVELOPE_LOCAL_KEYTABLE`. The log then shows `offline=1`. The launcher never turns it on.
+There is also an offline envelope backend for diagnostics. To use it, set `KYTY_PS5_ENVELOPE_BACKEND=local`, `KYTY_DIAGNOSTIC_ENVELOPE_LOCAL=1` and a `KYTY_PS5_ENVELOPE_LOCAL_KEYTABLE`. The log then shows `offline=1`. Neither launcher turns it on.
 
-The provider is part of the separate PS5 bridge project, not this repo. To set it up:
+`kyty_sysboot.exe` runs the provider itself and talks straight to the ps5-mcp payload on the console, so all it needs is the console's address and the payload's owner token file. `start.bat` instead expects the provider from the separate PS5 bridge project, which isn't in this repo. To set that up:
 
 - Start the bridge with `scripts/supervise.py --start-bridge` from that project. The console must be on and reachable, with the bridge's payloads loaded.
-- Create or rotate the token with `scripts/provision-envelope-provider.py --rotate`. Set `token_file` in `kyty.ini` to the file it writes. Rotate it at least once a day, the run scripts won't take a token older than 24 hours. After rotating, restart only the bridge child process; the supervisor brings it back.
+- Create or rotate the provider token with `scripts/provision-envelope-provider.py --rotate`. Set `token_file` in `kyty.ini` to the file it writes. Rotate it at least once a day, the run scripts won't take a token older than 24 hours. After rotating, restart only the bridge child process; the supervisor brings it back.
 - Never paste the token anywhere. Pass the file path only.
 
 If provider requests in a run fail with `transport_error`, the console just wasn't reachable, so that run tells you nothing about the firmware. Don't bother comparing it against other runs.
@@ -116,12 +92,12 @@ cmake -S . -B _Build/vsh -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo `
   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
   -DCMAKE_LINKER=lld-link -DCMAKE_AR=llvm-lib `
   -DKYTY_BUILD_LAUNCHER=OFF -DBUILD_TESTING=ON
-ninja -C _Build/vsh kyty_emulator.exe
+ninja -C _Build/vsh kyty_emulator.exe kyty_sysboot.exe
 ```
 
 The first configure downloads FFmpeg, opus, xbyak, zydis, zstd and ZArchive. To configure offline afterwards, pass `-DFETCHCONTENT_FULLY_DISCONNECTED=ON` plus `-DFETCHCONTENT_SOURCE_DIR_<NAME>=_Build/vsh/_deps/<name>-src` for each dependency.
 
-The build copies `libwinpthread-1.dll` next to the exe; the launcher needs it there.
+Both exes end up in `_Build/vsh`. The build copies `libwinpthread-1.dll` next to them; the emulator needs it there. `cmake --install _Build/vsh --prefix <dir>` copies the exes, the DLL and the license files to one folder, which is what the Actions artifact is.
 
 A CMake build tree can't be moved. If you move the repo, delete `_Build/vsh/CMakeCache.txt` and `CMakeFiles/` and configure again.
 
@@ -132,22 +108,47 @@ ninja -C _Build/vsh kyty_tests
 ctest --test-dir _Build/vsh --output-on-failure
 ```
 
-## Running
+## Booting
 
-```bat
-start.bat
-```
+What you need:
 
-`start.bat` runs `scripts/start_kyty_ps5.py`, which does the following:
+- The LFS clone of this repo (the firmware).
+- A jailbroken PS5 on 13.60, on the same network, running the ps5-mcp payload. The payload is part of the separate PS5 bridge project and isn't published here.
+- The payload's owner token file. The bridge keeps it in `.state/native.json`; a file holding only the token also works.
 
-1. Reads `kyty.ini` and `boot_profile.json`, then checks that the emulator, the token file and every firmware path exist.
-2. Opens one host window. The firmware's video output is presented there.
-3. Starts `kyty_emulator.exe` with `mini-syscore.elf` as the entry ELF and `firmware/decrypted` as the sysroot. All processes the firmware spawns run in one job object.
-4. Writes the run folder: `boot.json` records the binary, the firmware root and the profile hash; logs stream into the folder while the run goes.
+Run `kyty_sysboot.exe`, then:
 
-Closing the window or pressing Ctrl+C ends the run (exit code 130).
+1. **File > Preferences.** Enter the PS5's IP address and choose the token file. The payload port defaults to 9035. Leave the repository folder blank if the exe is inside the clone (it searches upwards from its own folder); otherwise browse to the clone. Settings are saved in `kyty_sysboot.ini` next to the exe.
+2. **File > Boot sys.**
+
+Boot sys first checks the firmware files and then asks the payload for its health record. If no IP is set, the firmware is missing or still LFS pointers, the console can't be reached, or the payload rejects the token, it stops and shows an error popup saying which one. Nothing is started in that case.
+
+Once the console answers, it starts `kyty_emulator.exe` with `mini-syscore.elf` as the entry ELF and `firmware/decrypted` as the sysroot. The firmware's video output is shown in the main window, and every process the firmware spawns runs in one job object. **File > Stop sys** or closing the window ends the boot. **View > Log** shows progress and any guest errors; the log window opens on its own when the firmware reports an error. If the emulator crashes, you get a popup with the exit code.
+
+Each boot gets a folder under `runs/` next to the exe. `boot.json` records the binary, the firmware root and the profile hash, and `kyty.log`, `host_console.log` and `error_report.log` stream into the folder while the run goes.
 
 The first boot after you build a new binary or move `firmware/` misses the startup metadata cache in `runtime/cache` and is slower. Later boots reuse the cache.
+
+### start.bat
+
+`start.bat` runs `scripts/start_kyty_ps5.py`, which does the same boot through the bridge's provider instead of the payload directly. It reads `kyty.ini`:
+
+```bat
+copy kyty.example.ini kyty.ini
+```
+
+| Section | Key | Meaning |
+| --- | --- | --- |
+| `paths` | `firmware` | The `firmware/` folder. Relative paths resolve from the repo root. |
+| `paths` | `evidence` | Local folder its run folders go under, as `<evidence>/runs/manual_boots/`. Git-ignored. |
+| `paths` | `emulator` | The built `kyty_emulator.exe`. |
+| `provider` | `token_file` | Path to the bridge provider's HMAC token file. Required. |
+| `provider` | `port` | Loopback port of the provider (default 9038). |
+| `provider` | `timeout_ms` | Per-request timeout. 100 to 300000. |
+| `boot` | `readbacks` | `yes` dumps presented frames to `<run>/present` every 200 ms. |
+| `boot` | `show_services` | `yes` gives every spawned service its own window, not just the main display window. |
+
+`--readbacks` and `--show-services` on the command line turn the same options on for one run. Closing the window or pressing Ctrl+C ends the run (exit code 130). Readbacks and service windows are also in `kyty_sysboot.exe`'s Preferences.
 
 ## Sending changes
 
