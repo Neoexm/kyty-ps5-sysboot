@@ -224,13 +224,28 @@ void CheckSemaphoreCrossHost() {
   Check(CloseHandle(job), "release semaphore subprocess containment");
 
   set_scope(scope + "x");
-  for (unsigned i = 0; i < 128; ++i) {
+  Sema::KernelSema stale = nullptr;
+  Check(Sema::KernelCreateSema(&stale, "SemaBound", 0x101, 0, 1, nullptr) == OK &&
+        Sema::KernelOpenSema(&missing, "SemaBound") == OK, "open a semaphore before it is deleted");
+  Check(Sema::KernelDeleteSema(stale) == OK, "delete the opened semaphore");
+  for (unsigned i = 0; i < 1100; ++i) {
     Sema::KernelSema bound = nullptr;
     Check(Sema::KernelCreateSema(&bound, "SemaBound", 0x101, 0, 1, nullptr) == OK &&
-          Sema::KernelDeleteSema(bound) == OK, "consume a bounded scoped generation");
+          Sema::KernelDeleteSema(bound) == OK, "deleted rows are reused past the table size");
   }
-  Check(Sema::KernelCreateSema(&missing, "SemaBound", 0x101, 0, 1, nullptr) == KERNEL_ERROR_ENOSPC,
-        "scoped generation exhaustion returns a resource error");
+  Check(Sema::KernelSignalSema(missing, 1) == KERNEL_ERROR_EINVAL &&
+        Sema::KernelCloseSema(missing) == OK, "stale opener cannot reach a reused row");
+  std::vector<Sema::KernelSema> live;
+  for (unsigned i = 0; i < 1024; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof(name), "SemaBound%u", i);
+    Sema::KernelSema bound = nullptr;
+    Check(Sema::KernelCreateSema(&bound, name, 0x101, 0, 1, nullptr) == OK, "fill the scoped table");
+    live.push_back(bound);
+  }
+  Check(Sema::KernelCreateSema(&missing, "SemaBoundFull", 0x101, 0, 1, nullptr) == KERNEL_ERROR_ENOSPC,
+        "scoped table exhaustion returns a resource error");
+  for (auto bound: live) Check(Sema::KernelDeleteSema(bound) == OK, "release the scoped table");
 
   for (size_t i = 0; i < saved.size(); ++i)
     Check(_putenv_s(keys[i], saved[i].c_str()) == 0, "restore semaphore scope environment");

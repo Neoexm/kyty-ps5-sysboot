@@ -15,6 +15,7 @@
 #include "kernel/execProcess.h"
 #include "kernel/fileSystem.h"
 #include "kernel/ipmiManager.h"
+#include "kernel/nullfsMount.h"
 #include "kernel/memory.h"
 #include "kernel/process.h"
 #include "kernel/pthread.h"
@@ -180,8 +181,12 @@ static NativeModuleSource OpenNativeModuleSource(const std::string& guest_path) 
 	const char*       native_alias_label = guest_path.ends_with(".dll.sprx")
 	                                           ? "PSM_NATIVE_AOT_LOADER_ALIAS"
 	                                           : "PSM_NATIVE_MODULE_LOADER_ALIAS";
-	const std::string canonical_guest_path =
+	std::string canonical_guest_path =
 	    mscorlib_alias ? "/system_ex/common_ex/lib/mscorlib.dll.sprx" : native_aot_guest_path;
+	// sandboxed daemons load /<word>/common/lib/..., a nullfs view of /system the provider never sees
+	LibKernel::NullfsMount::Resolution mounted;
+	if (LibKernel::NullfsMount::Resolve(canonical_guest_path, &mounted) == OK && mounted.mounted)
+		canonical_guest_path = std::move(mounted.path);
 	source.file_name = LibKernel::FileSystem::GetRealFilename(canonical_guest_path);
 	if (!source.file_name.empty()) {
 		source.result =

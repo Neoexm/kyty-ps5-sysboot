@@ -48,8 +48,9 @@ constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
 // Cross-process named semaphores, like the event-flag table in eventFlag.cpp. Keyed on
 // Process::GetScope() so SysCore and ShellCore share one SceSysCoreEventSemaphore count.
 struct ScopeSemaphores {
-	static constexpr uint32_t MaxSemas   = 128;
+	static constexpr uint32_t MaxSemas   = 1024;
 	static constexpr uint32_t MaxWaiters = 64;
+	static constexpr uint32_t MaxHolders = 8;
 	static constexpr uint64_t Signature  = 0x324d45535954594bull;
 
 	struct Sema {
@@ -65,6 +66,10 @@ struct ScopeSemaphores {
 		int32_t  init_count;
 		int32_t  max_count;
 		uint64_t waiters;
+		// Peer processes that opened the name; an unlinked row stays pinned while any of them lives.
+		uint32_t holders[MaxHolders];
+		uint64_t holder_births[MaxHolders];
+		bool     holders_overflowed;
 	};
 
 	uint64_t signature;
@@ -189,15 +194,18 @@ uint64_t ProcessBirth(HANDLE process) {
 	return (uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime;
 }
 
-bool CreatorAlive(const ScopeSemaphores::Sema& sema) {
-	HANDLE process =
-	    OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, sema.creator);
+bool Alive(uint32_t pid, uint64_t expected_birth) {
+	HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 	if (process == nullptr) return GetLastError() != ERROR_INVALID_PARAMETER;
 	const DWORD    status = WaitForSingleObject(process, 0);
 	const uint64_t birth  = ProcessBirth(process);
-	const bool     alive  = status != WAIT_OBJECT_0 && (birth == 0 || birth == sema.creator_birth);
+	const bool     alive  = status != WAIT_OBJECT_0 && (birth == 0 || birth == expected_birth);
 	CloseHandle(process);
 	return alive;
+}
+
+bool CreatorAlive(const ScopeSemaphores::Sema& sema) {
+	return Alive(sema.creator, sema.creator_birth);
 }
 
 std::string WakeName(const ScopeSemaphoreContext& scope, const ScopeSemaphores::Sema& sema,
@@ -205,7 +213,7 @@ std::string WakeName(const ScopeSemaphoreContext& scope, const ScopeSemaphores::
 	return scope.name + "_g" + std::to_string(sema.generation) + "_w" + std::to_string(waiter);
 }
 
-int Wake(ScopeSemaphoreContext& scope, ScopeSemaphores::Sema& sema) {
+int Wake(ScopeSemaphoreContext& scope, ScopeSemaphores::Sema& sema, bool signal = true) {
 	int count = 0;
 	for (uint32_t waiter = 0; waiter < ScopeSemaphores::MaxWaiters; ++waiter) {
 		if ((sema.waiters & (1ull << waiter)) == 0) continue;
@@ -214,11 +222,39 @@ int Wake(ScopeSemaphoreContext& scope, ScopeSemaphores::Sema& sema) {
 			sema.waiters &= ~(1ull << waiter);
 			continue;
 		}
-		SetEvent(event);
+		if (signal) SetEvent(event);
 		CloseHandle(event);
 		++count;
 	}
 	return count;
+}
+
+void AddHolder(ScopeSemaphores::Sema& sema, uint32_t pid, uint64_t birth) {
+	if (pid == sema.creator && birth == sema.creator_birth) return;
+	for (uint32_t i = 0; i < ScopeSemaphores::MaxHolders; ++i) {
+		if (sema.holders[i] == pid && sema.holder_births[i] == birth) return;
+	}
+	for (uint32_t i = 0; i < ScopeSemaphores::MaxHolders; ++i) {
+		if (sema.holders[i] != 0 && Alive(sema.holders[i], sema.holder_births[i])) continue;
+		sema.holders[i]       = pid;
+		sema.holder_births[i] = birth;
+		return;
+	}
+	sema.holders_overflowed = true;
+}
+
+// Same rule as the event-flag table: a deleted row is dead to every handle once generations differ, an orphaned one waits for its openers.
+bool Reclaimable(ScopeSemaphoreContext& scope, ScopeSemaphores::Sema& sema) {
+	if (sema.generation == 0) return true;
+	if (sema.linked) return false;
+	Wake(scope, sema, false);
+	if (sema.waiters != 0) return false;
+	if (sema.deleted) return true;
+	if (sema.holders_overflowed) return false;
+	for (uint32_t i = 0; i < ScopeSemaphores::MaxHolders; ++i) {
+		if (sema.holders[i] != 0 && Alive(sema.holders[i], sema.holder_births[i])) return false;
+	}
+	return true;
 }
 
 void UnlinkDeadCreators(ScopeSemaphoreContext& scope) {
@@ -244,7 +280,7 @@ int GetScopeContext(std::shared_ptr<ScopeSemaphoreContext>* output) {
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	auto context   = std::make_shared<ScopeSemaphoreContext>();
-	context->name  = "Local\\kyty_ps5_" + scope + "_sema_v2";
+	context->name  = "Local\\kyty_ps5_" + scope + "_sema_v3";
 	context->mutex = CreateMutexA(nullptr, FALSE, (context->name + "_lock").c_str());
 	if (context->mutex == nullptr) return KERNEL_ERROR_EIO;
 	ScopeLock lock(context.get());
@@ -279,20 +315,27 @@ int Attach(KernelSemaPrivate& sema, bool create, int init = 0, int max = 0, bool
 	ScopeLock lock(sema.scope.get());
 	if (!lock.locked) return KERNEL_ERROR_EIO;
 	UnlinkDeadCreators(*sema.scope);
-	ScopeSemaphores::Sema* empty = nullptr;
+	const uint64_t birth = ProcessBirth(GetCurrentProcess());
+	if (birth == 0) return KERNEL_ERROR_EIO;
 	for (auto& candidate: sema.scope->table->semas) {
-		if (candidate.generation == 0 && empty == nullptr) empty = &candidate;
 		if (!candidate.linked || sema.GetName() != candidate.name) continue;
 		if (create) return KERNEL_ERROR_EEXIST;
+		AddHolder(candidate, GetCurrentProcessId(), birth);
 		sema.shared     = &candidate;
 		sema.generation = candidate.generation;
 		return OK;
 	}
 	if (!create) return KERNEL_ERROR_ENOENT;
+	ScopeSemaphores::Sema* empty = nullptr;
+	for (auto& candidate: sema.scope->table->semas) {
+		if (Reclaimable(*sema.scope, candidate)) {
+			empty = &candidate;
+			break;
+		}
+	}
 	if (empty == nullptr || sema.scope->table->next_generation == UINT64_MAX)
 		return KERNEL_ERROR_ENOSPC;
-	const uint64_t birth = ProcessBirth(GetCurrentProcess());
-	if (birth == 0) return KERNEL_ERROR_EIO;
+	*empty = {};
 	std::strcpy(empty->name, sema.GetName().c_str());
 	empty->generation    = sema.scope->table->next_generation++;
 	empty->creator       = GetCurrentProcessId();
@@ -317,7 +360,8 @@ bool NameLinked(KernelSemaPrivate& sema) {
 		ScopeLock lock(sema.scope.get());
 		if (!lock.locked) return false;
 		UnlinkDeadCreators(*sema.scope);
-		return sema.shared->linked && !sema.shared->deleted;
+		return sema.shared->generation == sema.generation && sema.shared->linked &&
+		       !sema.shared->deleted;
 	}
 #endif
 	return true;
@@ -342,6 +386,7 @@ void KernelSemaPrivate::Delete() {
 	if (shared != nullptr) {
 		ScopeLock lock(scope.get());
 		if (!lock.locked) return;
+		if (shared->generation != generation) return;
 		shared->deleted = true;
 		shared->linked  = false;
 		Wake(*scope, *shared);
@@ -367,6 +412,7 @@ int KernelSemaPrivate::WaitingCount() {
 	if (shared != nullptr) {
 		ScopeLock lock(scope.get());
 		if (!lock.locked) return 0;
+		if (shared->generation != generation) return 0;
 		return CountWaiters(shared->waiters);
 	}
 #endif
@@ -382,7 +428,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 		ScopeLock lock(scope.get());
 		if (!lock.locked) return Result::Deleted;
 		if (set_count > shared->max_count) return Result::InvalCount;
-		if (shared->deleted) return Result::Deleted;
+		if (shared->generation != generation || shared->deleted) return Result::Deleted;
 		if (num_waiting_threads != nullptr) *num_waiting_threads = CountWaiters(shared->waiters);
 		shared->count = (set_count < 0 ? shared->init_count : set_count);
 		++shared->canceled;
@@ -425,7 +471,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	if (shared != nullptr) {
 		ScopeLock lock(scope.get());
 		if (!lock.locked) return Result::Deleted;
-		if (shared->deleted) return Result::Deleted;
+		if (shared->generation != generation || shared->deleted) return Result::Deleted;
 		if (signal_count < 0 || signal_count > shared->max_count - shared->count)
 			return Result::InvalCount;
 		shared->count += signal_count;
@@ -496,13 +542,13 @@ KernelSemaPrivate::Result KernelSemaPrivate::WaitShared(int need_count, uint32_t
 	ScopeLock lock(scope.get());
 	if (!lock.locked) return Result::Deleted;
 	if (need_count < 1 || need_count > shared->max_count) return Result::InvalCount;
-	if (shared->deleted) return Result::Deleted;
+	if (shared->generation != generation || shared->deleted) return Result::Deleted;
 
 	const uint32_t serial = shared->canceled;
 	Result         status = Result::TimedOut;
 
 	for (;;) {
-		if (shared->deleted) {
+		if (shared->generation != generation || shared->deleted) {
 			status = Result::Deleted;
 			break;
 		}
