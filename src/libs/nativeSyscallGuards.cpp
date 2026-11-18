@@ -70,6 +70,17 @@ int KYTY_SYSV_ABI KernelSetBudget(int id) {
 	return 0;
 }
 
+// libkernel_sys 0x447c0: raw 652 retried on EINTR, then 0x80020000|errno
+static int KYTY_SYSV_ABI KernelTerminateProcess(int pid, int* status) {
+	const auto reply = NativeKernelBridge::DispatchSyscall(
+	    {0x28c, {static_cast<uint64_t>(static_cast<int64_t>(pid)), reinterpret_cast<uint64_t>(status)}});
+	if (reply.value < 0) {
+		*Posix::GetErrorAddr() = LibKernel::KernelToPosix(static_cast<int>(reply.value));
+		return static_cast<int>(reply.value);
+	}
+	return 0;
+}
+
 static int KYTY_SYSV_ABI GetSelfAuthInfo(const char* path, void* output) {
 	const auto reply = NativeKernelBridge::DispatchSyscall(
 	    {0x25f, {reinterpret_cast<uint64_t>(path), reinterpret_cast<uint64_t>(output)}});
@@ -382,6 +393,7 @@ LIB_DEFINE(Register) {
 	}
 	LIB_FUNC("OX9wtyjVAJY", KernelGetBudget);
 	LIB_FUNC("nzuKTmqQFXY", KernelSetBudget);
+	LIB_FUNC("VinlCA8Vkg8", KernelTerminateProcess);
 	LIB_FUNC("7KuwdAt0kQQ", Unsupported<0x23d>);
 	// app spawn trampoline pre-execve sandbox wrappers; the daemon trampoline doesn't call them
 	LIB_FUNC("ASVb7Y-pR4Y", AppSandboxPath);    // 600 sys_sandbox_path

@@ -1458,6 +1458,32 @@ void ReleaseCommittedExecChild(int pid) {
 #endif
 }
 
+int KillCommittedExecChild(int pid) {
+#if defined(_WIN32)
+	std::shared_ptr<HostImage> image;
+	{
+		std::lock_guard lock(g_images_mutex);
+		const auto      found = g_images.find(pid);
+		if (found == g_images.end() || !found->second->committed) return KERNEL_ERROR_ESRCH;
+		image = found->second;
+	}
+	// A guest that already reached exit keeps its own status; otherwise the monitor reports a plain SIGKILL termination (wait status 9) like psignal(p, SIGKILL) in sys_process_terminate.
+	if (InterlockedCompareExchange(&image->shared->guest_exit_known, 0, 0) == 0) {
+		image->shared->guest_wait_status = 9;
+		InterlockedExchange(&image->shared->guest_exit_known, 1);
+	}
+	const BOOL  killed = TerminateProcess(image->process, 9);
+	const DWORD error  = killed ? 0 : GetLastError();
+	LOGF("GUEST_EXEC_TERMINATE guest_pid=%d host_pid=%lu killed=%d error=%lu\n", pid,
+	     image->shared->child_host_pid, killed ? 1 : 0, error);
+	// ERROR_ACCESS_DENIED here is the host process having exited already; the monitor still reports it
+	if (!killed && WaitForSingleObject(image->process, 0) != WAIT_OBJECT_0) return KERNEL_ERROR_EPERM;
+	return 0;
+#else
+	return KERNEL_ERROR_ENOSYS;
+#endif
+}
+
 int ExecImage(const std::string& guest_path, const std::filesystem::path& host_path,
               const std::vector<std::string>& argv, const std::vector<std::string>& envp,
               const std::filesystem::path& app0_dir, const std::string& app0_elf) {

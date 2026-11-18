@@ -39,6 +39,7 @@ std::string GetExecChildSandboxWord();
 void        SignalExecChildImageCommitted(uint64_t entry);
 bool        AwaitExecChildCommit(uint64_t entry, uint64_t stack, uint64_t params);
 void        ReleaseCommittedExecChild(int pid);
+int         KillCommittedExecChild(int pid);
 void        RecordExecChildExitStatus(uint32_t wait_status);
 void        RecordExecChildRebootOptions(uint64_t options, uint32_t kind, uint32_t exit_code);
 inline void ClassifyMiniSyscoreRebootOptions(uint64_t options, uint32_t* kind,

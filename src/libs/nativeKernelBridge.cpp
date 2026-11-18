@@ -1280,6 +1280,48 @@ Reply AppMountEnd(const SyscallRequest& request) {
 	return BudgetReply(result, 0);
 }
 
+// 652 {pid, &status}. 13.60 sys_process_terminate (0x9efd9510) psignals SIGKILL, reaps through kern_wait6 and copies the wait status out; a target that is not the caller's child reads back 9.
+Reply ProcessTerminate(const SyscallRequest& request) {
+	namespace Process = LibKernel::Process;
+	const int pid    = static_cast<int32_t>(request.args[0]);
+	auto*     status = reinterpret_cast<int32_t*>(request.args[1]);
+	if (!Process::IsTrackedRforkChild(pid)) {
+		const char* source   = nullptr;
+		uint32_t    host_pid = 0;
+		const int   exists   = Process::QueryGuestProcessExists(pid, &source, &host_pid);
+		LOGF("PROCESS_TERMINATE_UNMODELED caller_pid=%d pid=%d source=%s host_pid=%u exists=0x%08x\n",
+		     Process::GetPid(), pid, source, host_pid, static_cast<uint32_t>(exists));
+		return BudgetReply(exists == LibKernel::KERNEL_ERROR_ESRCH ? Libs::Posix::POSIX_ESRCH
+		                                                           : Libs::Posix::POSIX_ENOSYS,
+		                   0);
+	}
+	uint32_t wait_status = 0;
+	if (!Process::GetRforkChildExitStatus(pid, &wait_status)) {
+		if (!Process::IsRforkChildExecCommitted(pid)) {
+			// rfork children before execve are guest threads of this host process
+			LOGF("PROCESS_TERMINATE_UNMODELED caller_pid=%d pid=%d source=rfork_thread\n",
+			     Process::GetPid(), pid);
+			return BudgetReply(Libs::Posix::POSIX_ENOSYS, 0);
+		}
+		const int killed = Process::KillCommittedExecChild(pid);
+		// ESRCH: the monitor already dropped the image, so the exit is recorded and only the reap is left
+		if (killed != 0 && killed != LibKernel::KERNEL_ERROR_ESRCH)
+			return BudgetReply(LibKernel::KernelToPosix(killed), 0);
+	}
+	const int reaped = Process::WaitForChild(pid, &wait_status, 0);
+	if (reaped == LibKernel::KERNEL_ERROR_ECHILD) {
+		wait_status = 9;
+	} else if (reaped < 0) {
+		return BudgetReply(LibKernel::KernelToPosix(reaped), 0);
+	}
+	LOGF("PROCESS_TERMINATE caller_pid=%d pid=%d reaped=%d wait_status=0x%08x\n", Process::GetPid(),
+	     pid, reaped, wait_status);
+	return BudgetReply(WriteSysctlMemory(status, &wait_status, sizeof(wait_status))
+	                       ? 0
+	                       : Libs::Posix::POSIX_EFAULT,
+	                   0);
+}
+
 Reply SysctlPageSize(const SyscallRequest& request) {
 	// sysconf(47): sysctl {9,20}, read back as a signed int
 	const uint32_t count = static_cast<uint32_t>(request.args[1]);
@@ -6054,6 +6096,7 @@ Reply DispatchSyscall(const SyscallRequest& request) {
 		case 0x239: result = BudgetDelete(request); break;
 		case 0x23a: result = BudgetGetResourceLimit(request); break;
 		case 0x23b: result = BudgetSet(request); break;
+		case 0x28c: result = ProcessTerminate(request); break;
 		case 0x261: result = BudgetGet(request); break;
 		case 0x2c2: result = AppMountBegin(request); break;
 		case 0x2c3: result = AppMountEnd(request); break;
