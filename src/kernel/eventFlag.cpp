@@ -32,8 +32,9 @@ namespace Libs::LibKernel::EventFlag {
 LIB_NAME("libkernel", "libkernel");
 
 struct ScopeEventFlags {
-	static constexpr uint32_t MaxFlags   = 128;
+	static constexpr uint32_t MaxFlags   = 1024;
 	static constexpr uint32_t MaxWaiters = 64;
+	static constexpr uint32_t MaxHolders = 8;
 	static constexpr uint64_t Signature  = 0x325646455954594bull;
 
 	struct Flag {
@@ -47,6 +48,10 @@ struct ScopeEventFlags {
 		uint32_t canceled;
 		uint64_t bits;
 		uint64_t waiters;
+		// Peer processes that opened the name; an unlinked row stays pinned while any of them lives.
+		uint32_t holders[MaxHolders];
+		uint64_t holder_births[MaxHolders];
+		bool     holders_overflowed;
 	};
 
 	uint64_t signature;
@@ -161,9 +166,8 @@ struct CreatorLiveness {
 	bool known;
 };
 
-CreatorLiveness QueryCreatorLiveness(const ScopeEventFlags::Flag& flag) {
-	HANDLE process =
-	    OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, flag.creator);
+CreatorLiveness QueryLiveness(uint32_t pid, uint64_t expected_birth) {
+	HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 	if (process == nullptr) {
 		return GetLastError() == ERROR_INVALID_PARAMETER ? CreatorLiveness {false, true}
 		                                                 : CreatorLiveness {true, false};
@@ -171,10 +175,13 @@ CreatorLiveness QueryCreatorLiveness(const ScopeEventFlags::Flag& flag) {
 	const DWORD    status = WaitForSingleObject(process, 0);
 	const uint64_t birth  = ProcessBirth(process);
 	CloseHandle(process);
-	if (status == WAIT_OBJECT_0 || (birth != 0 && birth != flag.creator_birth))
-		return {false, true};
+	if (status == WAIT_OBJECT_0 || (birth != 0 && birth != expected_birth)) return {false, true};
 	if (status == WAIT_TIMEOUT && birth != 0) return {true, true};
 	return {true, false};
+}
+
+CreatorLiveness QueryCreatorLiveness(const ScopeEventFlags::Flag& flag) {
+	return QueryLiveness(flag.creator, flag.creator_birth);
 }
 
 bool CreatorAlive(const ScopeEventFlags::Flag& flag) {
@@ -200,6 +207,37 @@ int Wake(ScopeEventFlagContext& scope, ScopeEventFlags::Flag& flag, bool signal 
 		++count;
 	}
 	return count;
+}
+
+void AddHolder(ScopeEventFlags::Flag& flag, uint32_t pid, uint64_t birth) {
+	if (pid == flag.creator && birth == flag.creator_birth) return;
+	for (uint32_t i = 0; i < ScopeEventFlags::MaxHolders; ++i) {
+		if (flag.holders[i] == pid && flag.holder_births[i] == birth) return;
+	}
+	for (uint32_t i = 0; i < ScopeEventFlags::MaxHolders; ++i) {
+		if (flag.holders[i] != 0 && QueryLiveness(flag.holders[i], flag.holder_births[i]).alive)
+			continue;
+		flag.holders[i]       = pid;
+		flag.holder_births[i] = birth;
+		return;
+	}
+	flag.holders_overflowed = true;
+}
+
+// A deleted row is unreachable because every access compares generations; a row orphaned by creator exit is reusable once no recorded opener is alive.
+bool Reclaimable(ScopeEventFlagContext& scope, ScopeEventFlags::Flag& flag) {
+	if (flag.generation == 0) return true;
+	if (flag.linked) return false;
+	// A sleeper still clears its waiter bit in this row when it wakes.
+	Wake(scope, flag, false);
+	if (flag.waiters != 0) return false;
+	if (flag.deleted) return true;
+	if (flag.holders_overflowed) return false;
+	for (uint32_t i = 0; i < ScopeEventFlags::MaxHolders; ++i) {
+		if (flag.holders[i] != 0 && QueryLiveness(flag.holders[i], flag.holder_births[i]).alive)
+			return false;
+	}
+	return true;
 }
 
 void UnlinkDeadCreators(ScopeEventFlagContext& scope) {
@@ -232,7 +270,7 @@ int GetScopeContext(std::shared_ptr<ScopeEventFlagContext>* output) {
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	auto context   = std::make_shared<ScopeEventFlagContext>();
-	context->name  = "Local\\kyty_ps5_" + scope + "_evf_v2";
+	context->name  = "Local\\kyty_ps5_" + scope + "_evf_v3";
 	context->mutex = CreateMutexA(nullptr, FALSE, (context->name + "_lock").c_str());
 	if (context->mutex == nullptr) return KERNEL_ERROR_EIO;
 	ScopeLock lock(context.get());
@@ -267,20 +305,27 @@ int Attach(KernelEventFlagState& flag, bool create, uint64_t initial = 0) {
 	ScopeLock lock(flag.scope.get());
 	if (!lock.locked) return KERNEL_ERROR_EIO;
 	UnlinkDeadCreators(*flag.scope);
-	ScopeEventFlags::Flag* empty = nullptr;
+	const uint64_t birth = ProcessBirth(GetCurrentProcess());
+	if (birth == 0) return KERNEL_ERROR_EIO;
 	for (auto& candidate: flag.scope->table->flags) {
-		if (candidate.generation == 0 && empty == nullptr) empty = &candidate;
 		if (!candidate.linked || flag.name != candidate.name) continue;
 		if (create) return KERNEL_ERROR_EEXIST;
+		AddHolder(candidate, GetCurrentProcessId(), birth);
 		flag.shared     = &candidate;
 		flag.generation = candidate.generation;
 		return OK;
 	}
 	if (!create) return KERNEL_ERROR_ENOENT;
+	ScopeEventFlags::Flag* empty = nullptr;
+	for (auto& candidate: flag.scope->table->flags) {
+		if (Reclaimable(*flag.scope, candidate)) {
+			empty = &candidate;
+			break;
+		}
+	}
 	if (empty == nullptr || flag.scope->table->next_generation == UINT64_MAX)
 		return KERNEL_ERROR_ENOSPC;
-	const uint64_t birth = ProcessBirth(GetCurrentProcess());
-	if (birth == 0) return KERNEL_ERROR_EIO;
+	*empty = {};
 	std::strcpy(empty->name, flag.name.c_str());
 	empty->generation    = flag.scope->table->next_generation++;
 	empty->creator       = GetCurrentProcessId();
@@ -311,7 +356,8 @@ bool NameLinked(KernelEventFlagState& flag) {
 		ScopeLock lock(flag.scope.get());
 		if (!lock.locked) return false;
 		UnlinkDeadCreators(*flag.scope);
-		return flag.shared->linked && !flag.shared->deleted;
+		return flag.shared->generation == flag.generation && flag.shared->linked &&
+		       !flag.shared->deleted;
 	}
 #endif
 	return true;
@@ -447,7 +493,7 @@ int KernelEventFlagState::Change(Operation operation, uint64_t pattern, int* wai
 	if (shared != nullptr) {
 		ScopeLock lock(scope.get());
 		if (!lock.locked) return KERNEL_ERROR_EIO;
-		if (shared->deleted) return KERNEL_ERROR_EACCES;
+		if (shared->generation != generation || shared->deleted) return KERNEL_ERROR_EACCES;
 		const uint64_t before = shared->bits;
 		switch (operation) {
 			case Operation::Set: shared->bits |= pattern; break;
@@ -511,7 +557,7 @@ KernelEventFlagState::Result KernelEventFlagState::Wait(uint64_t wanted, WaitMod
 	if (shared != nullptr) {
 		ScopeLock lock(scope.get());
 		if (!lock.locked) return Result::Failed;
-		if (shared->deleted) return Result::Deleted;
+		if (shared->generation != generation || shared->deleted) return Result::Deleted;
 		Wake(*scope, *shared, false);
 		if (shared->single && shared->waiters != 0) return Result::AlreadyWaiting;
 		const uint32_t serial = shared->canceled;
@@ -548,7 +594,7 @@ KernelEventFlagState::Result KernelEventFlagState::Wait(uint64_t wanted, WaitMod
 			shared->waiters &= ~(1ull << waiter);
 			CloseHandle(event);
 			elapsed = static_cast<uint64_t>(timer.GetTimeS() * 1000000.0);
-			if (shared->deleted) {
+			if (shared->generation != generation || shared->deleted) {
 				status = Result::Deleted;
 				break;
 			}
@@ -680,7 +726,7 @@ int OpenEventFlag(KernelEventFlag* output, const char* name, bool synthetic_allo
 	if (trace != nullptr) {
 		std::string scope;
 		if (Process::GetScope(&scope)) {
-			trace->scope       = "Local\\kyty_ps5_" + scope + "_evf_v2";
+			trace->scope       = "Local\\kyty_ps5_" + scope + "_evf_v3";
 			trace->scope_state = "requested";
 		} else {
 			trace->scope       = "local";

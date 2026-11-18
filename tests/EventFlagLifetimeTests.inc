@@ -326,13 +326,28 @@ void CheckEventFlagLifetimes() {
         "creator exit unlinks name while both prior alias states retain their identities");
   Check(CloseHandle(job), "release eventflag subprocess containment");
   set_scope(scope + "x");
-  for (unsigned i = 0; i < 128; ++i) {
+  Event::KernelEventFlag stale = nullptr;
+  Check(Event::KernelCreateEventFlag(&stale, "LifetimeBound", 0x111, 1, nullptr) == OK &&
+        Event::KernelOpenEventFlag(&missing, "LifetimeBound") == OK, "open a row before it is deleted");
+  Check(Event::KernelDeleteEventFlag(stale) == OK, "delete the opened row");
+  for (unsigned i = 0; i < 1100; ++i) {
     Event::KernelEventFlag flag = nullptr;
     Check(Event::KernelCreateEventFlag(&flag, "LifetimeBound", 0x111, i, nullptr) == OK &&
-          Event::KernelDeleteEventFlag(flag) == OK, "consume a bounded scoped generation");
+          Event::KernelDeleteEventFlag(flag) == OK, "deleted rows are reused past the table size");
   }
-  Check(Event::KernelCreateEventFlag(&missing, "LifetimeBound", 0x111, 0, nullptr) ==
-        KERNEL_ERROR_ENOSPC, "scoped generation exhaustion returns a resource error");
+  Check(Event::KernelSetEventFlag(missing, 1) == KERNEL_ERROR_EACCES &&
+        Event::KernelCloseEventFlag(missing) == OK, "a handle to a reused row stays deleted");
+  std::vector<Event::KernelEventFlag> live;
+  for (unsigned i = 0; i < 1024; ++i) {
+    Event::KernelEventFlag flag = nullptr;
+    char name[32];
+    std::snprintf(name, sizeof(name), "LifetimeBound%u", i);
+    Check(Event::KernelCreateEventFlag(&flag, name, 0x111, i, nullptr) == OK, "fill the scoped table");
+    live.push_back(flag);
+  }
+  Check(Event::KernelCreateEventFlag(&missing, "LifetimeBoundFull", 0x111, 0, nullptr) ==
+        KERNEL_ERROR_ENOSPC, "scoped table exhaustion returns a resource error");
+  for (auto flag: live) Check(Event::KernelDeleteEventFlag(flag) == OK, "release the scoped table");
   for (size_t i = 0; i < saved.size(); ++i)
     Check(_putenv_s(keys[i], saved[i].c_str()) == 0, "restore eventflag lifetime environment");
   std::printf("EventFlagLifetimeTests: local/cross-host recreation, creator exit, cancel, isolation and bounds passed\n");
