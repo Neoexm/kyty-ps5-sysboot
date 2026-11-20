@@ -6,12 +6,10 @@
 #define IDM_PREFERENCES   202
 #define IDM_EXIT          203
 #define IDM_LOG           204
+#define IDM_RESET_STATE   205
 
-#define IDC_IP            300
-#define IDC_PORT          301
-#define IDC_TOKEN         302
-#define IDC_TOKEN_BROWSE  303
 #define IDC_REPO          304
 #define IDC_REPO_BROWSE   305
 #define IDC_READBACKS     306
 #define IDC_SHOW_SERVICES 307
+#define IDC_RESET_STATE   308

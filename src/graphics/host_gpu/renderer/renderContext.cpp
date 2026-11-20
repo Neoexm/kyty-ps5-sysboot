@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -157,6 +158,9 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_buffer_cache.EnsureBdaResources();
+	static const bool timing = std::getenv("KYTY_DIAGNOSTIC_GPU_SLICE_TIMING") != nullptr;
+	const auto        begin  = timing ? Common::Timer::QueryPerformanceCounter() : 0;
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		if (m_mapped_ranges_snapshot_dirty) {
@@ -171,16 +175,40 @@ void RenderContext::PrepareBda() {
 		m_buffer_cache.SynchronizeBuffersInRange(range.address, range.size);
 	}
 	m_fault_process_pending = true;
+	if (timing) {
+		static std::atomic_uint logged = 0;
+		const auto us = (Common::Timer::QueryPerformanceCounter() - begin) * 1000000 /
+		                Common::Timer::QueryPerformanceFrequency();
+		if (us >= 500 && logged.fetch_add(1) < 4000) {
+			LOGF("FIRST_FRAME_AUDIT GPU_SLICE_TIMING prepare_bda us=%" PRIu64 " ranges=%zu\n", us,
+			     m_mapped_ranges_snapshot.size());
+		}
+	}
 }
 
 void RenderContext::RunGarbageCollector() {
+	static const bool timing = std::getenv("KYTY_DIAGNOSTIC_GPU_SLICE_TIMING") != nullptr;
+	const auto        begin  = timing ? Common::Timer::QueryPerformanceCounter() : 0;
+	const bool        faults = m_fault_process_pending;
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
+	const auto mid = timing ? Common::Timer::QueryPerformanceCounter() : 0;
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+	if (timing) {
+		static std::atomic_uint logged = 0;
+		const auto freq = Common::Timer::QueryPerformanceFrequency();
+		const auto end  = Common::Timer::QueryPerformanceCounter();
+		const auto us   = (end - begin) * 1000000 / freq;
+		if (us >= 500 && logged.fetch_add(1) < 4000) {
+			LOGF("FIRST_FRAME_AUDIT GPU_SLICE_TIMING gc us=%" PRIu64 " fault_us=%" PRIu64
+			     " faults=%u\n",
+			     us, (mid - begin) * 1000000 / freq, faults ? 1u : 0u);
+		}
+	}
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {

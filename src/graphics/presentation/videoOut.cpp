@@ -1353,7 +1353,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				presented = true;
 			}
 		}
-		if (fallback_due && !presented) {
+		if (fallback_due && !presented && !m_presenter.IsHeadless()) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;

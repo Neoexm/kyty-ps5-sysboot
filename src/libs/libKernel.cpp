@@ -2517,7 +2517,9 @@ static int KYTY_SYSV_ABI KernelSetProcessProperty(const char* name, const void* 
 
 static int64_t KYTY_SYSV_ABI read(int d, void* buf, uint64_t nbytes) {
 	// PRINT_NAME();
-	if (std::getenv("KYTY_DIAGNOSTIC_PIPE_READ") != nullptr && d >= 0 && d <= 9) {
+	// getenv locks and scans the whole environment, too slow for ShellCore's byte-at-a-time copies
+	static const bool trace_pipe_read = std::getenv("KYTY_DIAGNOSTIC_PIPE_READ") != nullptr;
+	if (trace_pipe_read && d >= 0 && d <= 9) {
 		static std::atomic<uint32_t> trace_count {0};
 		if (trace_count.fetch_add(1) < 48) {
 			LOGF("PIPE_READ_TRACE caller=0x%016" PRIx64 " fd=%d buf=0x%016" PRIx64 " count=%" PRIu64
@@ -3651,6 +3653,24 @@ int KYTY_SYSV_ABI flock(int d, int operation) {
 
 int KYTY_SYSV_ABI fcntl(int d, int cmd, uint64_t arg) {
 	PRINT_NAME();
+	constexpr int f_getfd = 1;
+	constexpr int f_setfd = 2;
+	constexpr int f_getfl = 3;
+	constexpr int f_setfl = 4;
+
+	LOGF("\t fd = %d, cmd = %d\n", d, cmd);
+	if (cmd == f_getfd) {
+		return POSIX_N_CALL(LibKernel::FileSystem::GetDescriptorFlags(d));
+	}
+	if (cmd == f_setfd) {
+		return POSIX_CALL(LibKernel::FileSystem::SetDescriptorFlags(d, static_cast<int>(arg)));
+	}
+	if (cmd == f_getfl) {
+		return POSIX_N_CALL(LibKernel::FileSystem::GetStatusFlags(d));
+	}
+	if (cmd == f_setfl) {
+		return POSIX_CALL(LibKernel::FileSystem::SetStatusFlags(d, static_cast<int>(arg)));
+	}
 
 	struct Flock {
 		int64_t l_start;
@@ -3669,9 +3689,6 @@ int KYTY_SYSV_ABI fcntl(int d, int cmd, uint64_t arg) {
 	constexpr int16_t f_unlck = 2;
 	constexpr int16_t f_wrlck = 3;
 
-	LOGF("\t fd = %d, cmd = %d\n", d, cmd);
-
-	// record locks only. Mono probes fd 0-2 with F_GETFL and takes -1 as closed
 	if (cmd != f_getlk && cmd != f_setlk && cmd != f_setlkw) {
 		return LibKernel::KERNEL_ERROR_ENOSYS;
 	}

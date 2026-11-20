@@ -69,6 +69,7 @@ private:
 		bool                      blocked           = false;
 		bool                      from_client       = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  enqueue_qpc       = 0;
 	};
 
 	void              Enqueue(Submission submission);

@@ -201,8 +201,8 @@ static size_t _etoa(out_fct_type out, std::vector<char>* buffer, size_t idx, siz
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static size_t _ftoa(out_fct_type out, std::vector<char>* buffer, size_t idx, size_t maxlen,
                     double value, unsigned int prec, unsigned int width, unsigned int flags) {
-	char   buf[PRINTF_FTOA_BUFFER_SIZE];
-	size_t len  = 0U;
+	std::vector<char> buf;
+	buf.reserve(PRINTF_FTOA_BUFFER_SIZE);
 	double diff = 0.0;
 
 	// powers of 10
@@ -240,8 +240,8 @@ static size_t _ftoa(out_fct_type out, std::vector<char>* buffer, size_t idx, siz
 		prec = PRINTF_DEFAULT_FLOAT_PRECISION;
 	}
 	// limit precision to 9, cause a prec >= 10 can lead to overflow errors
-	while ((len < PRINTF_FTOA_BUFFER_SIZE) && (prec > 9U)) {
-		buf[len++] = '0';
+	while (prec > 9U) {
+		buf.push_back('0');
 		prec--;
 	}
 
@@ -273,26 +273,21 @@ static size_t _ftoa(out_fct_type out, std::vector<char>* buffer, size_t idx, siz
 	} else {
 		unsigned int count = prec;
 		// now do fractional part, as an unsigned number
-		while (len < PRINTF_FTOA_BUFFER_SIZE) {
+		while (true) {
 			--count;
-			buf[len++] = static_cast<char>(48U + (frac % 10U));
+			buf.push_back(static_cast<char>(48U + (frac % 10U)));
 			if ((frac /= 10U) == 0u) {
 				break;
 			}
 		}
 		// add extra 0s
-		while ((len < PRINTF_FTOA_BUFFER_SIZE) && (count-- > 0U)) {
-			buf[len++] = '0';
-		}
-		if (len < PRINTF_FTOA_BUFFER_SIZE) {
-			// add decimal
-			buf[len++] = '.';
-		}
+		while (count-- > 0U) buf.push_back('0');
+		buf.push_back('.');
 	}
 
 	// do whole part, number is reversed
-	while (len < PRINTF_FTOA_BUFFER_SIZE) {
-		buf[len++] = static_cast<char>(48 + (whole % 10));
+	while (true) {
+		buf.push_back(static_cast<char>(48 + (whole % 10)));
 		if ((whole /= 10) == 0) {
 			break;
 		}
@@ -303,22 +298,18 @@ static size_t _ftoa(out_fct_type out, std::vector<char>* buffer, size_t idx, siz
 		if ((width != 0u) && (negative || ((flags & (FLAGS_PLUS | FLAGS_SPACE)) != 0u))) {
 			width--;
 		}
-		while ((len < width) && (len < PRINTF_FTOA_BUFFER_SIZE)) {
-			buf[len++] = '0';
-		}
+		while (buf.size() < width) buf.push_back('0');
 	}
 
-	if (len < PRINTF_FTOA_BUFFER_SIZE) {
-		if (negative) {
-			buf[len++] = '-';
-		} else if ((flags & FLAGS_PLUS) != 0u) {
-			buf[len++] = '+'; // ignore the space if the '+' exists
-		} else if ((flags & FLAGS_SPACE) != 0u) {
-			buf[len++] = ' ';
-		}
+	if (negative) {
+		buf.push_back('-');
+	} else if ((flags & FLAGS_PLUS) != 0u) {
+		buf.push_back('+');
+	} else if ((flags & FLAGS_SPACE) != 0u) {
+		buf.push_back(' ');
 	}
 
-	return _out_rev(out, buffer, idx, maxlen, buf, len, width, flags);
+	return _out_rev(out, buffer, idx, maxlen, buf.data(), buf.size(), width, flags);
 }
 
 // internal ftoa variant for exponential floating-point type, contributed by Martijn Jasperse

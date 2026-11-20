@@ -163,7 +163,7 @@ struct BufferCacheTestAccess {
   }
 
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
-    return cache.m_download_buffer;
+    return cache.GetUtilityBuffer(MemoryUsage::Download);
   }
 
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
@@ -17424,7 +17424,8 @@ public:
     scheduler.Begin(registers, user_config, shaders);
     StreamBuffer parameters(m_runtime_context, scheduler, MemoryUsage::Stream,
                             1u << 20);
-    TileManager tile_manager(m_runtime_context, scheduler, parameters);
+    TileManager tile_manager(m_runtime_context, scheduler,
+                             [&]() -> StreamBuffer & { return parameters; });
     constexpr uint64_t conversion_limit = 128ull << 20;
     Require(name, "D16 conversion chunk boundaries",
             TileManagerTestAccess::ConversionRows(0, 32ull << 10, 32ull << 10,
@@ -37799,7 +37800,8 @@ void CheckImageTransitionState(RenderContext &renderer) {
   Buffer copy_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                       16);
   StreamBuffer copy_parameters(context, scheduler, MemoryUsage::Stream, 4096);
-  TileManager copy_tiler(context, scheduler, copy_parameters);
+  TileManager copy_tiler(context, scheduler,
+                         [&]() -> StreamBuffer & { return copy_parameters; });
   buffered_destination.CopyImageWithBuffer(buffered_source, copy_scratch, copy_tiler);
   const auto [buffered_download_data, buffered_download_offset] =
       download.Map(buffered_expected.size(), 4);

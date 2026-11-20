@@ -801,19 +801,22 @@ static int ReadStreamError(int error) {
 static uint64_t g_native_fopen  = 0;
 static uint64_t g_native_fclose = 0;
 static uint64_t g_native_fread  = 0;
+static uint64_t g_native_fgets  = 0;
 static uint64_t g_native_fseek  = 0;
 static uint64_t g_native_ftell  = 0;
 
-void SetNativeStdioEntries(uint64_t fopen, uint64_t fclose, uint64_t fread, uint64_t fseek,
-                           uint64_t ftell) {
+void SetNativeStdioEntries(uint64_t fopen, uint64_t fclose, uint64_t fread, uint64_t fgets,
+                           uint64_t fseek, uint64_t ftell) {
 	g_native_fopen  = fopen;
 	g_native_fclose = fclose;
 	g_native_fread  = fread;
+	g_native_fgets  = fgets;
 	g_native_fseek  = fseek;
 	g_native_ftell  = ftell;
 	LOGF("LIBC_NATIVE_STDIO targets fopen=0x%016" PRIx64 " fclose=0x%016" PRIx64
-	     " fread=0x%016" PRIx64 " fseek=0x%016" PRIx64 " ftell=0x%016" PRIx64 "\n",
-	     fopen, fclose, fread, fseek, ftell);
+	     " fread=0x%016" PRIx64 " fgets=0x%016" PRIx64 " fseek=0x%016" PRIx64
+	     " ftell=0x%016" PRIx64 "\n",
+	     fopen, fclose, fread, fgets, fseek, ftell);
 }
 
 void* KYTY_SYSV_ABI GuestFopen(const char* path, const char* mode) {
@@ -940,6 +943,65 @@ size_t KYTY_SYSV_ABI GuestFread(void* destination, size_t size, size_t count, vo
 		}
 	}
 	return consumed / size;
+}
+
+char* KYTY_SYSV_ABI GuestFgets(char* destination, int size, void* handle) {
+	auto stream = FindReadStream(handle);
+	if (!stream && g_native_fgets != 0) {
+		using fgets_t = KYTY_SYSV_ABI char* (*)(char*, int, void*);
+		return reinterpret_cast<fgets_t>(g_native_fgets)(destination, size, handle);
+	}
+	if (!stream) {
+		ReadStreamError(Posix::POSIX_EBADF);
+		return nullptr;
+	}
+	if (destination == nullptr) {
+		ReadStreamError(Posix::POSIX_EFAULT);
+		return nullptr;
+	}
+	if (size < 2) {
+		ReadStreamError(Posix::POSIX_EINVAL);
+		return nullptr;
+	}
+	const size_t capacity = static_cast<size_t>(size);
+	if (!LibKernel::Memory::CanWriteGuest(destination, capacity) &&
+	    !Jemspace::ContainsAllocation(destination, capacity) &&
+	    !LibKernel::CanAccessCurrentThreadStack(destination, capacity, true)) {
+		ReadStreamError(Posix::POSIX_EFAULT);
+		return nullptr;
+	}
+	std::lock_guard lock(stream->mutex);
+	if (stream->closed) {
+		ReadStreamError(Posix::POSIX_EBADF);
+		return nullptr;
+	}
+	if (stream->eof) return nullptr;
+	int read_error = 0;
+	const int64_t count = LibKernel::FileSystem::ReadWithStatus(
+	    stream->fd, destination, capacity - 1, &read_error);
+	if (read_error != 0 || count < 0) {
+		stream->error = true;
+		ReadStreamError(LibKernel::KernelToPosix(
+		    read_error != 0 ? read_error : static_cast<int>(count)));
+		return nullptr;
+	}
+	if (count == 0) {
+		stream->eof = true;
+		return nullptr;
+	}
+	const auto* newline = static_cast<const char*>(
+	    std::memchr(destination, '\n', static_cast<size_t>(count)));
+	const size_t used = newline != nullptr ? static_cast<size_t>(newline - destination) + 1
+	                                      : static_cast<size_t>(count);
+	const size_t extra = static_cast<size_t>(count) - used;
+	if (extra != 0 && LibKernel::FileSystem::KernelLseek(
+	                      stream->fd, -static_cast<int64_t>(extra), 1) < 0) {
+		stream->error = true;
+		ReadStreamError(Posix::POSIX_EIO);
+		return nullptr;
+	}
+	destination[used] = '\0';
+	return destination;
 }
 
 int KYTY_SYSV_ABI GuestFseek(void* handle, int64_t offset, int whence) {
@@ -1213,6 +1275,7 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("xeYO4u7uyJ0", LibcInternal::GuestFopen);
 	LIB_FUNC("uodLYyUip20", LibcInternal::GuestFclose);
 	LIB_FUNC("lbB+UlZqVG0", LibcInternal::GuestFread);
+	LIB_FUNC("KdP-nULpuGw", LibcInternal::GuestFgets);
 	LIB_FUNC("rQFVBXp-Cxg", LibcInternal::GuestFseek);
 	LIB_FUNC("Qazy8LmXTvw", LibcInternal::GuestFtell);
 	LIB_FUNC("gNQ1V2vfXDE", LibcInternal::GuestSetjmp);

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -33,18 +34,48 @@ struct State {
 	uint32_t             buttons = 0;
 	std::array<int, 6>   axes {128, 128, 128, 128, 0, 0};
 	std::array<Touch, 2> touch {};
+	uint8_t              physical_connected = 0;
+	uint8_t              physical_ps5 = 0;
+	uint8_t              physical_transport = 0;
+	uint8_t              reserved = 0;
+	uint32_t             physical_connected_count = 0;
 };
 
 struct Reader {
 	uint64_t sequence = 0;
 	bool     attached = false;
+	uint32_t neutralized_producer_pid = 0;
+	uint64_t neutralized_sequence = 0;
+#ifdef _WIN32
+	uint32_t producer_pid = 0;
+	HANDLE producer_process = nullptr;
+	Reader() = default;
+	Reader(const Reader&) = delete;
+	Reader& operator=(const Reader&) = delete;
+	Reader(Reader&& other) noexcept { *this = std::move(other); }
+	Reader& operator=(Reader&& other) noexcept {
+		if (this == &other) return *this;
+		if (producer_process != nullptr) CloseHandle(producer_process);
+		sequence = other.sequence;
+		attached = other.attached;
+		neutralized_producer_pid = other.neutralized_producer_pid;
+		neutralized_sequence = other.neutralized_sequence;
+		producer_pid = other.producer_pid;
+		producer_process = other.producer_process;
+		other.producer_process = nullptr;
+		return *this;
+	}
+	~Reader() {
+		if (producer_process != nullptr) CloseHandle(producer_process);
+	}
+#endif
 };
 
 #ifdef _WIN32
 namespace Detail {
 
 constexpr uint32_t MAGIC           = 0x4b484953;
-constexpr uint32_t VERSION         = 1;
+constexpr uint32_t VERSION         = 3;
 constexpr size_t   CAPACITY        = 128;
 constexpr DWORD    LOCK_TIMEOUT_MS = 25;
 
@@ -58,6 +89,8 @@ struct SharedState {
 	uint32_t                     version    = 0;
 	uint64_t                     scope_hash = 0;
 	uint64_t                     sequence   = 0;
+	uint32_t                     producer_pid = 0;
+	uint32_t                     reserved = 0;
 	std::array<Record, CAPACITY> records;
 };
 
@@ -187,6 +220,7 @@ inline uint64_t Publish(const State& input) {
 	if (!context.Open(Detail::Scope())) return 0;
 	Detail::Lock lock(context.mutex);
 	if (!lock.Locked()) return 0;
+	context.state->producer_pid = GetCurrentProcessId();
 	const auto sequence = ++context.state->sequence;
 	auto&      record   = context.state->records[(sequence - 1) % Detail::CAPACITY];
 	record.state        = input;
@@ -203,6 +237,29 @@ inline size_t Read(Reader* reader, State* output, size_t capacity) {
 	if (!lock.Locked()) return 0;
 
 	const auto latest = context.state->sequence;
+	const auto producer_pid = context.state->producer_pid;
+	if (reader->producer_pid != producer_pid) {
+		if (reader->producer_process != nullptr) CloseHandle(reader->producer_process);
+		reader->producer_process = nullptr;
+		reader->producer_pid = producer_pid;
+	}
+	if (reader->producer_process == nullptr && producer_pid != 0 &&
+	    producer_pid != GetCurrentProcessId()) {
+		reader->producer_process = OpenProcess(SYNCHRONIZE, FALSE, producer_pid);
+	}
+	if (reader->producer_process != nullptr &&
+	    WaitForSingleObject(reader->producer_process, 0) == WAIT_OBJECT_0) {
+		if (reader->neutralized_producer_pid == producer_pid &&
+		    reader->neutralized_sequence == latest) return 0;
+		reader->neutralized_producer_pid = producer_pid;
+		reader->neutralized_sequence = latest;
+		reader->attached = true;
+		reader->sequence = latest;
+		output[0] = {};
+		return 1;
+	}
+	reader->neutralized_producer_pid = 0;
+	reader->neutralized_sequence = 0;
 	if (!reader->attached) {
 		reader->attached = true;
 		reader->sequence = latest;

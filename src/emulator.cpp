@@ -178,7 +178,10 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
-	subsystems.Initialize<Libs::Graphics::Lifecycle>();
+	// window + Vulkan is ~300 ms per child and nothing before the image commit needs it, so the parent's execve wait doesn't pay for it
+	if (!Libs::LibKernel::Process::IsExecChild()) {
+		subsystems.Initialize<Libs::Graphics::Lifecycle>();
+	}
 }
 
 static Loader::Program* LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = false,
@@ -434,6 +437,9 @@ void Run(const RunOptions& options) {
 	// Needed modules and relocation are the child's own rtld work; the parent's spawn doesn't wait
 	// for them.
 	Libs::LibKernel::Process::SignalExecChildImageCommitted(rt->GetEntry());
+	if (Libs::LibKernel::Process::IsExecChild()) {
+		subsystems.Initialize<Libs::Graphics::Lifecycle>();
+	}
 	if (!options.sysroot_dir.empty() && !main_program->elf->IsStaticExec()) {
 		rt->LoadNeededModules(main_program);
 	}

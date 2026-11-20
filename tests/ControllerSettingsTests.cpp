@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -23,6 +24,7 @@ std::vector<Rumble>                rumble;
 std::vector<Rumble>                haptics;
 std::vector<std::array<Uint8, 32>> effects;
 bool                               haptics_handles_rumble = false;
+SDL_JoystickConnectionState        connection_state = SDL_JOYSTICK_CONNECTION_WIRED;
 } // namespace
 
 namespace Fake {
@@ -35,6 +37,9 @@ SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
 }
 SDL_GamepadType GetGamepadType(SDL_Gamepad*) {
 	return SDL_GAMEPAD_TYPE_PS5;
+}
+SDL_JoystickConnectionState GetGamepadConnectionState(SDL_Gamepad*) {
+	return connection_state;
 }
 bool RumbleGamepad(SDL_Gamepad*, Uint16 large, Uint16 small, Uint32 duration) {
 	rumble.push_back({large, small, duration});
@@ -63,6 +68,7 @@ void Delay(Uint32) {}
 #define SDL_GetTicks                Fake::GetTicks
 #define SDL_GetGamepadFromID        Fake::GetGamepadFromID
 #define SDL_GetGamepadType          Fake::GetGamepadType
+#define SDL_GetGamepadConnectionState Fake::GetGamepadConnectionState
 #define SDL_RumbleGamepad           Fake::RumbleGamepad
 #define SDL_SendGamepadEffect       Fake::SendGamepadEffect
 #define SDL_SetGamepadLED           Fake::SetGamepadLED
@@ -74,6 +80,7 @@ void Delay(Uint32) {}
 #undef SDL_GetTicks
 #undef SDL_GetGamepadFromID
 #undef SDL_GetGamepadType
+#undef SDL_GetGamepadConnectionState
 #undef SDL_RumbleGamepad
 #undef SDL_SendGamepadEffect
 #undef SDL_SetGamepadLED
@@ -109,6 +116,7 @@ struct Controller {
 	Controller() {
 		now                    = 1000;
 		haptics_handles_rumble = false;
+		connection_state       = SDL_JOYSTICK_CONNECTION_WIRED;
 		Initialize();
 		Connect(1);
 		Check(GetSettingScale(Setting::SpeakerVolume) ==
@@ -343,9 +351,209 @@ void TestIndependentOutputsAndPadSwitch() {
 		      "released controller retained a cached vibration");
 	}
 }
+
+#ifdef _WIN32
+void TestPhysicalAttachCount() {
+	const auto scope = "controller_attach_" + std::to_string(GetCurrentProcessId()) + "_" +
+	                   std::to_string(GetTickCount64());
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE", scope.c_str()) == 0,
+	      "failed to create physical attach scope");
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY", "1") == 0,
+	      "failed to enable physical attach scope");
+	Initialize();
+	SetHostInputSharedProducer(true);
+	GameController reader;
+	reader.Connect(HOST_INPUT_CONTROLLER_ID);
+	bool connected = false;
+	int count = 0;
+	reader.GetConnectionInfo(&connected, &count);
+	Check(connected && count == 1, "keyboard-only connection count changed");
+	PadControllerInformation info {};
+	Check(PadGetControllerInformation(1, &info) == 0 && info.connected_count == 1,
+	      "keyboard-only pad count changed");
+
+	Connect(1);
+	reader.GetConnectionInfo(&connected, &count);
+	Check(connected && count == 2, "physical attach was not visible to shared reader");
+	g_controller->GetConnectionInfo(&connected, &count);
+	Check(connected && count == 2, "physical attach did not update guest connection count");
+	Check(PadGetControllerInformation(1, &info) == 0 && info.connected_count == 2,
+	      "physical attach did not update guest pad information");
+	Connect(1);
+	RefreshHostPhysicalConnection();
+	Connect(2);
+	Disconnect(1);
+	reader.GetConnectionInfo(&connected, &count);
+	Check(connected && count == 2, "duplicate, remap or second pad changed connection count");
+
+	Disconnect(2);
+	reader.GetConnectionInfo(&connected, &count);
+	Check(connected && count == 2, "physical detach changed connection count");
+	Connect(1);
+	reader.GetConnectionInfo(&connected, &count);
+	Check(connected && count == 3, "physical reattach was not visible to shared reader");
+	g_controller->GetConnectionInfo(&connected, &count);
+	Check(connected && count == 3, "physical reattach did not update guest connection count");
+	Check(PadGetControllerInformation(1, &info) == 0 && info.connected_count == 3,
+	      "physical reattach did not update guest pad information");
+	Shutdown();
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE", "") == 0,
+	      "failed to clear physical attach scope");
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY", "") == 0,
+	      "failed to clear physical attach registry scope");
+}
+
+void TestPhysicalInputSharedAcrossProcesses() {
+	const auto scope = "controller_settings_" + std::to_string(GetCurrentProcessId()) + "_" +
+	                   std::to_string(GetTickCount64());
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE", scope.c_str()) == 0,
+	      "failed to create shared input scope");
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY", "1") == 0,
+	      "failed to enable coordinated input scope");
+	{
+		Controller controller;
+		SetHostInputSharedProducer(true);
+		HostInputShared::Reader reader;
+		HostInputShared::State  states[8];
+		Check(HostInputShared::Read(&reader, states, 8) == 1,
+		      "shared input producer did not publish initial state");
+		HostPhysicalConnectionInfo physical;
+		GetHostPhysicalConnectionInfo(&physical);
+		Check(physical.connected && physical.ps5 &&
+		          physical.transport == HostConnectionTransport::Wired &&
+		          states[0].physical_connected == 1 && states[0].physical_ps5 == 1,
+		      "wired PS5 connection metadata was not published");
+
+		Disconnect(1);
+		GetHostPhysicalConnectionInfo(&physical);
+		Check(!physical.connected && physical.transport == HostConnectionTransport::None,
+		      "synthetic keyboard was reported as a physical controller");
+		Connect(2);
+		SetButton(2, PAD_BUTTON_CROSS, true);
+		SetAxis(2, Axis::LeftX, 0);
+		SetTouchPad(2, 0, true, 0.5f, 0.5f);
+		const auto count = HostInputShared::Read(&reader, states, 8);
+		Check(count == 5, "physical controller transition was not forwarded");
+		Check(states[0].buttons == 0 && states[0].axes[0] == 128 &&
+		          states[1].buttons == 0 && states[1].axes[0] == 128,
+		      "controller switch did not publish neutral input");
+		Check(states[2].buttons == PAD_BUTTON_CROSS && states[3].axes[0] == 0 &&
+		          states[4].touch[0].down == 1,
+		      "physical button, axis or touch input was not forwarded");
+		SetButton(2, PAD_BUTTON_PS, true);
+		Check(HostInputShared::Read(&reader, states, 8) == 1 &&
+		          (states[0].buttons & PAD_BUTTON_PS) != 0,
+		      "PS button was not forwarded");
+		connection_state = SDL_JOYSTICK_CONNECTION_WIRELESS;
+		RefreshHostPhysicalConnection();
+		Check(HostInputShared::Read(&reader, states, 8) == 1 &&
+		          states[0].physical_connected == 1 &&
+		          states[0].physical_transport ==
+		              static_cast<uint8_t>(HostConnectionTransport::Wireless),
+		      "wireless transport change was not published");
+
+		Disconnect(2);
+		Check(HostInputShared::Read(&reader, states, 8) == 1 && states[0].buttons == 0 &&
+		          states[0].axes[0] == 128 && states[0].touch[0].down == 0 &&
+		          states[0].physical_connected == 0 &&
+		          states[0].physical_transport ==
+		              static_cast<uint8_t>(HostConnectionTransport::None),
+		      "unplug did not clear shared physical input");
+		SetHostInputSharedProducer(false);
+	}
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE", "") == 0,
+	      "failed to clear shared input scope");
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY", "") == 0,
+	      "failed to clear coordinated input scope");
+}
+
+void TestSharedInputProducerExit() {
+	const auto scope = "controller_exit_" + std::to_string(GetCurrentProcessId()) + "_" +
+	                   std::to_string(GetTickCount64());
+	const auto event_name = "Local\\KytyHostInputTest." + scope;
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE", scope.c_str()) == 0,
+	      "failed to create producer-exit scope");
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY", "1") == 0,
+	      "failed to enable producer-exit scope");
+	Check(_putenv_s("KYTY_HOST_INPUT_TEST_EVENT", event_name.c_str()) == 0,
+	      "failed to set producer-exit event");
+	const auto event = CreateEventA(nullptr, TRUE, FALSE, event_name.c_str());
+	Check(event != nullptr, "failed to create producer-exit event");
+
+	HostInputShared::State seed;
+	Check(HostInputShared::Publish(seed) != 0, "failed to create shared input mapping");
+	HostInputShared::Reader reader;
+	HostInputShared::State  state[2];
+	Check(HostInputShared::Read(&reader, state, 2) == 1,
+	      "failed to attach to shared input mapping");
+
+	wchar_t executable[MAX_PATH] {};
+	Check(GetModuleFileNameW(nullptr, executable, MAX_PATH) != 0,
+	      "failed to find controller test executable");
+	std::wstring command = L"\"" + std::wstring(executable) + L"\" --shared-input-child";
+	STARTUPINFOW startup {};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process {};
+	Check(CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+	                     nullptr, nullptr, &startup, &process),
+	      "failed to start shared input producer");
+	CloseHandle(process.hThread);
+	bool received = false;
+	for (int attempt = 0; attempt < 100; attempt++) {
+		if (HostInputShared::Read(&reader, state, 2) == 1 &&
+		    state[0].buttons == PAD_BUTTON_PS && state[0].physical_connected == 1) {
+			received = true;
+			break;
+		}
+		Sleep(20);
+	}
+	Check(received, "child producer state did not reach reader");
+	Check(SetEvent(event), "failed to release shared input producer");
+	Check(WaitForSingleObject(process.hProcess, 10000) == WAIT_OBJECT_0,
+	      "shared input producer did not exit");
+	DWORD exit_code = 0;
+	Check(GetExitCodeProcess(process.hProcess, &exit_code) && exit_code == 0,
+	      "shared input producer failed");
+	CloseHandle(process.hProcess);
+	Check(HostInputShared::Read(&reader, state, 2) == 1 && state[0].buttons == 0 &&
+	          state[0].physical_connected == 0,
+	      "dead producer left stale controller state");
+	Check(HostInputShared::Read(&reader, state, 2) == 0,
+	      "dead producer emitted repeated neutral states");
+	HostInputShared::State resumed;
+	resumed.buttons = PAD_BUTTON_CROSS;
+	Check(HostInputShared::Publish(resumed) != 0 &&
+	          HostInputShared::Read(&reader, state, 2) == 1 &&
+	          state[0].buttons == PAD_BUTTON_CROSS,
+	      "new producer did not resume shared input");
+	CloseHandle(event);
+	Check(_putenv_s("KYTY_HOST_INPUT_TEST_EVENT", "") == 0,
+	      "failed to clear producer-exit event");
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE", "") == 0,
+	      "failed to clear producer-exit scope");
+	Check(_putenv_s("KYTY_DIAGNOSTIC_PROCESS_REGISTRY_SCOPE_ONLY", "") == 0,
+	      "failed to clear producer-exit registry scope");
+}
+#endif
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#ifdef _WIN32
+	if (argc == 2 && std::strcmp(argv[1], "--shared-input-child") == 0) {
+		Libs::Controller::HostInputShared::State state;
+		state.buttons = Libs::Controller::PAD_BUTTON_PS;
+		state.physical_connected = 1;
+		if (Libs::Controller::HostInputShared::Publish(state) == 0) return 2;
+		char event_name[256] {};
+		if (GetEnvironmentVariableA("KYTY_HOST_INPUT_TEST_EVENT", event_name,
+		                            sizeof(event_name)) == 0) return 3;
+		const auto event = OpenEventA(SYNCHRONIZE, FALSE, event_name);
+		if (event == nullptr) return 4;
+		const auto waited = WaitForSingleObject(event, 10000);
+		CloseHandle(event);
+		return waited == WAIT_OBJECT_0 ? 0 : 5;
+	}
+#endif
 	Config::Initialize();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
@@ -353,6 +561,11 @@ int main() {
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+#ifdef _WIN32
+	TestPhysicalAttachCount();
+	TestPhysicalInputSharedAcrossProcesses();
+	TestSharedInputProducerExit();
+#endif
 	Config::Shutdown();
 	return 0;
 }

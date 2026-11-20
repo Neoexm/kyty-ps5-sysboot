@@ -12,6 +12,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -886,7 +887,8 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag handle, uint64_t bits, uin
 	KernelEventFlagState::ClearMode clear;
 	const int                       status = Decode(mode, &wait, &clear);
 	if (status != OK || bits == 0) return KERNEL_ERROR_EINVAL;
-	if (std::getenv("KYTY_DIAGNOSTIC_SHELLUI_EVENT_WAIT") != nullptr) {
+	static const bool diag = std::getenv("KYTY_DIAGNOSTIC_SHELLUI_EVENT_WAIT") != nullptr;
+	if (diag) {
 		static std::atomic_uint32_t count {0};
 		if (count.fetch_add(1) < 64) {
 			LOGF("FIRST_FRAME_AUDIT SHELLUI_EVENT_WAIT before name=%s bits=0x%016llx"
@@ -896,6 +898,22 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag handle, uint64_t bits, uin
 			         reinterpret_cast<uint64_t>(__builtin_return_address(0))),
 			     timeout == nullptr ? "infinite" : "bounded");
 		}
+		const auto start = std::chrono::steady_clock::now();
+		const auto ret   = flag->Wait(bits, wait, clear, result, timeout);
+		const auto ms    = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+		                    .count();
+		// only long waits, the short ones are frame pacing
+		if (ms >= 100) {
+			LOGF("FIRST_FRAME_AUDIT SHELLUI_EVENT_WAIT slow name=%s bits=0x%016llx caller=0x%016llx"
+			     " elapsed_ms=%lld got=0x%016llx\n",
+			     flag->name.c_str(), static_cast<unsigned long long>(bits),
+			     static_cast<unsigned long long>(
+			         reinterpret_cast<uint64_t>(__builtin_return_address(0))),
+			     static_cast<long long>(ms),
+			     static_cast<unsigned long long>(result != nullptr ? *result : 0));
+		}
+		return WaitStatus(ret, false);
 	}
 	return WaitStatus(flag->Wait(bits, wait, clear, result, timeout), false);
 }

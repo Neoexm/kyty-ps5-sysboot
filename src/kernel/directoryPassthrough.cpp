@@ -155,7 +155,9 @@ bool FactoryStorageHides(const MountRecord& mount, std::string_view origin) {
 	}
 	if (LowercaseStartsWith(origin, "/priv/cache/profile/") ||
 	    HasUserDirectory(origin, "/priv/messages/") || HasUserDirectory(origin, "/priv/sticker/") ||
-	    HasUserDirectory(origin, "/eap/rodata/home/"))
+	    HasUserDirectory(origin, "/eap/rodata/home/") ||
+	    HasUserDirectory(origin, "/savedata/") ||
+	    HasUserDirectory(origin, "/savedata_prospero/"))
 		return true;
 	for (const std::string_view database: {"/priv/mms/notification2.db"}) {
 		if (LowercaseEqual(origin, database) ||
@@ -225,18 +227,34 @@ int Normalize(const std::string& path, std::string* normalized) {
 	return OK;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// A miss on a case-insensitive directory already covered every casing, so the scan can only find
+// something in a per-directory case-sensitive one. Win32 strips trailing dots and spaces, so those
+// names still need the scan.
+bool DirectMissIsFinal(const std::filesystem::path& directory, const std::string& component) {
+	if (component.back() == '.' || component.back() == ' ') return false;
+	const HANDLE handle =
+	    CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES,
+	                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+	                FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) return false;
+	FILE_CASE_SENSITIVE_INFO info {};
+	const bool queried = GetFileInformationByHandleEx(handle, FileCaseSensitiveInfo, &info,
+	                                                  sizeof(info)) != 0;
+	CloseHandle(handle);
+	return queried && (info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR) == 0;
+}
+#endif
+
 // Case-insensitive like exfatfs. An NTFS copy of the dump keeps its casing, so try a direct hit
-// before scanning.
+// before scanning. host_root is the mount's canonical root.
 int ResolveHost(const std::filesystem::path& host_root, const std::string& relative,
                 std::filesystem::path* resolved, bool* exists) {
 	*resolved = host_root;
 	*exists   = false;
 	if (relative == "/" || relative.empty()) {
 		std::error_code ec;
-		const auto      canonical_root = std::filesystem::weakly_canonical(host_root, ec);
-		if (ec || !std::filesystem::is_directory(canonical_root, ec) || ec)
-			return KERNEL_ERROR_ENOENT;
-		*resolved = canonical_root;
+		if (!std::filesystem::is_directory(host_root, ec) || ec) return KERNEL_ERROR_ENOENT;
 		*exists   = true;
 		return OK;
 	}
@@ -260,6 +278,9 @@ int ResolveHost(const std::filesystem::path& host_root, const std::string& relat
 		if (ec) return KERNEL_ERROR_EIO;
 		if (!directory) return KERNEL_ERROR_ENOTDIR;
 		bool found = false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (!DirectMissIsFinal(*resolved, component))
+#endif
 		for (const auto& entry: std::filesystem::directory_iterator(*resolved, ec)) {
 			const auto       name_u8 = entry.path().filename().u8string();
 			std::string_view name_view(reinterpret_cast<const char*>(name_u8.data()),
@@ -274,9 +295,7 @@ int ResolveHost(const std::filesystem::path& host_root, const std::string& relat
 		if (!found) {
 			const auto canonical_candidate = std::filesystem::weakly_canonical(direct, ec);
 			if (ec) return KERNEL_ERROR_EIO;
-			const auto canonical_root = std::filesystem::weakly_canonical(host_root, ec);
-			if (ec) return KERNEL_ERROR_EIO;
-			if (!IsWithinRoot(canonical_root, canonical_candidate)) return KERNEL_ERROR_ENOENT;
+			if (!IsWithinRoot(host_root, canonical_candidate)) return KERNEL_ERROR_ENOENT;
 			*resolved = canonical_candidate;
 			return OK;
 		}
@@ -284,9 +303,7 @@ int ResolveHost(const std::filesystem::path& host_root, const std::string& relat
 	std::error_code ec;
 	const auto      canon_resolved = std::filesystem::weakly_canonical(*resolved, ec);
 	if (ec) return KERNEL_ERROR_ENOENT;
-	const auto canon_root = std::filesystem::weakly_canonical(host_root, ec);
-	if (ec) return KERNEL_ERROR_ENOENT;
-	if (!IsWithinRoot(canon_root, canon_resolved)) return KERNEL_ERROR_ENOENT;
+	if (!IsWithinRoot(host_root, canon_resolved)) return KERNEL_ERROR_ENOENT;
 	const bool present = std::filesystem::exists(canon_resolved, ec);
 	if (ec) return KERNEL_ERROR_ENOENT;
 	*resolved = canon_resolved;
@@ -554,6 +571,7 @@ int SaveIndex(UpperStore* upper) {
 }
 
 // Orders index writes across exec children; the generation marks cached nodes stale.
+// The named mutex is thread-owned, so it serializes this process's threads too. Callers drop mounts_mutex before taking it: another process can hold it across a full index rewrite, and every path resolution here needs mounts_mutex.
 class UpperLock {
 public:
 	explicit UpperLock(UpperStore* upper): upper(upper) {
@@ -728,9 +746,9 @@ int Lookup(const MountRecord& mount, const std::string& relative, View* view) {
 		view->kind = view->node->kind;
 		return OK;
 	}
+	if (!view->node && FactoryStorageHides(mount, view->origin)) return KERNEL_ERROR_ENOENT;
 	const int found = CapturedDirectory::Find(*mount.snapshot, view->origin, &view->entry);
 	if (found != OK) return found;
-	if (!view->node && FactoryStorageHides(mount, view->origin)) return KERNEL_ERROR_ENOENT;
 	view->kind = view->node ? view->node->kind : (view->entry->type == 4 ? 'd' : 'f');
 	return OK;
 }
@@ -922,6 +940,8 @@ public:
 	std::mutex                                         mutex;
 	uint64_t                                           offset   = 0;
 	std::FILE*                                         file     = nullptr;
+	uint64_t                                           read_at  = UINT64_MAX;
+	uint64_t                                           write_at = UINT64_MAX;
 	bool                                               overlay  = false;
 	bool                                               object   = false;
 	bool                                               writable = false;
@@ -1030,6 +1050,10 @@ static int OpenOverlay(const std::shared_ptr<MountRecord>& mount, std::string no
 		opened->file =
 		    _wfsopen(opened->host.c_str(), write || truncate ? L"r+b" : L"rb", _SH_DENYNO);
 		if (opened->file == nullptr) return KERNEL_ERROR_EIO;
+		// Guests that reopen the same object through a second descriptor must see each other's bytes immediately: SQLite's rollback journal keeps a write fd plus a read-only playback fd, and a stdio write buffer defers the length the OS reports until it drains. Only the SQLite databases do this, so scope the unbuffering to .db paths; leaving the rest buffered keeps a guest that writes a file one byte at a time (eap timezone.dat does, ~80k single-byte writes) from turning each into its own physical write.
+		if (opened->normalized.find(".db") != std::string::npos) {
+			std::setvbuf(opened->file, nullptr, _IONBF, 0);
+		}
 		if (truncate && _chsize_s(_fileno(opened->file), 0) != 0) return KERNEL_ERROR_EIO;
 #else
 		return KERNEL_ERROR_ENOSYS;
@@ -1270,8 +1294,8 @@ int ValidateTraversal(const std::string& path) try {
 int Open(const std::string& path, int flags, std::shared_ptr<Handle>* handle, uint32_t mode) try {
 	if (!handle) return KERNEL_ERROR_EFAULT;
 	if ((flags & 3) == 3) return KERNEL_ERROR_EINVAL;
-	const bool      mutating = (flags & 3) != 0 || (flags & (0x8 | 0x200 | 0x400 | 0x800));
-	std::lock_guard lock(mounts_mutex);
+	const bool       mutating = (flags & 3) != 0 || (flags & (0x8 | 0x200 | 0x400 | 0x800));
+	std::unique_lock lock(mounts_mutex);
 	std::string     normalized;
 	const int       result = Normalize(path, &normalized);
 	const auto      mount  = result == OK ? FindMount(normalized) : nullptr;
@@ -1279,6 +1303,7 @@ int Open(const std::string& path, int flags, std::shared_ptr<Handle>* handle, ui
 	if (result != OK) return result;
 	if (!mount) return KERNEL_ERROR_ENOENT;
 	if (mount->upper) {
+		lock.unlock();
 		const int opened = OpenOverlay(mount, normalized, flags, mode, handle);
 		if (std::getenv("KYTY_DIAGNOSTIC_READ_ONLY_PROVIDER_IO_AUDIT") != nullptr) {
 			LOGF("PASSTHROUGH_UPPER_IO operation=open path=%s flags=0x%x mode=0%o result=0x%08x\n",
@@ -1433,13 +1458,14 @@ int ResolveHostPath(const std::string& path, std::filesystem::path* host) try {
 
 int Stat(const std::string& path, NodeStat* stat) try {
 	if (!stat) return KERNEL_ERROR_EFAULT;
-	std::lock_guard lock(mounts_mutex);
-	std::string     normalized;
-	const int       result = Normalize(path, &normalized);
+	std::unique_lock lock(mounts_mutex);
+	std::string      normalized;
+	const int        result = Normalize(path, &normalized);
 	if (result != OK) return result;
 	const auto mount = FindMount(normalized);
 	if (!mount) return KERNEL_ERROR_ENOENT;
 	if (mount->upper) {
+		lock.unlock();
 		UpperLock upper_lock(mount->upper.get());
 		if (upper_lock.result != OK) return upper_lock.result;
 		View      view;
@@ -1510,8 +1536,7 @@ int Entries(const std::shared_ptr<Handle>& handle, std::vector<DirectoryEntry>* 
 	// Listed by path: a directory renamed or removed while open reads as its current namesake or as
 	// empty.
 	if (handle->overlay) {
-		std::lock_guard lock(mounts_mutex);
-		UpperLock       upper_lock(handle->mount->upper.get());
+		UpperLock upper_lock(handle->mount->upper.get());
 		if (upper_lock.result != OK) return upper_lock.result;
 		const auto relative = Relative(*handle->mount, handle->normalized);
 		View       view;
@@ -1567,15 +1592,23 @@ int64_t Pread(const std::shared_ptr<Handle>& handle, void* data, size_t length, 
 	if (length == 0) return 0;
 	std::lock_guard lock(handle->mutex);
 	if (handle->file == nullptr) return KERNEL_ERROR_EIO;
+	// A seek drops the stdio buffer, so ShellCore's one-byte-at-a-time timezone.dat copy refilled 4 KiB per byte. Captured read-only files never change underneath us; overlay objects can be rewritten through another descriptor and still reseek.
+	const bool positioned = !handle->overlay && handle->read_at == offset;
+	handle->read_at       = UINT64_MAX;
+	handle->write_at      = UINT64_MAX;
+	if (!positioned) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (_fseeki64(handle->file, static_cast<long long>(offset), SEEK_SET) != 0)
-		return KERNEL_ERROR_EIO;
+		if (_fseeki64(handle->file, static_cast<long long>(offset), SEEK_SET) != 0)
+			return KERNEL_ERROR_EIO;
 #else
-	if (std::fseek(handle->file, static_cast<long>(offset), SEEK_SET) != 0) return KERNEL_ERROR_EIO;
+		if (std::fseek(handle->file, static_cast<long>(offset), SEEK_SET) != 0) return KERNEL_ERROR_EIO;
 #endif
+	}
 	const auto actual = std::fread(data, 1, length, handle->file);
 	if (actual == 0 && std::ferror(handle->file)) return KERNEL_ERROR_EIO;
-	if (std::getenv("KYTY_DIAGNOSTIC_READ_ONLY_PROVIDER_IO_AUDIT") != nullptr) {
+	if (!std::feof(handle->file)) handle->read_at = offset + actual;
+	static const bool audit = std::getenv("KYTY_DIAGNOSTIC_READ_ONLY_PROVIDER_IO_AUDIT") != nullptr;
+	if (audit) {
 		LOGF("READ_ONLY_PROVIDER_IO operation=pread path=%s offset=%llu requested=%zu result=%zu\n",
 		     Log::EscapeField(handle->normalized).c_str(), static_cast<unsigned long long>(offset),
 		     length, actual);
@@ -1619,15 +1652,27 @@ int64_t Seek(const std::shared_ptr<Handle>& handle, int64_t offset, int whence) 
 // O_APPEND also governs pwrite, as in FreeBSD's ffs_write. Callers hold handle.mutex.
 static int64_t WriteLocked(Handle& handle, const void* data, size_t length, uint64_t* offset) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const int positioned = handle.append
-	                           ? _fseeki64(handle.file, 0, SEEK_END)
-	                           : _fseeki64(handle.file, static_cast<long long>(*offset), SEEK_SET);
+	// every write is flushed, so the OS file pointer of our own descriptor already sits at write_at
+	const bool in_place = !handle.append && handle.write_at == *offset;
+	handle.read_at      = UINT64_MAX;
+	handle.write_at     = UINT64_MAX;
+	const int positioned = in_place       ? 0
+	                       : handle.append ? _fseeki64(handle.file, 0, SEEK_END)
+	                                       : _fseeki64(handle.file, static_cast<long long>(*offset), SEEK_SET);
 	if (positioned != 0 || std::fwrite(data, 1, length, handle.file) != length ||
 	    std::fflush(handle.file) != 0)
 		return KERNEL_ERROR_EIO;
-	const auto end = _ftelli64(handle.file);
+	const auto end = handle.append ? _ftelli64(handle.file) : static_cast<long long>(*offset + length);
 	if (end < 0) return KERNEL_ERROR_EIO;
 	*offset = static_cast<uint64_t>(end);
+	if (!handle.append) handle.write_at = *offset;
+	static const bool audit = std::getenv("KYTY_DIAGNOSTIC_READ_ONLY_PROVIDER_IO_AUDIT") != nullptr;
+	if (audit) {
+		LOGF("PASSTHROUGH_UPPER_IO operation=pwrite path=%s offset=%llu requested=%zu end=%lld\n",
+		     Log::EscapeField(handle.normalized).c_str(),
+		     static_cast<unsigned long long>(end - static_cast<long long>(length)), length,
+		     static_cast<long long>(end));
+	}
 	return static_cast<int64_t>(length);
 #else
 	return KERNEL_ERROR_ENOSYS;
@@ -1656,9 +1701,21 @@ int Truncate(const std::shared_ptr<Handle>& handle, uint64_t length) {
 		return KERNEL_ERROR_EINVAL;
 	std::lock_guard lock(handle->mutex);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (std::fflush(handle->file) != 0 ||
-	    _chsize_s(_fileno(handle->file), static_cast<long long>(length)) != 0)
+	if (std::fflush(handle->file) != 0) return KERNEL_ERROR_EIO;
+	// _chsize_s grows a file by writing zeros 4 KiB at a time; SetEndOfFile extends in one call and NTFS reads the new range back as zeros, same as ffs.
+	// Dropping the cached positions makes the next read or write seek first, so moving the OS file pointer is safe.
+	handle->read_at       = UINT64_MAX;
+	handle->write_at      = UINT64_MAX;
+	const intptr_t native = _get_osfhandle(_fileno(handle->file));
+	LARGE_INTEGER  end;
+	end.QuadPart = static_cast<LONGLONG>(length);
+	if (native == -1 || SetFilePointerEx(reinterpret_cast<HANDLE>(native), end, nullptr, FILE_BEGIN) == 0 ||
+	    SetEndOfFile(reinterpret_cast<HANDLE>(native)) == 0)
 		return KERNEL_ERROR_EIO;
+	if (std::getenv("KYTY_DIAGNOSTIC_READ_ONLY_PROVIDER_IO_AUDIT") != nullptr) {
+		LOGF("PASSTHROUGH_UPPER_IO operation=ftruncate path=%s length=%llu\n",
+		     Log::EscapeField(handle->normalized).c_str(), static_cast<unsigned long long>(length));
+	}
 	return OK;
 #else
 	return KERNEL_ERROR_ENOSYS;
@@ -1689,10 +1746,11 @@ static void AuditUpper(const char* operation, const std::string& path, int resul
 }
 
 int Mkdir(const std::string& path, uint32_t mode) try {
-	std::lock_guard lock(mounts_mutex);
-	std::string     normalized;
+	std::unique_lock lock(mounts_mutex);
+	std::string      normalized;
 	const auto      mount = Normalize(path, &normalized) == OK ? FindMount(normalized) : nullptr;
 	if (!mount || !mount->upper) return KERNEL_ERROR_EROFS;
+	lock.unlock();
 	auto&      upper    = *mount->upper;
 	const auto relative = Relative(*mount, normalized);
 	const int  result   = [&] {
@@ -1731,10 +1789,11 @@ int Mkdir(const std::string& path, uint32_t mode) try {
 }
 
 int Rmdir(const std::string& path) try {
-	std::lock_guard lock(mounts_mutex);
-	std::string     normalized;
+	std::unique_lock lock(mounts_mutex);
+	std::string      normalized;
 	const auto      mount = Normalize(path, &normalized) == OK ? FindMount(normalized) : nullptr;
 	if (!mount || !mount->upper) return KERNEL_ERROR_EROFS;
+	lock.unlock();
 	auto&      upper    = *mount->upper;
 	const auto relative = Relative(*mount, normalized);
 	const int  result   = [&] {
@@ -1767,10 +1826,11 @@ int Rmdir(const std::string& path) try {
 }
 
 int Unlink(const std::string& path) try {
-	std::lock_guard lock(mounts_mutex);
-	std::string     normalized;
+	std::unique_lock lock(mounts_mutex);
+	std::string      normalized;
 	const auto      mount = Normalize(path, &normalized) == OK ? FindMount(normalized) : nullptr;
 	if (!mount || !mount->upper) return KERNEL_ERROR_EROFS;
+	lock.unlock();
 	auto&      upper    = *mount->upper;
 	const auto relative = Relative(*mount, normalized);
 	const int  result   = [&] {
@@ -1807,8 +1867,8 @@ int Unlink(const std::string& path) try {
 }
 
 int Rename(const std::string& from, const std::string& to) try {
-	std::lock_guard lock(mounts_mutex);
-	std::string     source, target;
+	std::unique_lock lock(mounts_mutex);
+	std::string      source, target;
 	const int       from_normalized = Normalize(from, &source);
 	const int       to_normalized   = Normalize(to, &target);
 	if (from_normalized != OK) return from_normalized;
@@ -1816,6 +1876,7 @@ int Rename(const std::string& from, const std::string& to) try {
 	const auto mount = FindMount(source);
 	if (!mount || FindMount(target) != mount) return KERNEL_ERROR_EXDEV;
 	if (!mount->upper) return KERNEL_ERROR_EROFS;
+	lock.unlock();
 	auto&      upper         = *mount->upper;
 	const auto from_relative = Relative(*mount, source);
 	const auto to_relative   = Relative(*mount, target);

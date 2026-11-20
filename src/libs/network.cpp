@@ -10,6 +10,7 @@
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
 #include <afunix.h>
+#include <bcrypt.h>
 #ifdef s_addr
 #undef s_addr
 #endif
@@ -59,6 +60,29 @@
 #include <vector>
 
 namespace Libs::Network {
+
+static bool CookieDigest(const uint8_t* data, uint32_t size, uint8_t out[16]) {
+#if defined(_WIN32)
+	BCRYPT_ALG_HANDLE  algorithm = nullptr;
+	BCRYPT_HASH_HANDLE hash      = nullptr;
+	bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_MD5_ALGORITHM, nullptr, 0) >= 0 &&
+	          BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) >= 0 &&
+	          BCryptHashData(hash, const_cast<PUCHAR>(data), size, 0) >= 0 &&
+	          BCryptFinishHash(hash, out, 16, 0) >= 0;
+	if (hash != nullptr) BCryptDestroyHash(hash);
+	if (algorithm != nullptr) BCryptCloseAlgorithmProvider(algorithm, 0);
+	return ok;
+#else
+	return false;
+#endif
+}
+
+static uint64_t CookieNowTick() {
+	// sceRtcGetCurrentTick: microseconds since 0001-01-01
+	return 0xdcbffeff2bc000ull + static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                                       std::chrono::system_clock::now().time_since_epoch())
+	                                                       .count());
+}
 
 class Network {
 public:
@@ -158,6 +182,10 @@ public:
 	bool HttpSetCookieEnabled(Id id, int enable);
 	bool HttpSetAutoRedirect(Id id, int enable);
 	bool HttpSetAuthEnabled(Id id, int enable);
+	bool HttpSetSocketCreationCallback(Id id, void* cbfunc, void* user_arg);
+	bool HttpSetRequestStatusCallback(Id id, void* cbfunc, void* user_arg);
+	bool HttpCookieImport(Id http_ctx_id, const void* buffer, size_t size);
+	int  HttpCookieExport(Id http_ctx_id, void* buffer, size_t size, size_t* export_size);
 	bool HttpMarkRequestSent(Id req_id, int result);
 	bool HttpGetRequestResponse(Id req_id, int* send_result, int* status_code, const char** headers,
 	                            size_t* headers_size, uint64_t* content_length);
@@ -180,11 +208,25 @@ private:
 		int         memid = 0;
 	};
 
+	// record types 1-9 of the libSceHttp export blob; 6 and 7 are kept but not interpreted
+	struct HttpCookie {
+		uint64_t                            expires = 0;
+		std::string                         domain;
+		std::optional<std::string>          name;
+		std::optional<std::string>          value;
+		std::optional<std::string>          path;
+		std::optional<std::string>          field6;
+		std::optional<std::string>          field7;
+		std::optional<std::vector<uint8_t>> ports;
+		uint32_t                            port_count = 0;
+	};
+
 	struct Http {
 		bool     used       = false;
 		uint64_t size       = 0;
 		int      memid      = 0;
 		int      ssl_ctx_id = 0;
+		std::vector<HttpCookie> cookies;
 	};
 
 	struct HttpHeader {
@@ -202,6 +244,11 @@ private:
 		uint32_t                options         = 0;
 		HttpsCallback           ssl_cbfunc      = nullptr;
 		void*                   ssl_user_arg    = nullptr;
+		// stored only: nothing here opens a socket or drives request status
+		void*                   socket_cbfunc   = nullptr;
+		void*                   socket_user_arg = nullptr;
+		void*                   status_cbfunc   = nullptr;
+		void*                   status_user_arg = nullptr;
 		uint32_t                ssl_flags       = 0xA7;
 		uint32_t                min_ssl_version = 0;
 		int                     http_ctx_id     = 0;
@@ -241,7 +288,7 @@ private:
 
 	static constexpr int POOLS_MAX     = 129;
 	static constexpr int RESOLVERS_MAX = 32;
-	static constexpr int HTTP_MAX      = 32;
+	static constexpr int HTTP_MAX      = 128; // libSceHttp context table at 0x40020, 128 x 208 bytes
 
 	Common::Mutex               m_mutex;
 	Pool                        m_pools[POOLS_MAX];
@@ -463,6 +510,7 @@ bool Network::HttpTerm(Id http_ctx_id) {
 
 	if (HttpValid(http_ctx_id)) {
 		m_http[http_ctx_id.GetId()].used = false;
+		m_http[http_ctx_id.GetId()].cookies.clear();
 
 		return true;
 	}
@@ -890,6 +938,194 @@ bool Network::HttpSetAuthEnabled(Id id, int enable) {
 	return false;
 }
 
+bool Network::HttpSetSocketCreationCallback(Id id, void* cbfunc, void* user_arg) {
+	Common::LockGuard lock(m_mutex);
+
+	HttpBase* base = FindHttpBase(id, true);
+
+	if (base != nullptr) {
+		base->socket_cbfunc   = cbfunc;
+		base->socket_user_arg = user_arg;
+		return true;
+	}
+
+	return false;
+}
+
+bool Network::HttpSetRequestStatusCallback(Id id, void* cbfunc, void* user_arg) {
+	Common::LockGuard lock(m_mutex);
+
+	HttpBase* base = FindHttpBase(id, true);
+
+	if (base != nullptr) {
+		base->status_cbfunc   = cbfunc;
+		base->status_user_arg = user_arg;
+		return true;
+	}
+
+	return false;
+}
+
+bool Network::HttpCookieImport(Id http_ctx_id, const void* buffer, size_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValid(http_ctx_id)) {
+		return false;
+	}
+
+	// libSceHttp 0x6730: flush the store, then a short or corrupt blob is accepted with nothing imported
+	auto& cookies = m_http[http_ctx_id.GetId()].cookies;
+	cookies.clear();
+
+	const auto* p      = static_cast<const uint8_t*>(buffer);
+	uint32_t    length = 0;
+	if (size < 20) {
+		return true;
+	}
+	memcpy(&length, p, 4);
+	uint8_t digest[16] {};
+	if (static_cast<uint64_t>(length) + 20 > size || !CookieDigest(p + 20, length, digest) || memcmp(digest, p + 4, 16) != 0) {
+		return true;
+	}
+
+	const auto now     = CookieNowTick();
+	HttpCookie cookie;
+	bool       expired    = false;
+	bool       has_domain = false;
+	const auto* rec    = p + 20;
+	size_t      left   = length;
+	while (left >= 3) {
+		const uint8_t  type = rec[0];
+		const uint16_t len  = static_cast<uint16_t>(rec[1] | (rec[2] << 8u));
+		if (left - 3 < len) {
+			break;
+		}
+		const auto* data = rec + 3;
+		std::string str(reinterpret_cast<const char*>(data), len);
+		switch (type) {
+			case 1:
+				if (len != 8) {
+					return true;
+				}
+				memcpy(&cookie.expires, data, 8);
+				if (cookie.expires < now) {
+					expired = true;
+				}
+				break;
+			case 2:
+				cookie.domain = str;
+				has_domain    = true;
+				break;
+			case 3: cookie.name = str; break;
+			case 4: cookie.value = str; break;
+			case 5: cookie.path = str; break;
+			case 6: cookie.field6 = str; break;
+			case 7: cookie.field7 = str; break;
+			case 8: cookie.ports = std::vector<uint8_t>(data, data + len); break;
+			case 9:
+				if (len != 4) {
+					return true;
+				}
+				memcpy(&cookie.port_count, data, 4);
+				break;
+			case 255:
+				if (!expired && has_domain && (cookie.name || cookie.value)) {
+					cookies.push_back(cookie);
+				}
+				cookie     = HttpCookie();
+				expired    = false;
+				has_domain = false;
+				break;
+			default: break;
+		}
+		rec += 3 + len;
+		left -= 3 + len;
+	}
+
+	return true;
+}
+
+int Network::HttpCookieExport(Id http_ctx_id, void* buffer, size_t size, size_t* export_size) {
+	Common::LockGuard lock(m_mutex);
+
+	if (!HttpValid(http_ctx_id)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	if (buffer != nullptr && size < 20) {
+		return HTTP_ERROR_OUT_OF_SIZE;
+	}
+
+	const auto& cookies = m_http[http_ctx_id.GetId()].cookies;
+	const auto  now     = CookieNowTick();
+
+	std::vector<uint8_t> out;
+	auto put = [&out](uint8_t type, const void* data, size_t len) {
+		out.push_back(type);
+		out.push_back(static_cast<uint8_t>(len & 0xffu));
+		out.push_back(static_cast<uint8_t>((len >> 8u) & 0xffu));
+		const auto* b = static_cast<const uint8_t*>(data);
+		out.insert(out.end(), b, b + len);
+	};
+
+	// libSceHttp 0x61c0 walks cookies per domain; a cookie that does not fit ends that domain only
+	std::vector<std::string> domains;
+	for (const auto& c: cookies) {
+		if (std::find(domains.begin(), domains.end(), c.domain) == domains.end()) {
+			domains.push_back(c.domain);
+		}
+	}
+	for (const auto& domain: domains) {
+		for (const auto& c: cookies) {
+			if (c.domain != domain || c.expires == 0 || c.expires < now) {
+				continue;
+			}
+			// the native fit check uses the cookie's stored size: each string plus a terminator, two bytes per port
+			size_t stored = c.domain.size() + 1;
+			for (const auto* s: {&c.name, &c.value, &c.path, &c.field6, &c.field7}) {
+				if (*s) {
+					stored += (*s)->size() + 1;
+				}
+			}
+			if (c.ports) {
+				stored += 2 * static_cast<size_t>(c.port_count);
+			}
+			if (buffer != nullptr && out.size() + stored + 38 > size) {
+				break;
+			}
+			put(1, &c.expires, 8);
+			put(2, c.domain.data(), c.domain.size());
+			if (c.name) put(3, c.name->data(), c.name->size());
+			if (c.value) put(4, c.value->data(), c.value->size());
+			put(5, c.path ? c.path->data() : "", c.path ? c.path->size() : 0);
+			if (c.field6) put(6, c.field6->data(), c.field6->size());
+			if (c.field7) put(7, c.field7->data(), c.field7->size());
+			if (c.ports) {
+				std::vector<uint8_t> ports(*c.ports);
+				ports.resize(2 * static_cast<size_t>(c.port_count));
+				put(8, ports.data(), ports.size());
+				put(9, &c.port_count, 4);
+			}
+			put(255, nullptr, 0);
+		}
+	}
+
+	if (buffer != nullptr) {
+		auto*      dst    = static_cast<uint8_t*>(buffer);
+		const auto length = static_cast<uint32_t>(out.size());
+		uint8_t    digest[16] {};
+		CookieDigest(out.data(), length, digest);
+		memcpy(dst, &length, 4);
+		memcpy(dst + 4, digest, 16);
+		memcpy(dst + 20, out.data(), out.size());
+	}
+	if (export_size != nullptr) {
+		*export_size = out.size() + 20;
+	}
+
+	return OK;
+}
+
 namespace Net {
 
 LIB_NAME("Net", "Net");
@@ -1151,6 +1387,7 @@ struct SocketTransport {
 	const int                type;
 	bool                      local_unix = false;
 	std::atomic<int>          local_unix_no_sigpipe {0};
+	std::atomic<int>          local_unix_reuse_addr {0};
 	std::string               local_unix_bind_path;
 	std::mutex                local_policy_mutex;
 	uint32_t                  local_policy_flags = 0;
@@ -1511,9 +1748,8 @@ static int ConvertFamily(int family) {
 	}
 }
 
-// Three 106-byte compositor/SISR addresses, each mapped to a short temp path. Process-local unless
-// KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE lets a peer process bind the same name.
-static bool GuestCompositorSocketPath(std::string* host_path, const char* endpoint) {
+// Each accepted guest address maps to a short temp path scoped to this boot.
+static bool GuestLocalSocketPath(std::string* host_path, const char* endpoint) {
 	if (host_path == nullptr || std::getenv("KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SOCKET") == nullptr) {
 		return false;
 	}
@@ -1653,12 +1889,15 @@ static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_sto
 			: guest_path == "/system_tmp/AgcCompositorSppSocket"  ? CompositorEndpoint::Spp
 			: guest_path == "/system_tmp/GnmCompositorRestricted" ? CompositorEndpoint::Gnmr
 			                                                      : CompositorEndpoint::None;
-		if (endpoint == CompositorEndpoint::None) {
+		const char* local_name = endpoint != CompositorEndpoint::None
+		                             ? CompositorEndpointName(endpoint)
+		                             : guest_path == "/system_tmp/redis.sock" ? "redis" : nullptr;
+		if (local_name == nullptr) {
 			*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
 			return -1;
 		}
 		std::string local_path;
-		if (!GuestCompositorSocketPath(&local_path, CompositorEndpointName(endpoint))) {
+		if (!GuestLocalSocketPath(&local_path, local_name)) {
 			*Posix::GetErrorAddr() = Posix::POSIX_ENAMETOOLONG;
 			return -1;
 		}
@@ -3081,6 +3320,13 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		LOGF("PSM_LOCAL_UNIX_GET_NOSIGPIPE fd=%d value=%d\n", s, enabled);
 		return 0;
 	}
+	if (level == 0xffff && optname == 4 && state.transport && state.transport->local_unix) {
+		if (*optlen < sizeof(int)) return SetGuestSocketError(Posix::POSIX_EINVAL);
+		const int enabled = state.transport->local_unix_reuse_addr.load();
+		std::memcpy(optval, &enabled, sizeof(enabled));
+		*optlen = sizeof(enabled);
+		return 0;
+	}
 	if (state.p2p) {
 		const auto* value = level == 0xffff ? P2pSocketOption(*state.p2p, optname) : nullptr;
 		if (value == nullptr) {
@@ -3149,6 +3395,13 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		}
 		state.transport->local_unix_no_sigpipe.store(enabled);
 		LOGF("PSM_LOCAL_UNIX_SET_NOSIGPIPE fd=%d enabled=%d\n", s, enabled);
+		return 0;
+	}
+	if (level == 0xffff && optname == 4 && state.transport && state.transport->local_unix) {
+		if (optlen != sizeof(int)) return SetGuestSocketError(Posix::POSIX_EINVAL);
+		int enabled = 0;
+		std::memcpy(&enabled, optval, sizeof(enabled));
+		state.transport->local_unix_reuse_addr.store(enabled != 0);
 		return 0;
 	}
 	if (state.p2p) {
@@ -4024,6 +4277,63 @@ int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable) {
 	}
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI HttpSetSocketCreationCallback(int id, void* cbfunc, void* user_arg) {
+	PRINT_NAME();
+
+	LOGF("\t id     = %d\n", id);
+
+	if (!g_net->HttpSetSocketCreationCallback(Network::Id(id), cbfunc, user_arg)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int id, void* cbfunc, void* user_arg) {
+	PRINT_NAME();
+
+	LOGF("\t id     = %d\n", id);
+
+	if (!g_net->HttpSetRequestStatusCallback(Network::Id(id), cbfunc, user_arg)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpCookieImport(int http_ctx_id, const void* buffer, size_t size) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n"
+	     "\t size        = %" PRIu64 "\n",
+	     http_ctx_id, static_cast<uint64_t>(size));
+
+	// same order as libSceHttp 0x152d0: argument check before the context lookup
+	if (buffer == nullptr || size == 0) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	if (!g_net->HttpCookieImport(Network::Id(http_ctx_id), buffer, size)) {
+		return HTTP_ERROR_INVALID_ID;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI HttpCookieExport(int http_ctx_id, void* buffer, size_t size, size_t* export_size) {
+	PRINT_NAME();
+
+	LOGF("\t http_ctx_id = %d\n"
+	     "\t size        = %" PRIu64 "\n",
+	     http_ctx_id, static_cast<uint64_t>(size));
+
+	if (buffer == nullptr && export_size == nullptr) {
+		return HTTP_ERROR_INVALID_VALUE;
+	}
+
+	return g_net->HttpCookieExport(Network::Id(http_ctx_id), buffer, size, export_size);
 }
 
 int KYTY_SYSV_ABI HttpAddRequestHeader(int id, const char* name, const char* value, uint32_t mode) {

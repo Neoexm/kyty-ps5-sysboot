@@ -394,6 +394,9 @@ add_executable(auth_info_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AuthInfoTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/authInfo.cpp")
 target_include_directories(auth_info_tests PRIVATE ${inc_headers})
+if(WIN32)
+	target_link_libraries(auth_info_tests bcrypt)
+endif()
 
 add_executable(auth_info_capture_tool EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/tools/authInfoCaptureTool.cpp"
@@ -429,6 +432,9 @@ add_executable(ipmi_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/kernel/ipmiManager.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/ipmiScope.cpp")
 target_link_libraries(ipmi_manager_tests fmt::fmt)
+if(WIN32)
+	target_link_libraries(ipmi_manager_tests bcrypt)
+endif()
 target_include_directories(ipmi_manager_tests PRIVATE ${inc_headers})
 if(BUILD_TESTING)
 	add_test(NAME ipmi_manager COMMAND $<TARGET_FILE:ipmi_manager_tests>)
@@ -564,6 +570,16 @@ add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
+
+add_executable(guest_printf_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestPrintfTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/guestPrintf.cpp"
+)
+target_link_libraries(guest_printf_tests common fmt::fmt)
+target_include_directories(guest_printf_tests PRIVATE ${inc_headers})
+if(BUILD_TESTING)
+	add_test(NAME guest_printf COMMAND $<TARGET_FILE:guest_printf_tests>)
+endif()
 
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
@@ -862,6 +878,7 @@ if (WIN32)
 	target_link_libraries(kyty_emulator setupapi)
 	target_link_libraries(kyty_emulator advapi32)
 	target_link_libraries(kyty_emulator bcrypt)
+	target_link_libraries(kyty_emulator winmm)
 	target_link_libraries(kyty_emulator ws2_32)
 endif()
 if (KYTY_CLANG_CL)

@@ -119,6 +119,7 @@ public:
 	ScopeSemaphores::Sema*                 shared     = nullptr;
 	uint64_t                               generation = 0;
 	std::string                            key;
+	int                                    creator_guest_pid = -1;
 
 private:
 	enum class Status { Set, Deleted };
@@ -319,7 +320,9 @@ int Attach(KernelSemaPrivate& sema, bool create, int init = 0, int max = 0, bool
 	if (birth == 0) return KERNEL_ERROR_EIO;
 	for (auto& candidate: sema.scope->table->semas) {
 		if (!candidate.linked || sema.GetName() != candidate.name) continue;
-		if (create) return KERNEL_ERROR_EEXIST;
+		if (create)
+			return candidate.creator == GetCurrentProcessId() && candidate.creator_birth == birth
+			           ? KERNEL_ERROR_EEXIST : KERNEL_ERROR_EPERM;
 		AddHolder(candidate, GetCurrentProcessId(), birth);
 		sema.shared     = &candidate;
 		sema.generation = candidate.generation;
@@ -703,13 +706,16 @@ int KYTY_SYSV_ABI KernelCreateSema(KernelSema* sem, const char* name, uint32_t a
 
 	auto created = std::make_shared<KernelSemaPrivate>(std::string(name), fifo, init, max);
 	created->key = NamespaceKey(name);
+	created->creator_guest_pid = Process::GetPid();
 	Common::LockGuard lock(g_named_semas_mutex);
 	const auto        handle = NewHandle();
 	if (handle == nullptr) return KERNEL_ERROR_EMFILE;
 	if ((attr & 0x100u) != 0) {
 		auto found = g_named_semas.find(created->key);
 		if (found != g_named_semas.end()) {
-			if (NameLinked(*found->second)) return KERNEL_ERROR_EEXIST;
+			if (NameLinked(*found->second))
+				return found->second->creator_guest_pid == Process::GetPid()
+				           ? KERNEL_ERROR_EEXIST : KERNEL_ERROR_EPERM;
 			g_named_semas.erase(found);
 		}
 		const int status = Attach(*created, true, init, max, fifo);

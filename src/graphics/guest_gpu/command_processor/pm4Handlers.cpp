@@ -2713,6 +2713,15 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 	return 1 + dw_num;
 }
 
+// These diagnostic handlers re-fire on every submit with the same value, over a million identical lines per boot in one render process. First hit per register keeps the evidence, the rest are dropped.
+static bool FirstDiagnosticRegisterLog(uint32_t offset) {
+	static std::array<std::atomic<bool>, 0x400> seen {};
+	if (offset >= seen.size()) {
+		return true;
+	}
+	return !seen[offset].exchange(true, std::memory_order_relaxed);
+}
+
 void GraphicsInitJmpTablesCxIndirect() {
 	for (auto& func: g_hw_ctx_indirect_func) {
 		func = nullptr;
@@ -3523,9 +3532,11 @@ void GraphicsInitJmpTablesCxIndirect() {
 		     ++offset) {
 			g_hw_ctx_indirect_func[offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 				(void)cp;
-				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_GRID_ZERO_ONLY register=0x%03" PRIx32
-				     " value=0x%08" PRIx32 " SEMANTICS_UNVERIFIED\n",
-				     cmd_offset, value);
+				if (FirstDiagnosticRegisterLog(cmd_offset)) {
+					LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_GRID_ZERO_ONLY register=0x%03" PRIx32
+					     " value=0x%08" PRIx32 " SEMANTICS_UNVERIFIED\n",
+					     cmd_offset, value);
+				}
 				EXIT_NOT_IMPLEMENTED(value != 0);
 			};
 		}
@@ -3534,35 +3545,45 @@ void GraphicsInitJmpTablesCxIndirect() {
 		g_hw_ctx_indirect_func[Pm4::SPI_INTERP_CONTROL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			EXIT_NOT_IMPLEMENTED((value & ~1u) != 0);
 			cp.GetCtx().SetPsInterpControl(value);
-			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_INTERP_CONTROL flat_shade=%u "
-			     "OTHER_INTERPOLATION_SEMANTICS_UNVERIFIED\n",
-			     value & 1u);
+			if (FirstDiagnosticRegisterLog(cmd_offset)) {
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_INTERP_CONTROL flat_shade=%u "
+				     "OTHER_INTERPOLATION_SEMANTICS_UNVERIFIED\n",
+				     value & 1u);
+			}
 		};
 		g_hw_ctx_indirect_func[Pm4::PA_SU_SMALL_PRIM_FILTER_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
 			cp.GetCtx().SetSmallPrimitiveFilter(value);
-			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_SMALL_PRIM_FILTER value=0x%08" PRIx32
-			     " RASTER_EFFECT_UNVERIFIED\n",
-			     value);
+			if (FirstDiagnosticRegisterLog(cmd_offset)) {
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_SMALL_PRIM_FILTER value=0x%08" PRIx32
+				     " RASTER_EFFECT_UNVERIFIED\n",
+				     value);
+			}
 		};
 		g_hw_ctx_indirect_func[Pm4::PA_STEREO_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			EXIT_NOT_IMPLEMENTED(value != 0 && value != 0x04000000u);
 			cp.GetCtx().SetStereoControl(value);
-			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_STEREO_CONTROL value=0x%08" PRIx32
-			     " BIT26_SEMANTICS_UNVERIFIED\n",
-			     value);
+			if (FirstDiagnosticRegisterLog(cmd_offset)) {
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_STEREO_CONTROL value=0x%08" PRIx32
+				     " BIT26_SEMANTICS_UNVERIFIED\n",
+				     value);
+			}
 		};
 		g_hw_ctx_indirect_func[Pm4::PA_STATE_STEREO_X] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			EXIT_NOT_IMPLEMENTED(value != 0);
 			cp.GetCtx().SetStereoXOffset(value);
-			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_STEREO_X_ZERO value=0x%08" PRIx32 "\n", value);
+			if (FirstDiagnosticRegisterLog(cmd_offset)) {
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_STEREO_X_ZERO value=0x%08" PRIx32 "\n", value);
+			}
 		};
 		g_hw_ctx_indirect_func[Pm4::PA_SC_NGG_MODE_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 			EXIT_NOT_IMPLEMENTED((value & ~0x00ff07ffu) != 0);
 			cp.GetCtx().SetNggModeControl(value);
-			LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_NGG_MODE value=0x%08" PRIx32
-			     " MAX_DEALLOCS=%u MAX_FPOVS=%u SCHEDULING_UNVERIFIED\n",
-			     value, value & 0x7ffu, (value >> 16u) & 0xffu);
+			if (FirstDiagnosticRegisterLog(cmd_offset)) {
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_CX_NGG_MODE value=0x%08" PRIx32
+				     " MAX_DEALLOCS=%u MAX_FPOVS=%u SCHEDULING_UNVERIFIED\n",
+				     value, value & 0x7ffu, (value >> 16u) & 0xffu);
+			}
 		};
 	}
 	g_hw_ctx_indirect_func[Pm4::PA_SC_FOV_WINDOW_TB] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
@@ -4002,9 +4023,11 @@ void GraphicsInitJmpTablesUcIndirect() {
 			for (uint32_t offset = range[0]; offset <= range[1]; ++offset) {
 				g_hw_uc_indirect_func[offset] = [](KYTY_HW_UC_INDIRECT_ARGS) {
 					(void)cp;
-					LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_UC_ZERO_ONLY register=0x%03" PRIx32
-					     " value=0x%08" PRIx32 " SEMANTICS_UNVERIFIED\n",
-					     cmd_offset, value);
+					if (FirstDiagnosticRegisterLog(cmd_offset)) {
+						LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_UC_ZERO_ONLY register=0x%03" PRIx32
+						     " value=0x%08" PRIx32 " SEMANTICS_UNVERIFIED\n",
+						     cmd_offset, value);
+					}
 					EXIT_NOT_IMPLEMENTED(value != 0);
 				};
 			}

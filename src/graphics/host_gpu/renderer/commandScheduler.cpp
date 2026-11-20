@@ -2,9 +2,12 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <optional>
 
@@ -275,7 +278,18 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
+		static const bool timing = std::getenv("KYTY_DIAGNOSTIC_GPU_SLICE_TIMING") != nullptr;
+		const auto        begin  = timing ? Common::Timer::QueryPerformanceCounter() : 0;
 		m_master.Wait(operation.tick);
+		if (timing) {
+			static std::atomic_uint logged = 0;
+			const auto us = (Common::Timer::QueryPerformanceCounter() - begin) * 1000000 /
+			                Common::Timer::QueryPerformanceFrequency();
+			if (us >= 3000 && logged.fetch_add(1) < 4000) {
+				LOGF("FIRST_FRAME_AUDIT GPU_SLICE_TIMING priority_wait us=%" PRIu64 " tick=%" PRIu64 "\n",
+				     us, operation.tick);
+			}
+		}
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}

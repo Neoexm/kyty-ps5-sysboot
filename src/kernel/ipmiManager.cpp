@@ -38,6 +38,10 @@ bool CopyFromAllocation(void* destination, const void* source, uint64_t size);
 bool CopyToAllocation(void* destination, const void* source, uint64_t size);
 } // namespace Libs::Jemspace
 
+namespace Libs::LibJson2 {
+bool ContainsCString(const void* pointer, uint64_t size);
+}
+
 namespace Libs::LibKernel::IpmiManager {
 
 namespace {
@@ -362,6 +366,8 @@ const char* PointerDomain(uint64_t address, uint64_t size, bool writable) {
 	if (guest) return "guest";
 	if (Jemspace::QueryAllocation(reinterpret_cast<void*>(address), size, nullptr, nullptr))
 		return "jemspace";
+	if (LibJson2::ContainsCString(reinterpret_cast<void*>(address), size) && !writable)
+		return "json2_cstring";
 	if (CanAccessCurrentThreadStack(reinterpret_cast<void*>(address), size, writable))
 		return "native_stack";
 	return "unowned";
@@ -372,6 +378,16 @@ bool ReadInvokeSpan(uint64_t address, void* out, uint64_t size) {
 	auto* source = reinterpret_cast<void*>(address);
 	if (Memory::CopyFromGuest(out, source, size)) return true;
 	if (Jemspace::CopyFromAllocation(out, source, size)) return true;
+	if (LibJson2::ContainsCString(source, size)) {
+#if defined(_WIN32)
+		// The range can outlive a later mutation of its string, like a native c_str pointer, and freed heap may be decommitted.
+		SIZE_T copied = 0;
+		return ReadProcessMemory(GetCurrentProcess(), source, out, size, &copied) && copied == size;
+#else
+		std::memcpy(out, source, size);
+		return true;
+#endif
+	}
 	if (!CanAccessCurrentThreadStack(source, size, false)) return false;
 	std::memcpy(out, source, size);
 	return true;
@@ -860,7 +876,8 @@ int Receive(int32_t handle, const uint8_t* args) {
 		handler = found->second.handler;
 	}
 	Packet     packet;
-	const auto start = std::chrono::steady_clock::now();
+	uint32_t   peer_pid = 0;
+	const auto start    = std::chrono::steady_clock::now();
 	for (;;) {
 		{
 			std::lock_guard lock(state_mutex);
@@ -868,8 +885,15 @@ int Receive(int32_t handle, const uint8_t* args) {
 			if (found == servers.end()) return IPMI_FAIL("RECEIVE", handle, 0, KERNEL_ERROR_EBADF);
 		}
 		if (packet.request ||
-		    IpmiScope::TryReceive(server, &packet.request, &packet.client, &packet.bytes))
-			break;
+		    IpmiScope::TryReceive(server, &packet.request, &packet.client, &packet.bytes)) {
+			// A client that closed between queueing and dequeue has withdrawn the request; libSceIpmi ud2s on any receive error but EAGAIN, so it is never delivered.
+			if (!packet.client || IpmiScope::InspectPeerClient(server, packet.client, &peer_pid))
+				break;
+			LOGF("ORIGINAL_APP_IPMI_RECEIVE_WITHDRAWN server=%u client=%u pid=%d request=%u\n", server,
+			     packet.client, Process::GetPid(), packet.request);
+			packet = {};
+			continue;
+		}
 		if (timeout != UINT32_MAX &&
 		    std::chrono::steady_clock::now() - start >= std::chrono::microseconds(timeout))
 			return timeout ? IPMI_FAIL("RECEIVE", handle, 0, KERNEL_ERROR_ETIMEDOUT)
@@ -892,10 +916,7 @@ int Receive(int32_t handle, const uint8_t* args) {
 	ReceivedRequest receipt {server, packet.request};
 	if (packet.bytes.size() < 4)
 		return IPMI_FAIL("RECEIVE", handle, packet.request, KERNEL_ERROR_EIO);
-	const auto kind     = Load<uint32_t>(packet.bytes.data());
-	uint32_t   peer_pid = 0;
-	if (!IpmiScope::InspectPeerClient(server, packet.client, &peer_pid))
-		return IPMI_FAIL("RECEIVE", handle, packet.request, KERNEL_ERROR_ECONNRESET);
+	const auto kind = Load<uint32_t>(packet.bytes.data());
 	std::vector<uint8_t> body;
 	uint64_t             output_offset  = 0;
 	int32_t              session_handle = 0;
@@ -1026,7 +1047,17 @@ int Invoke(int32_t handle, const uint8_t* args) {
 	uint64_t    input_bytes     = 0;
 	uint64_t    output_capacity = 0;
 	const char* pointer_domain  = "not_checked";
+	uint64_t    fault_address   = 0;
+	uint64_t    fault_size      = 0;
+	static std::atomic_uint32_t efault_count {0};
 	auto        trace_rnps      = [&](const char* stage, int result, int index) {
+		if (result == KERNEL_ERROR_EFAULT && fault_address != 0 && efault_count.fetch_add(1) < 64) {
+			LOGF("ORIGINAL_APP_IPMI_INVOKE_EFAULT pid=%d handle=%d method=%08x stage=%s index=%d"
+			     " address=%016llx size=%llu pointer_domain=%s\n",
+			     Process::GetPid(), handle, method, stage, index,
+			     static_cast<unsigned long long>(fault_address),
+			     static_cast<unsigned long long>(fault_size), pointer_domain);
+		}
 		if (rnps_trace) {
 			LOGF("SHELLUI_RNPS_IPMI_PROVENANCE pid=%d handle=%d method=%08x"
 			     " in_count=%u out_count=%u flag=%u stage=%s index=%d"
@@ -1044,7 +1075,9 @@ int Invoke(int32_t handle, const uint8_t* args) {
 	if (flag > 1)
 		return IPMI_FAIL("INVOKE", handle, 0, trace_rnps("header_flag", KERNEL_ERROR_EINVAL, -1));
 	if (!CanWriteInvokeSpan(method_result, 4)) {
-		if (rnps_trace) pointer_domain = PointerDomain(method_result, 4, true);
+		fault_address  = method_result;
+		fault_size     = 4;
+		pointer_domain = PointerDomain(method_result, 4, true);
 		return IPMI_FAIL("INVOKE", handle, 0, trace_rnps("method_result", KERNEL_ERROR_EFAULT, -1));
 	}
 	std::vector<uint8_t> packet;
@@ -1060,8 +1093,9 @@ int Invoke(int32_t handle, const uint8_t* args) {
 			    "INVOKE", handle, 0,
 			    trace_rnps("input_descriptor_overflow", KERNEL_ERROR_EFAULT, static_cast<int>(i)));
 		if (!ReadInvokeSpan(inputs + i * 16, descriptor, sizeof(descriptor))) {
-			if (rnps_trace)
-				pointer_domain = PointerDomain(inputs + i * 16, sizeof(descriptor), false);
+			fault_address  = inputs + i * 16;
+			fault_size     = sizeof(descriptor);
+			pointer_domain = PointerDomain(inputs + i * 16, sizeof(descriptor), false);
 			return IPMI_FAIL(
 			    "INVOKE", handle, 0,
 			    trace_rnps("input_descriptor", KERNEL_ERROR_EFAULT, static_cast<int>(i)));
@@ -1080,7 +1114,9 @@ int Invoke(int32_t handle, const uint8_t* args) {
 		const auto offset = packet.size();
 		packet.resize(offset + descriptor[1]);
 		if (!ReadInvokeSpan(descriptor[0], packet.data() + offset, descriptor[1])) {
-			if (rnps_trace) pointer_domain = PointerDomain(descriptor[0], descriptor[1], false);
+			fault_address  = descriptor[0];
+			fault_size     = descriptor[1];
+			pointer_domain = PointerDomain(descriptor[0], descriptor[1], false);
 			return IPMI_FAIL("INVOKE", handle, 0,
 			                 trace_rnps("input_payload", KERNEL_ERROR_EFAULT, static_cast<int>(i)));
 		}
@@ -1094,13 +1130,17 @@ int Invoke(int32_t handle, const uint8_t* args) {
 			    "INVOKE", handle, 0,
 			    trace_rnps("output_descriptor_overflow", KERNEL_ERROR_EFAULT, static_cast<int>(i)));
 		if (!ReadInvokeSpan(outputs + i * 24, out[i].data(), 24)) {
-			if (rnps_trace) pointer_domain = PointerDomain(outputs + i * 24, 24, false);
+			fault_address  = outputs + i * 24;
+			fault_size     = 24;
+			pointer_domain = PointerDomain(outputs + i * 24, 24, false);
 			return IPMI_FAIL(
 			    "INVOKE", handle, 0,
 			    trace_rnps("output_descriptor", KERNEL_ERROR_EFAULT, static_cast<int>(i)));
 		}
 		if (!CanWriteInvokeSpan(out[i][0], out[i][1])) {
-			if (rnps_trace) pointer_domain = PointerDomain(out[i][0], out[i][1], true);
+			fault_address  = out[i][0];
+			fault_size     = out[i][1];
+			pointer_domain = PointerDomain(out[i][0], out[i][1], true);
 			return IPMI_FAIL("INVOKE", handle, 0,
 			                 trace_rnps("output_buffer", KERNEL_ERROR_EFAULT, static_cast<int>(i)));
 		}

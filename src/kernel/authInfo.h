@@ -4,8 +4,11 @@
 #include "common/common.h"
 
 #include <array>
+#include <filesystem>
+#include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace Libs::LibKernel::AuthInfo {
 
@@ -16,6 +19,7 @@ constexpr size_t   kCaptureEnvelopeSize    = 0x108;
 constexpr size_t   kScopedCaptureSize      = 0x150;
 constexpr size_t   kObservationSize        = 200;
 constexpr size_t   kScopedObservationSize  = 0x118;
+constexpr size_t   kCaptureCatalogueCapacity = 256 * 1024;
 constexpr uint64_t kFilteredCapabilityMask = 0x7000000000000000ull;
 
 inline constexpr char kCapturePathEnvironment[]   = "KYTY_PS5_CAPTURED_AUTHINFO";
@@ -70,6 +74,20 @@ enum class CaptureLoadResult {
 	Absent,
 	Verified,
 	Rejected,
+};
+
+class CaptureCatalogue {
+public:
+	bool Add(const Digest& self_sha256, const Digest& envelope_sha256,
+	         const std::filesystem::path& path, std::string* reason);
+	CaptureLoadResult Load(const ImageIdentity& image, Capture* capture, std::string* reason) const;
+	bool Encode(uint8_t* output, size_t capacity, size_t* written, std::string* reason) const;
+	bool Decode(const uint8_t* data, size_t size, std::string* reason);
+	size_t Size() const { return m_entries.size(); }
+	void Clear() { m_entries.clear(); }
+
+private:
+	std::map<Digest, std::pair<Digest, std::filesystem::path>> m_entries;
 };
 
 uint64_t    AuthorityId(const Record& record);

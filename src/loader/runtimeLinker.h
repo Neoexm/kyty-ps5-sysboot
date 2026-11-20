@@ -9,6 +9,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -158,6 +159,9 @@ struct Program {
 	bool                            fail_if_global_not_resolved = true;
 	bool                            dbg_print_reloc             = false;
 	std::vector<uint8_t>            rela_bits;
+	// unset rela_bits indices from the last full scan; anything that clears a bit must reset rela_pending_valid
+	std::vector<uint32_t>           rela_pending;
+	bool                            rela_pending_valid          = false;
 	uint64_t                        proc_param_vaddr            = 0;
 };
 
@@ -232,6 +236,7 @@ private:
 	static void SetupTlsHandler(Program* program);
 	void        WriteUnresolvedSymbols();
 	void        RefreshNeededModules();
+	void        RebuildAddrRanges();
 	bool        IsProgramReferenced(Program* program);
 	bool        IsThreadAtexitReferenced(Program* program);
 	int         ProgramUnloadStatus(Program* program);
@@ -250,6 +255,15 @@ private:
 	bool                            m_shellui_npcommon_pool_owned    = false;
 	std::unique_ptr<SymbolDatabase> m_symbols;
 	Common::Mutex                   m_mutex;
+
+	// Segment index for FindProgramByAddr, which runs on every guest pthread mutex lock and must not wait on m_mutex while modules relocate.
+	struct AddrRange {
+		uint64_t begin;
+		uint64_t end;
+		Program* program;
+	};
+	std::vector<AddrRange> m_addr_ranges;
+	std::shared_mutex      m_addr_ranges_mutex;
 
 	application_heap_malloc_func_t         m_application_heap_malloc         = nullptr;
 	application_heap_free_func_t           m_application_heap_free           = nullptr;

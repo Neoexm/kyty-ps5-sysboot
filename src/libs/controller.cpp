@@ -114,6 +114,8 @@ public:
 	void  ResetOrientation();
 	void  ResetInputState();
 	void  SetHostInputSharedProducer(bool enabled);
+	void  RefreshHostPhysicalConnection();
+	void  GetHostPhysicalConnectionInfo(HostPhysicalConnectionInfo* info);
 	void  ReleaseHostPads();
 	void  GetConnectionInfo(bool* flag, int* count);
 	void  SetVibration(uint8_t large_motor, uint8_t small_motor);
@@ -141,6 +143,7 @@ private:
 	int              m_active_id       = -1;
 	bool             m_connected       = false;
 	int              m_connected_count = 0;
+	HostPhysicalConnectionInfo m_physical;
 	bool             m_motion_enabled  = true;
 	uint64_t         m_gyro_time       = 0;
 	// Accelerometer gravity direction in the reset frame.
@@ -393,25 +396,49 @@ void GameController::Disconnect(int id) {
 }
 
 void GameController::CheckActive() {
-	int  new_active_id = -1;
-	bool new_connected = false;
-
-	if (!m_connected_ids.empty()) {
-		new_active_id = m_connected_ids[0];
-		for (const auto id: m_connected_ids) {
-			if (id != HOST_INPUT_CONTROLLER_ID) {
-				new_active_id = id;
-				break;
+	int                        new_active_id = m_connected_ids.empty() ? -1 : m_connected_ids[0];
+	const bool                 new_connected = !m_connected_ids.empty();
+	HostPhysicalConnectionInfo physical;
+	for (const auto id: m_connected_ids) {
+		if (id == HOST_INPUT_CONTROLLER_ID) continue;
+		auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
+		const bool ps5 = pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5;
+		HostConnectionTransport transport = HostConnectionTransport::Unknown;
+		if (pad != nullptr) {
+			switch (SDL_GetGamepadConnectionState(pad)) {
+				case SDL_JOYSTICK_CONNECTION_WIRED:
+					transport = HostConnectionTransport::Wired;
+					break;
+				case SDL_JOYSTICK_CONNECTION_WIRELESS:
+					transport = HostConnectionTransport::Wireless;
+					break;
+				default: break;
 			}
 		}
-		new_connected = true;
+		if (!physical.connected || (ps5 && !physical.ps5) ||
+		    (ps5 && physical.ps5 && transport == HostConnectionTransport::Wired &&
+		     physical.transport != HostConnectionTransport::Wired)) {
+			new_active_id      = id;
+			physical.connected = true;
+			physical.ps5       = ps5;
+			physical.transport = transport;
+		}
 	}
-
-	if (m_connected == new_connected && m_active_id == new_active_id) {
-		return;
-	}
+	const bool physical_attached = !m_physical.connected && physical.connected;
+	physical.connected_count =
+	    m_physical.connected_count + static_cast<uint32_t>(physical_attached);
+	const bool physical_changed = m_physical.connected != physical.connected ||
+	                              m_physical.ps5 != physical.ps5 ||
+	                              m_physical.transport != physical.transport;
+	m_physical = physical;
 	if (!m_connected && new_connected) {
 		m_connected_count++;
+	} else if (physical_attached) {
+		m_connected_count++;
+	}
+	if (m_connected == new_connected && m_active_id == new_active_id) {
+		if (physical_changed) PublishHostInput();
+		return;
 	}
 	m_active_id          = new_active_id;
 	m_connected          = new_connected;
@@ -424,6 +451,8 @@ void GameController::CheckActive() {
 	m_vibration          = {};
 	m_vibration_until    = 0;
 	m_trigger_effect     = {};
+	AddState();
+	PublishHostInput();
 }
 
 void GameController::AddState() {
@@ -442,6 +471,10 @@ void GameController::PublishHostInput() {
 	if (!m_host_input_shared_producer) return;
 	HostInputShared::State state;
 	state.buttons = m_state.buttons;
+	state.physical_connected = static_cast<uint8_t>(m_physical.connected);
+	state.physical_ps5 = static_cast<uint8_t>(m_physical.ps5);
+	state.physical_transport = static_cast<uint8_t>(m_physical.transport);
+	state.physical_connected_count = m_physical.connected_count;
 	std::copy_n(m_state.axes, state.axes.size(), state.axes.begin());
 	for (size_t i = 0; i < state.touch.size(); i++) {
 		state.touch[i] = {m_state.touch[i].id, static_cast<uint8_t>(m_state.touch[i].down ? 1 : 0),
@@ -459,10 +492,31 @@ void GameController::SetHostInputSharedProducer(bool enabled) {
 	if (enabled) PublishHostInput();
 }
 
+void GameController::RefreshHostPhysicalConnection() {
+	Common::LockGuard lock(m_mutex);
+	CheckActive();
+}
+
+void GameController::GetHostPhysicalConnectionInfo(HostPhysicalConnectionInfo* info) {
+	EXIT_IF(info == nullptr);
+	Common::LockGuard lock(m_mutex);
+	SyncHostInput();
+	*info = m_physical;
+}
+
 void GameController::SyncHostInput() {
 	std::array<HostInputShared::State, STATES_MAX> states;
 	const auto count = HostInputShared::Read(&m_host_input_reader, states.data(), states.size());
 	for (size_t index = 0; index < count; index++) {
+		if (states[index].physical_connected_count > m_physical.connected_count && m_connected) {
+			m_connected_count +=
+			    static_cast<int>(states[index].physical_connected_count - m_physical.connected_count);
+		}
+		m_physical.connected = states[index].physical_connected != 0;
+		m_physical.ps5 = states[index].physical_ps5 != 0;
+		m_physical.transport =
+		    static_cast<HostConnectionTransport>(states[index].physical_transport);
+		m_physical.connected_count = states[index].physical_connected_count;
 		m_state.buttons = states[index].buttons;
 		std::copy(states[index].axes.begin(), states[index].axes.end(), m_state.axes);
 		for (size_t i = 0; i < states[index].touch.size(); i++) {
@@ -486,7 +540,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 		m_state.buttons = down ? m_state.buttons | button : m_state.buttons & ~button;
 
 		AddState();
-		if (id == HOST_INPUT_CONTROLLER_ID) PublishHostInput();
+		PublishHostInput();
 	}
 }
 
@@ -513,7 +567,7 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 		}
 
 		AddState();
-		if (id == HOST_INPUT_CONTROLLER_ID) PublishHostInput();
+		PublishHostInput();
 	}
 }
 
@@ -525,7 +579,7 @@ void GameController::RightStick(int id, int x, int y) {
 		m_state.axes[static_cast<int>(Axis::RightX)] = x;
 		m_state.axes[static_cast<int>(Axis::RightY)] = y;
 		AddState();
-		if (id == HOST_INPUT_CONTROLLER_ID) PublishHostInput();
+		PublishHostInput();
 	}
 }
 
@@ -550,7 +604,7 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 			                       : m_state.buttons & ~PAD_BUTTON_TOUCH_PAD;
 		}
 		AddState();
-		if (id == HOST_INPUT_CONTROLLER_ID) PublishHostInput();
+		PublishHostInput();
 	}
 }
 
@@ -901,6 +955,14 @@ void ResetInputState() {
 
 void SetHostInputSharedProducer(bool enabled) {
 	g_controller->SetHostInputSharedProducer(enabled);
+}
+
+void RefreshHostPhysicalConnection() {
+	g_controller->RefreshHostPhysicalConnection();
+}
+
+void GetHostPhysicalConnectionInfo(HostPhysicalConnectionInfo* info) {
+	g_controller->GetHostPhysicalConnectionInfo(info);
 }
 
 int GetActiveControllerId() {

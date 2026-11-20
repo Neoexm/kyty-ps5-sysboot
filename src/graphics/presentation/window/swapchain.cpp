@@ -322,6 +322,11 @@ struct Presenter::Impl {
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
+		if (owner.headless) {
+			// Flips still prepare frames, they just never reach a swapchain.
+			frames.Initialize(3, vk::Format::eB8G8R8A8Unorm);
+			return;
+		}
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
@@ -1099,9 +1104,14 @@ bool Presenter::IsGuestPaused() const noexcept {
 }
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
+	if (m_impl->window.headless) return false;
 	const auto visual = GetSystemOverlayVisualState();
 	return visual.active ||
 	       visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
+}
+
+bool Presenter::IsHeadless() const noexcept {
+	return m_impl->window.headless;
 }
 
 RenderContext& Presenter::Renderer() const noexcept {
@@ -1142,6 +1152,7 @@ void Presenter::ClearLayer(int bus) {
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
+	if (window.headless) return;
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (swapchain.NeedsResize()) {

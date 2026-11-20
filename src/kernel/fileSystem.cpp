@@ -95,8 +95,18 @@ static int ValidateMountedTraversal(const std::string& path) {
 	NullfsMount::Resolution resolution;
 	const int               resolved = NullfsMount::Resolve(path, &resolution);
 	if (resolved != OK) return resolved;
-	const auto& actual    = resolution.mounted ? resolution.path : path;
-	const int   temporary = Tmpfs::ValidateTraversal(actual);
+	const auto& actual = resolution.mounted ? resolution.path : path;
+	// A passthrough mounted on a tmpfs directory covers it, so tmpfs only walks down to the point.
+	std::string covered = actual;
+	if (DirectoryPassthrough::Contains(actual) && Tmpfs::Contains(actual)) {
+		for (auto slash = covered.rfind('/'); slash != std::string::npos && slash > 0;
+		     slash      = covered.rfind('/')) {
+			auto parent = covered.substr(0, slash);
+			if (!DirectoryPassthrough::Contains(parent)) break;
+			covered = std::move(parent);
+		}
+	}
+	const int temporary = Tmpfs::ValidateTraversal(covered);
 	if (temporary != OK) return temporary;
 	const int exfat = ExfatMount::ValidateTraversal(actual);
 	if (exfat != OK) return exfat;
@@ -565,7 +575,7 @@ struct SharedGuestPipe {
 		return Open(name, true);
 	}
 
-	int64_t Read(void* buffer, size_t length) {
+	int64_t Read(void* buffer, size_t length, bool nonblocking) {
 		if (length == 0) {
 			return 0;
 		}
@@ -595,13 +605,16 @@ struct SharedGuestPipe {
 			if (writers == 0) {
 				return 0;
 			}
+			if (nonblocking) {
+				return KERNEL_ERROR_EAGAIN;
+			}
 			if (WaitForSingleObject(readable, 100) == WAIT_FAILED) {
 				return KERNEL_ERROR_EIO;
 			}
 		}
 	}
 
-	int64_t Write(const void* buffer, size_t length) {
+	int64_t Write(const void* buffer, size_t length, bool nonblocking) {
 		size_t      written = 0;
 		const auto* input   = static_cast<const uint8_t*>(buffer);
 		while (written != length) {
@@ -628,6 +641,9 @@ struct SharedGuestPipe {
 			written += count;
 			Notify(readers, writers);
 			ReleaseMutex(mutex);
+			if (count == 0 && nonblocking) {
+				return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EAGAIN;
+			}
 			if (count == 0 && WaitForSingleObject(writable, 100) == WAIT_FAILED) {
 				return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EIO;
 			}
@@ -643,6 +659,8 @@ struct GuestPipe {
 	std::deque<uint8_t>     data;
 	uint32_t                readers = 1;
 	uint32_t                writers = 1;
+	std::atomic_bool        read_nonblocking {false};
+	std::atomic_bool        write_nonblocking {false};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::shared_ptr<SharedGuestPipe> shared;
 #endif
@@ -674,6 +692,8 @@ class MountPoints {
 public:
 	struct MountPair {
 		std::filesystem::path dir;
+		// weakly_canonical(dir) at mount time, empty if the folder did not exist yet
+		std::filesystem::path canonical_dir;
 		std::string           point;
 		std::shared_ptr<Common::ArchiveReader> archive;
 		bool                                   read_only = false;
@@ -1370,6 +1390,8 @@ public:
 	int  AcquireSocketPipe(int fd, bool receive, std::shared_ptr<GuestPipe>* pipe);
 	int  GetFlags(int fd);
 	int  SetFlags(int fd, int flags);
+	int  GetStatusFlags(int fd);
+	int  SetStatusFlags(int fd, int flags);
 	int  Export(std::string* manifest);
 	int  Import(const std::string& manifest);
 	bool HasExplicitStandardTable() const { return m_explicit_standard; }
@@ -1574,16 +1596,22 @@ static void ReleaseSocketEndpoint(File* file) {
 }
 
 static int64_t ReadGuestPipe(const std::shared_ptr<GuestPipe>& pipe, void* buf, size_t size) {
+	const bool nonblocking = pipe->read_nonblocking.load();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (pipe->shared) {
-		return pipe->shared->Read(buf, size);
+		return pipe->shared->Read(buf, size, nonblocking);
 	}
 #endif
 	if (size == 0) {
 		return 0;
 	}
 	std::unique_lock lock(pipe->mutex);
-	pipe->cv.wait(lock, [&] { return !pipe->data.empty() || pipe->writers == 0; });
+	if (nonblocking && pipe->data.empty() && pipe->writers != 0) {
+		return KERNEL_ERROR_EAGAIN;
+	}
+	if (!nonblocking) {
+		pipe->cv.wait(lock, [&] { return !pipe->data.empty() || pipe->writers == 0; });
+	}
 	const auto count = std::min(size, pipe->data.size());
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf), count);
 	auto* output = static_cast<uint8_t*>(buf);
@@ -1598,9 +1626,10 @@ static int64_t ReadGuestPipe(const std::shared_ptr<GuestPipe>& pipe, void* buf, 
 
 static int64_t WriteGuestPipe(const std::shared_ptr<GuestPipe>& pipe, const void* buf,
                               size_t size) {
+	const bool nonblocking = pipe->write_nonblocking.load();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (pipe->shared) {
-		return pipe->shared->Write(buf, size);
+		return pipe->shared->Write(buf, size, nonblocking);
 	}
 #endif
 	constexpr size_t limit   = 1024 * 1024;
@@ -1608,7 +1637,12 @@ static int64_t WriteGuestPipe(const std::shared_ptr<GuestPipe>& pipe, const void
 	size_t           written = 0;
 	while (written != size) {
 		std::unique_lock lock(pipe->mutex);
-		pipe->cv.wait(lock, [&] { return pipe->data.size() < limit || pipe->readers == 0; });
+		if (nonblocking && pipe->data.size() == limit && pipe->readers != 0) {
+			return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EAGAIN;
+		}
+		if (!nonblocking) {
+			pipe->cv.wait(lock, [&] { return pipe->data.size() < limit || pipe->readers == 0; });
+		}
 		if (pipe->readers == 0) {
 			return written ? static_cast<int64_t>(written) : KERNEL_ERROR_EPIPE;
 		}
@@ -2107,9 +2141,9 @@ static std::shared_ptr<LvdDevice> FindLvdDevice(const std::string& path) {
 	return ParseLvdDevicePath(path, &unit) ? FindLvdDevice(unit) : nullptr;
 }
 
-static void FillLvdStat(FileStat* stat, bool block_device) {
+static void FillLvdStat(FileStat* stat) {
 	*stat            = {};
-	stat->st_mode    = block_device ? 0060600u : 0020600u;
+	stat->st_mode    = 0020600u;
 	stat->st_nlink   = 1;
 	stat->st_blksize = 0x4000;
 }
@@ -2642,12 +2676,74 @@ int FileDescriptors::SetFlags(int fd, int flags) {
 	return OK;
 }
 
+int FileDescriptors::GetStatusFlags(int fd) {
+	if (fd < 0) return KERNEL_ERROR_EBADF;
+	Common::LockGuard lock(m_mutex);
+	if (fd < DESCRIPTOR_MIN) {
+		return m_explicit_standard && !m_standard_deci[fd] ? KERNEL_ERROR_EBADF
+		                                                    : (fd == 0 ? 0 : 1);
+	}
+	const size_t index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size() || m_files[index] == nullptr || !m_files[index]->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	const auto* file = m_files[index];
+	if (file->special == SpecialFile::PipeRead && file->pipe) {
+		return file->pipe->read_nonblocking.load() ? 4 : 0;
+	}
+	if (file->special == SpecialFile::PipeWrite && file->pipe) {
+		return 1 | (file->pipe->write_nonblocking.load() ? 4 : 0);
+	}
+	if (file->special == SpecialFile::GuestSocketPair && file->pipe && file->socket_send) {
+		return 2 | (file->pipe->read_nonblocking.load() ? 4 : 0);
+	}
+	return KERNEL_ERROR_ENOSYS;
+}
+
+int FileDescriptors::SetStatusFlags(int fd, int flags) {
+	if (fd < 0) return KERNEL_ERROR_EBADF;
+	Common::LockGuard lock(m_mutex);
+	if (fd < DESCRIPTOR_MIN) {
+		return m_explicit_standard && !m_standard_deci[fd] && !m_standard_console[fd]
+		           ? KERNEL_ERROR_EBADF : KERNEL_ERROR_ENOSYS;
+	}
+	const size_t index = static_cast<size_t>(fd - DESCRIPTOR_MIN);
+	if (index >= m_files.size() || m_files[index] == nullptr || !m_files[index]->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if ((flags & ~7) != 0) return KERNEL_ERROR_EINVAL;
+	auto* file = m_files[index];
+	const bool nonblocking = (flags & 4) != 0;
+	if (file->special == SpecialFile::PipeRead && file->pipe) {
+		file->pipe->read_nonblocking.store(nonblocking);
+		return OK;
+	}
+	if (file->special == SpecialFile::PipeWrite && file->pipe) {
+		file->pipe->write_nonblocking.store(nonblocking);
+		return OK;
+	}
+	if (file->special == SpecialFile::GuestSocketPair && file->pipe && file->socket_send) {
+		file->pipe->read_nonblocking.store(nonblocking);
+		file->socket_send->write_nonblocking.store(nonblocking);
+		return OK;
+	}
+	return KERNEL_ERROR_ENOSYS;
+}
+
 int GetDescriptorFlags(int fd) {
 	return g_files == nullptr ? KERNEL_ERROR_EBADF : g_files->GetFlags(fd);
 }
 
 int SetDescriptorFlags(int fd, int flags) {
 	return g_files == nullptr ? KERNEL_ERROR_EBADF : g_files->SetFlags(fd, flags);
+}
+
+int GetStatusFlags(int fd) {
+	return g_files == nullptr ? KERNEL_ERROR_EBADF : g_files->GetStatusFlags(fd);
+}
+
+int SetStatusFlags(int fd, int flags) {
+	return g_files == nullptr ? KERNEL_ERROR_EBADF : g_files->SetStatusFlags(fd, flags);
 }
 
 int FileDescriptors::Export(std::string* manifest) {
@@ -2985,6 +3081,13 @@ void MountPoints::Mount(const std::filesystem::path& folder, const std::string& 
 	p.point     = point_str;
 	p.archive   = Common::OpenArchive(folder);
 	p.read_only = read_only;
+	{
+		std::error_code error;
+		if (std::filesystem::is_directory(folder, error)) {
+			p.canonical_dir = std::filesystem::weakly_canonical(folder, error);
+			if (error) p.canonical_dir.clear();
+		}
+	}
 
 	m_mount_pairs.push_back(std::move(p));
 	if (read_only) {
@@ -3124,21 +3227,6 @@ static bool SamePsmShellUiFile(HANDLE left, HANDLE right) {
 	       left_info.dwVolumeSerialNumber == right_info.dwVolumeSerialNumber &&
 	       left_info.nFileIndexHigh == right_info.nFileIndexHigh &&
 	       left_info.nFileIndexLow == right_info.nFileIndexLow;
-}
-
-static bool SamePsmShellUiFile(const std::filesystem::path& left,
-                               const std::filesystem::path& right) {
-	const auto open = [](const std::filesystem::path& path) {
-		return CreateFileW(path.c_str(), GENERIC_READ,
-		                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-		                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	};
-	const HANDLE left_handle  = open(left);
-	const HANDLE right_handle = open(right);
-	const bool   same         = SamePsmShellUiFile(left_handle, right_handle);
-	if (left_handle != INVALID_HANDLE_VALUE) CloseHandle(left_handle);
-	if (right_handle != INVALID_HANDLE_VALUE) CloseHandle(right_handle);
-	return same;
 }
 #else
 static bool SamePsmShellUiFile(const std::filesystem::path& left,
@@ -3396,8 +3484,28 @@ static bool ResolvePsmShellUiPackageRoot(std::filesystem::path* root) {
 static bool IsPsmShellUiProtectedPackageFile(const std::filesystem::path& path) {
 	std::filesystem::path root;
 	if (!ResolvePsmShellUiPackageRoot(&root)) return false;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// every loader probe lands here, most of them misses, so open the candidate once for both targets
+	const auto open = [](const std::filesystem::path& file) {
+		return CreateFileW(file.c_str(), GENERIC_READ,
+		                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+		                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	};
+	const HANDLE candidate = open(path);
+	if (candidate == INVALID_HANDLE_VALUE) return false;
+	bool same = false;
+	for (const auto& file: {root / "eboot.bin", root / "psm" / "Application" / "app.exe.sprx"}) {
+		const HANDLE target = open(file);
+		same = SamePsmShellUiFile(candidate, target);
+		if (target != INVALID_HANDLE_VALUE) CloseHandle(target);
+		if (same) break;
+	}
+	CloseHandle(candidate);
+	return same;
+#else
 	return SamePsmShellUiFile(path, root / "eboot.bin") ||
 	       SamePsmShellUiFile(path, root / "psm" / "Application" / "app.exe.sprx");
+#endif
 }
 
 bool MountPoints::IsReadOnly(const std::filesystem::path& path) {
@@ -3485,6 +3593,53 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 #else
 static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_path) {
 	return relative_path.find_first_of("<>:\"|?*") != std::string::npos;
+}
+#endif
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// The not-found codes the MSVC STL weakly_canonical walks past.
+static bool IsCanonicalNotFound(const std::error_code& error) {
+	switch (error.value()) {
+		case ERROR_FILE_NOT_FOUND:
+		case ERROR_PATH_NOT_FOUND:
+		case ERROR_BAD_NETPATH:
+		case ERROR_INVALID_NAME:
+		case ERROR_BAD_PATHNAME:
+		case ERROR_DIRECTORY:
+		case ERROR_NETNAME_DELETED: return true;
+		default: return false;
+	}
+}
+
+// Same result as std::filesystem::weakly_canonical, which after a miss re-canonicalizes every prefix from the drive root, one GetFinalPathNameByHandleW each. Every prefix up to the mount directory resolves to canonical_dir, so the walk starts there.
+static std::filesystem::path WeaklyCanonicalUnder(const std::filesystem::path& dir, const std::filesystem::path& canonical_dir,
+                                                  const std::filesystem::path& input, std::error_code& error) {
+	auto result = std::filesystem::canonical(input, error);
+	if (!error) return result;
+	if (!IsCanonicalNotFound(error)) return {};
+	const auto normalized = input.lexically_normal();
+	auto       component  = normalized.begin();
+	for (const auto& part: dir.lexically_normal()) {
+		if (component == normalized.end() || *component != part) return std::filesystem::weakly_canonical(input, error);
+		++component;
+	}
+	error.clear();
+	result              = canonical_dir;
+	bool call_canonical = true;
+	for (; component != normalized.end(); ++component) {
+		result /= *component;
+		if (!call_canonical) continue;
+		auto canonical = std::filesystem::canonical(result, error);
+		if (!error) {
+			result = std::move(canonical);
+		} else if (IsCanonicalNotFound(error)) {
+			error.clear();
+			call_canonical = false;
+		} else {
+			return {};
+		}
+	}
+	return result;
 }
 #endif
 
@@ -3681,9 +3836,15 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		auto actual = ResolvePathIgnoringCase(p.dir / native_rel_path);
 #endif
 		std::error_code error;
-		const auto      root = std::filesystem::weakly_canonical(p.dir, error);
+		const auto      root =
+		    p.canonical_dir.empty() ? std::filesystem::weakly_canonical(p.dir, error) : p.canonical_dir;
 		if (error) return {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		actual = p.canonical_dir.empty() ? std::filesystem::weakly_canonical(actual, error)
+		                                 : WeaklyCanonicalUnder(p.dir, p.canonical_dir, actual, error);
+#else
 		actual = std::filesystem::weakly_canonical(actual, error);
+#endif
 		if (error) return {};
 		auto target = actual.begin();
 		for (auto component = root.begin(); component != root.end(); ++component, ++target) {
@@ -3733,7 +3894,8 @@ static bool HasDataTopology() {
 }
 
 static DataTopologyPath ResolveDataTopologyPath(const std::string& path) {
-	if (path.empty() || path[0] != '/' || !HasDataTopology()) return DataTopologyPath::None;
+	// HasDataTopology resolves /data on every call, so only ask once the path is under it
+	if (path.empty() || path[0] != '/') return DataTopologyPath::None;
 	bool data = false;
 	for (size_t start = 1; start <= path.size();) {
 		const auto end       = path.find('/', start);
@@ -3745,7 +3907,7 @@ static DataTopologyPath ResolveDataTopologyPath(const std::string& path) {
 				data = true;
 			} else if (data) {
 				const auto prefix = "/data/" + component;
-				if (g_mount_points->HasNonRootMountForPath(prefix)) {
+				if (!HasDataTopology() || g_mount_points->HasNonRootMountForPath(prefix)) {
 					return DataTopologyPath::None;
 				}
 				return DataTopologyPath::Missing;
@@ -3756,7 +3918,7 @@ static DataTopologyPath ResolveDataTopologyPath(const std::string& path) {
 		if (end == std::string::npos) break;
 		start = end + 1;
 	}
-	return data ? DataTopologyPath::Directory : DataTopologyPath::None;
+	return data && HasDataTopology() ? DataTopologyPath::Directory : DataTopologyPath::None;
 }
 
 static void FillDataTopologyStat(FileStat* stat) {
@@ -4510,6 +4672,7 @@ static std::string ReadOnlyProviderPoint(const std::string& device) {
 }
 
 static std::string ReadOnlyProviderFileSystemType(const std::string& device) {
+	if (device.starts_with("/dev/lvd")) return "ufs";
 	return device.starts_with("/dev/ssd0.") ? "exfatfs" : "";
 }
 
@@ -4701,7 +4864,10 @@ int MountRegisteredPartitionPassthrough(const std::string& device, const std::st
 	std::string normalized;
 	const int   parsed = Tmpfs::NormalizePath(point, &normalized);
 	if (parsed != OK) return parsed;
-	if (Tmpfs::Overlaps(normalized) || ExfatMount::Overlaps(normalized) ||
+	const auto slash    = normalized.rfind('/');
+	const bool on_tmpfs = slash != std::string::npos &&
+	                      Tmpfs::Contains(slash == 0 ? std::string("/") : normalized.substr(0, slash));
+	if ((!on_tmpfs && Tmpfs::Overlaps(normalized)) || ExfatMount::Overlaps(normalized) ||
 	    BfsMount::Overlaps(normalized) || NullfsMount::Overlaps(normalized) ||
 	    g_mount_points->HasSubmount(normalized))
 		return KERNEL_ERROR_EBUSY;
@@ -5460,8 +5626,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 	if (!directory) {
 		if (auto lvd = FindLvdDevice(file->name)) {
-			if ((flags != 0 && flags != 2) || mode != 0 || append || creat || trunc || excl ||
-			    direct) {
+			if (flags_u > 2u || mode != 0 || append || creat || trunc || excl || direct) {
 				g_files->DeleteDescriptor(descriptor);
 				return KERNEL_ERROR_EINVAL;
 			}
@@ -9729,7 +9894,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	}
 	if (std::strcmp(path, "/dev/lvdctl") == 0 || FindLvdDevice(path)) {
 		FileStat stat {};
-		FillLvdStat(&stat, std::strcmp(path, "/dev/lvdctl") != 0);
+		FillLvdStat(&stat);
 		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
 	}
 	if (auto backing = FindSectorPayload(path)) {
@@ -9898,7 +10063,7 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	}
 	if (file->special == SpecialFile::LvdCtl || file->special == SpecialFile::LvdDevice) {
 		FileStat stat {};
-		FillLvdStat(&stat, file->special == SpecialFile::LvdDevice);
+		FillLvdStat(&stat);
 		return Memory::CopyToGuest(sb, &stat, sizeof(stat)) ? OK : KERNEL_ERROR_EFAULT;
 	}
 	if (file->data_topology) {
@@ -10153,10 +10318,10 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 		if (traversal != OK) return traversal;
 	}
 	if (nullfs_read_only) return NullfsReadOnlyLookup(path, false);
+	if (DirectoryPassthrough::Contains(path)) return DirectoryPassthrough::Unlink(path);
 	if (Tmpfs::Contains(path)) return Tmpfs::Unlink(path);
 	if (ExfatMount::Contains(path)) return KERNEL_ERROR_EROFS;
 	if (BfsMount::Contains(path)) return KERNEL_ERROR_EROFS;
-	if (DirectoryPassthrough::Contains(path)) return DirectoryPassthrough::Unlink(path);
 	if (ResolveDataTopologyPath(path) != DataTopologyPath::None) return KERNEL_ERROR_EROFS;
 	auto real_file_name = g_mount_points->ResolvePath(path);
 	if (g_mount_points->IsReadOnly(real_file_name)) return KERNEL_ERROR_EROFS;
@@ -10365,13 +10530,13 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 		if (traversal != OK) return traversal;
 	}
 	if (nullfs_read_only) return NullfsReadOnlyLookup(path, true);
+	if (DirectoryPassthrough::Contains(path))
+		return DirectoryPassthrough::Mkdir(path,
+		                                   mode & ~g_creation_mask.load(std::memory_order_relaxed));
 	if (Tmpfs::Contains(path))
 		return Tmpfs::Mkdir(path, mode & ~g_creation_mask.load(std::memory_order_relaxed));
 	if (ExfatMount::Contains(path)) return KERNEL_ERROR_EROFS;
 	if (BfsMount::Contains(path)) return KERNEL_ERROR_EROFS;
-	if (DirectoryPassthrough::Contains(path))
-		return DirectoryPassthrough::Mkdir(path,
-		                                   mode & ~g_creation_mask.load(std::memory_order_relaxed));
 	if (ResolveDataTopologyPath(path) != DataTopologyPath::None) return KERNEL_ERROR_EROFS;
 	if (std::strlen(path) > 255) {
 		return KERNEL_ERROR_ENAMETOOLONG;
@@ -10425,10 +10590,10 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 		if (traversal != OK) return traversal;
 	}
 	if (nullfs_read_only) return NullfsReadOnlyLookup(path, false);
+	if (DirectoryPassthrough::Contains(path)) return DirectoryPassthrough::Rmdir(path);
 	if (Tmpfs::Contains(path)) return Tmpfs::Rmdir(path);
 	if (ExfatMount::Contains(path)) return KERNEL_ERROR_EROFS;
 	if (BfsMount::Contains(path)) return KERNEL_ERROR_EROFS;
-	if (DirectoryPassthrough::Contains(path)) return DirectoryPassthrough::Rmdir(path);
 	if (ResolveDataTopologyPath(path) != DataTopologyPath::None) return KERNEL_ERROR_EROFS;
 	LOGF("\t path = %s\n", path);
 
@@ -10489,7 +10654,7 @@ int KYTY_SYSV_ABI KernelUnmount(const char* path, int flags) {
 				return beneath(mount.source);
 			});
 			const bool submounts =
-			    DevfsInstanceOverlaps(normalized) ||
+			    DevfsInstanceOverlaps(normalized) || DirectoryPassthrough::Overlaps(normalized) ||
 			    std::any_of(nullfs.begin(), nullfs.end(),
 				            [&](const auto& mount) { return beneath(mount.point); });
 			result = upper || submounts ? KERNEL_ERROR_EBUSY : Tmpfs::Unmount(normalized);
@@ -10526,6 +10691,10 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 		if (traversal != OK) return traversal;
 	}
 	if (DevfsInstanceAt(path)) return OK;
+	if (DirectoryPassthrough::Contains(path)) {
+		DirectoryPassthrough::NodeStat stat {};
+		return DirectoryPassthrough::Stat(path, &stat);
+	}
 	if (Tmpfs::Contains(path)) {
 		Tmpfs::NodeStat stat {};
 		return Tmpfs::Stat(path, &stat);
@@ -10537,10 +10706,6 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 	if (BfsMount::Contains(path)) {
 		BfsMount::NodeStat stat {};
 		return BfsMount::Stat(path, &stat);
-	}
-	if (DirectoryPassthrough::Contains(path)) {
-		DirectoryPassthrough::NodeStat stat {};
-		return DirectoryPassthrough::Stat(path, &stat);
 	}
 	const auto data_topology = ResolveDataTopologyPath(path);
 	if (data_topology == DataTopologyPath::Directory) return OK;

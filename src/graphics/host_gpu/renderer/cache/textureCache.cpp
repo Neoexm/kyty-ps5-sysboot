@@ -151,7 +151,7 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
       m_blit_helper(graphics, scheduler),
-      m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
+      m_tiler(graphics, scheduler, [&buffer_cache]() -> StreamBuffer& { return buffer_cache.GetUtilityBuffer(MemoryUsage::Stream); }),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -1232,7 +1232,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 }
 
 void TextureCache::RefreshCrossProcessImage(Image& image) {
-	if (image.info.data.Empty()) {
+	// A GPU-modified image ignores the result, and page hashes are only compared on demand, so a skipped
+	// validation is caught by the next consumer of those pages. Saves re-hashing 4K render targets per submission.
+	if (image.info.data.Empty() || image.IsGpuModified()) {
 		return;
 	}
 	const auto validation =

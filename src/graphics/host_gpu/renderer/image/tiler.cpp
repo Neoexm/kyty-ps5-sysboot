@@ -28,8 +28,8 @@
 namespace Libs::Graphics {
 
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
-                         StreamBuffer& stream_buffer)
-    : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
+                         std::function<StreamBuffer&()> stream_buffer)
+    : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(std::move(stream_buffer)) {
 	static_assert(FamilyCount == 9);
 	static_assert(sizeof(Push) == 60);
 	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
@@ -205,13 +205,14 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 	const uint64_t stride = Common::AlignUp<uint64_t>(sizeof(Push), uniform_alignment);
 	EXIT_NOT_IMPLEMENTED(dispatches.size() > UINT64_MAX / stride);
 	const uint64_t bytes  = dispatches.size() * stride;
-	auto [mapped, offset] = m_stream_buffer.Map(bytes, uniform_alignment);
+	auto& stream          = m_stream_buffer();
+	auto [mapped, offset] = stream.Map(bytes, uniform_alignment);
 	EXIT_IF(mapped == nullptr);
 	for (size_t index = 0; index < dispatches.size(); index++) {
 		std::memcpy(mapped + index * stride, &dispatches[index].push, sizeof(Push));
 		dispatches[index].params_offset = offset + index * stride;
 	}
-	m_stream_buffer.Commit();
+	stream.Commit();
 }
 
 vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
@@ -294,7 +295,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	barriers[2]               = barriers[0];
 	barriers[2].srcAccessMask = vk::AccessFlagBits::eHostWrite;
 	barriers[2].dstAccessMask = vk::AccessFlagBits::eUniformRead;
-	barriers[2].buffer        = m_stream_buffer.Handle();
+	barriers[2].buffer        = m_stream_buffer().Handle();
 	barriers[2].offset        = dispatches.front().params_offset;
 	barriers[2].size =
 	    dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
@@ -315,7 +316,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
 	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
 	for (auto& dispatch: dispatches) {
-		const vk::DescriptorBufferInfo        params_info {m_stream_buffer.Handle(),
+		const vk::DescriptorBufferInfo        params_info {m_stream_buffer().Handle(),
 		                                                   dispatch.params_offset, sizeof(Push)};
 		const vk::DescriptorBufferInfo        infos[] {source_info, target_info, params_info};
 		std::array<vk::WriteDescriptorSet, 3> writes {};

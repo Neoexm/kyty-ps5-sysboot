@@ -54,6 +54,7 @@ std::map<int, std::pair<std::string, std::string>> g_spawn_sandboxes;
 #if defined(_WIN32)
 HANDLE g_validated_original_self = INVALID_HANDLE_VALUE;
 HANDLE g_validated_exec_elf      = INVALID_HANDLE_VALUE;
+AuthInfo::CaptureCatalogue g_auth_info_catalogue;
 
 bool SameValidatedImageFile(HANDLE validated, const std::filesystem::path& path) {
 	if (validated == INVALID_HANDLE_VALUE || path.empty()) return false;
@@ -205,6 +206,8 @@ struct ExecHandoff {
 	uint8_t       auth_info_capture[AuthInfo::kCaptureEnvelopeSize];
 	char          request[kRequestCapacity];
 	volatile LONG startup_stage;
+	uint32_t      catalogue_bytes;
+	uint8_t       catalogue[AuthInfo::kCaptureCatalogueCapacity];
 };
 
 static_assert(offsetof(ExecHandoff, auth_info_present) == 80);
@@ -222,6 +225,12 @@ void WipeRequest(ExecHandoff* shared) {
 	const size_t size = std::min<size_t>(shared->request_bytes, kRequestCapacity);
 	if (size != 0) SecureZeroMemory(shared->request, size);
 	shared->request_bytes = 0;
+}
+
+void WipeCatalogueSlot(ExecHandoff* shared) {
+	if (shared == nullptr) return;
+	SecureZeroMemory(&shared->catalogue_bytes,
+	                 sizeof(shared->catalogue_bytes) + sizeof(shared->catalogue));
 }
 
 void WipeJsonStrings(Json* value) {
@@ -383,6 +392,7 @@ struct HostImage {
 		if (shared != nullptr) {
 			WipeAuthInfoSlot(shared);
 			WipeRequest(shared);
+			WipeCatalogueSlot(shared);
 			UnmapViewOfFile(shared);
 		}
 		for (auto handle: {mapping, prepared, release, process, job, monitor_gate}) {
@@ -451,6 +461,91 @@ bool StripAuthInfoEnvironment() {
 	for (const auto& name: names) {
 		if (_wputenv_s(name.c_str(), L"") != 0) return false;
 	}
+	return true;
+}
+
+bool ReadRootAuthInfoCatalogue(AuthInfo::CaptureCatalogue* catalogue, std::string* reason) {
+	if (catalogue == nullptr) {
+		if (reason != nullptr) *reason = "catalogue output unavailable";
+		return false;
+	}
+	struct EnvironmentBlock {
+		LPWCH data = GetEnvironmentStringsW();
+		~EnvironmentBlock() { if (data != nullptr) FreeEnvironmentStringsW(data); }
+	} block;
+	if (block.data == nullptr) {
+		if (reason != nullptr) *reason = "catalogue environment unavailable";
+		return false;
+	}
+	constexpr std::wstring_view path_base = L"KYTY_PS5_CAPTURED_AUTHINFO";
+	constexpr std::wstring_view hash_base = L"KYTY_PS5_CAPTURED_AUTHINFO_SHA256";
+	std::map<AuthInfo::Digest, std::pair<std::wstring, std::wstring>> sources;
+	for (const auto* item = block.data; *item != 0; item += std::wcslen(item) + 1) {
+		const std::wstring_view entry(item);
+		const auto equal = entry.find(L'=', entry[0] == L'=' ? 1 : 0);
+		if (equal == std::wstring_view::npos) continue;
+		const auto key = entry.substr(0, equal);
+		const auto value = entry.substr(equal + 1);
+		const auto matches = [key](std::wstring_view prefix) {
+			return key.size() >= prefix.size() &&
+			       _wcsnicmp(key.data(), prefix.data(), prefix.size()) == 0;
+		};
+		if ((key.size() == path_base.size() && matches(path_base)) ||
+		    (key.size() == hash_base.size() && matches(hash_base)))
+			continue;
+		const bool hash = key.size() > hash_base.size() && matches(hash_base) &&
+		                  key[hash_base.size()] == L'_';
+		const bool path = !hash && key.size() > path_base.size() && matches(path_base) &&
+		                  key[path_base.size()] == L'_';
+		if (!hash && !path) continue;
+		const auto suffix = key.substr((hash ? hash_base : path_base).size() + 1);
+		if (suffix.size() != 64 || value.empty()) {
+			if (reason != nullptr) *reason = "catalogue key or value invalid";
+			return false;
+		}
+		std::string self_hex;
+		self_hex.reserve(suffix.size());
+		for (const wchar_t character: suffix) {
+			if (character > 0x7f) {
+				if (reason != nullptr) *reason = "catalogue SELF hash invalid";
+				return false;
+			}
+			self_hex.push_back(static_cast<char>(character));
+		}
+		AuthInfo::Digest self_sha256 {};
+		if (!AuthInfo::ParseDigestHex(self_hex, &self_sha256)) {
+			if (reason != nullptr) *reason = "catalogue SELF hash invalid";
+			return false;
+		}
+		auto& pair = sources[self_sha256];
+		auto& destination = hash ? pair.second : pair.first;
+		if (!destination.empty()) {
+			if (reason != nullptr) *reason = "catalogue duplicate SELF hash";
+			return false;
+		}
+		destination.assign(value);
+	}
+	AuthInfo::CaptureCatalogue decoded;
+	for (const auto& [self_sha256, pair]: sources) {
+		if (pair.first.empty() || pair.second.empty() || pair.second.size() != 64) {
+			if (reason != nullptr) *reason = "catalogue path/hash pair incomplete";
+			return false;
+		}
+		std::string hash_hex;
+		hash_hex.reserve(pair.second.size());
+		for (const wchar_t character: pair.second) {
+			if (character > 0x7f) {
+				if (reason != nullptr) *reason = "catalogue envelope hash invalid";
+				return false;
+			}
+			hash_hex.push_back(static_cast<char>(character));
+		}
+		AuthInfo::Digest envelope_sha256 {};
+		if (!AuthInfo::ParseDigestHex(hash_hex, &envelope_sha256) ||
+		    !decoded.Add(self_sha256, envelope_sha256, std::filesystem::path(pair.first), reason))
+			return false;
+	}
+	*catalogue = std::move(decoded);
 	return true;
 }
 
@@ -912,6 +1007,13 @@ void InstallRootOriginalSelf(const Emulator::RunOptions& options) {
 	// mini-syscore has no exec request, so it binds its own SELF like an exec child
 	const auto* root_self = std::getenv("KYTY_DIAGNOSTIC_ORIGINAL_SELF");
 	if (!options.exec_endpoint.empty() || root_self == nullptr) return;
+	std::string catalogue_reason;
+	if (!ReadRootAuthInfoCatalogue(&g_auth_info_catalogue, &catalogue_reason)) {
+		LOGF("AUTHINFO_CATALOGUE root=1 status=rejected reason=%s\n", catalogue_reason.c_str());
+		EXIT("root AuthInfo catalogue rejected\n");
+	}
+	LOGF("AUTHINFO_CATALOGUE root=1 status=verified entries=%zu\n",
+	     g_auth_info_catalogue.Size());
 	AuthInfo::ImageIdentity identity;
 	std::string             reason;
 	// options.elf is the /app0 path from --game; the host file is app0_dir/<name>
@@ -944,6 +1046,25 @@ void InstallRootOriginalSelf(const Emulator::RunOptions& options) {
 		     AuthInfo::DigestHex(observation.evidence_sha256).c_str(),
 		     static_cast<unsigned long long>(observation.facts.known_capability0),
 		     observation.facts.root_prison_known ? 1 : 0, observation.facts.root_prison ? 1 : 0);
+	}
+	SensitiveCapture capture;
+	std::string      capture_reason;
+	const auto capture_result = g_auth_info_catalogue.Load(identity, &capture.value, &capture_reason);
+	if (capture_result == AuthInfo::CaptureLoadResult::Rejected ||
+	    (capture_result == AuthInfo::CaptureLoadResult::Verified &&
+	     !InstallVerifiedAuthInfo(capture.value))) {
+		if (capture_result == AuthInfo::CaptureLoadResult::Verified)
+			capture_reason = "verified identity or observation mismatch";
+		LOGF("AUTHINFO_CAPTURE_INPUT provenance=environment root=1 status=rejected reason=%s\n",
+		     capture_reason.c_str());
+		EXIT("root AuthInfo capture rejected\n");
+	}
+	if (capture_result == AuthInfo::CaptureLoadResult::Verified) {
+		LOGF("AUTHINFO_CAPTURE_INPUT provenance=environment root=1 envelope_sha256=%s "
+		     "self_sha256=%s elf_sha256=%s status=verified\n",
+		     AuthInfo::DigestHex(capture.value.envelope_sha256).c_str(),
+		     AuthInfo::DigestHex(capture.value.self_sha256).c_str(),
+		     AuthInfo::DigestHex(capture.value.elf_sha256).c_str());
 	}
 #endif
 }
@@ -1139,6 +1260,27 @@ bool InitializeExecChild(const std::string& endpoint) {
 	            auth_info_slot.capture.size());
 	WipeAuthInfoSlot(image->shared);
 	g_child_image = image;
+	g_auth_info_catalogue.Clear();
+	const auto catalogue_bytes = image->shared->catalogue_bytes;
+	AuthInfo::CaptureCatalogue inherited_catalogue;
+	std::string catalogue_reason;
+	const bool catalogue_valid =
+	    catalogue_bytes <= AuthInfo::kCaptureCatalogueCapacity &&
+	    std::all_of(image->shared->catalogue + catalogue_bytes,
+	                image->shared->catalogue + AuthInfo::kCaptureCatalogueCapacity,
+	                [](uint8_t byte) { return byte == 0; }) &&
+	    inherited_catalogue.Decode(image->shared->catalogue, catalogue_bytes, &catalogue_reason);
+	WipeCatalogueSlot(image->shared);
+	if (!catalogue_valid) {
+		WipeRequest(image->shared);
+		LOGF("AUTHINFO_CATALOGUE provenance=exec status=rejected reason=%s\n",
+		     catalogue_reason.empty() ? "handoff malformed" : catalogue_reason.c_str());
+		ReportChildError(KERNEL_ERROR_ENOEXEC);
+		return false;
+	}
+	g_auth_info_catalogue = std::move(inherited_catalogue);
+	LOGF("AUTHINFO_CATALOGUE provenance=exec status=verified entries=%zu\n",
+	     g_auth_info_catalogue.Size());
 	MarkExecChildStartupStage(1);
 	SensitiveString encoded_request;
 	try {
@@ -1533,16 +1675,14 @@ int ExecImage(const std::string& guest_path, const std::filesystem::path& host_p
 	SensitiveCapture            auth_info_capture;
 	std::string                 auth_info_reason;
 	AuthInfo::CaptureLoadResult auth_info_result     = AuthInfo::CaptureLoadResult::Absent;
-	const char*                 auth_info_provenance = IsExecChild() ? "installed" : "environment";
+	const char*                 auth_info_provenance = "catalogue";
 	if (!original_self.empty()) {
-		if (IsExecChild()) {
-			if (GetVerifiedAuthInfoForImage(self_identity, &auth_info_capture.value)) {
-				auth_info_result = AuthInfo::CaptureLoadResult::Verified;
-			}
-		} else {
-			auth_info_result = AuthInfo::LoadCaptureFromEnvironment(
-			    self_identity.self_sha256, self_identity.elf_sha256, self_identity.authority_id,
-			    &auth_info_capture.value, &auth_info_reason);
+		auth_info_result = g_auth_info_catalogue.Load(self_identity, &auth_info_capture.value,
+		                                               &auth_info_reason);
+		if (auth_info_result == AuthInfo::CaptureLoadResult::Absent && IsExecChild() &&
+		    GetVerifiedAuthInfoForImage(self_identity, &auth_info_capture.value)) {
+			auth_info_result = AuthInfo::CaptureLoadResult::Verified;
+			auth_info_provenance = "installed";
 		}
 	}
 	if (auth_info_result == AuthInfo::CaptureLoadResult::Rejected) {
@@ -1609,6 +1749,16 @@ int ExecImage(const std::string& guest_path, const std::filesystem::path& host_p
 	    MapViewOfFile(image->mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(ExecHandoff)));
 	if (!image->shared) return KERNEL_ERROR_ENOMEM;
 	std::memset(image->shared, 0, sizeof(*image->shared));
+	size_t catalogue_bytes = 0;
+	std::string catalogue_reason;
+	if (!g_auth_info_catalogue.Encode(image->shared->catalogue,
+	                                  sizeof(image->shared->catalogue), &catalogue_bytes,
+	                                  &catalogue_reason)) {
+		LOGF("AUTHINFO_CATALOGUE provenance=exec status=rejected reason=%s\n",
+		     catalogue_reason.c_str());
+		return KERNEL_ERROR_ENOEXEC;
+	}
+	image->shared->catalogue_bytes = static_cast<uint32_t>(catalogue_bytes);
 	if (auth_info_result == AuthInfo::CaptureLoadResult::Verified) {
 		image->shared->auth_info_present = 1;
 		image->shared->auth_info_bytes =

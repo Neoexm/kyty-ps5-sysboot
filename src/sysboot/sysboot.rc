@@ -7,6 +7,7 @@ BEGIN
 	BEGIN
 		MENUITEM "&Boot sys", IDM_BOOT
 		MENUITEM "&Stop sys", IDM_STOP
+		MENUITEM "&Reset console state...", IDM_RESET_STATE
 		MENUITEM SEPARATOR
 		MENUITEM "&Preferences...", IDM_PREFERENCES
 		MENUITEM SEPARATOR
@@ -18,24 +19,19 @@ BEGIN
 	END
 END
 
-IDD_PREFERENCES DIALOGEX 0, 0, 322, 168
+IDD_PREFERENCES DIALOGEX 0, 0, 322, 121
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Preferences"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-	LTEXT "PS5 IP address:", -1, 8, 10, 78, 8
-	EDITTEXT IDC_IP, 90, 8, 120, 12, ES_AUTOHSCROLL
-	LTEXT "Payload port:", -1, 8, 28, 78, 8
-	EDITTEXT IDC_PORT, 90, 26, 44, 12, ES_NUMBER
-	LTEXT "Token file:", -1, 8, 46, 78, 8
-	EDITTEXT IDC_TOKEN, 90, 44, 172, 12, ES_AUTOHSCROLL
-	PUSHBUTTON "Browse...", IDC_TOKEN_BROWSE, 266, 43, 48, 14
-	LTEXT "Repository folder:", -1, 8, 64, 78, 8
-	EDITTEXT IDC_REPO, 90, 62, 172, 12, ES_AUTOHSCROLL
-	PUSHBUTTON "Browse...", IDC_REPO_BROWSE, 266, 61, 48, 14
-	LTEXT "Leave blank to search upwards from the folder kyty_sysboot.exe is in.", -1, 90, 77, 224, 8
-	AUTOCHECKBOX "Write present readbacks", IDC_READBACKS, 90, 96, 200, 10
-	AUTOCHECKBOX "Show service windows", IDC_SHOW_SERVICES, 90, 110, 200, 10
-	DEFPUSHBUTTON "OK", IDOK, 212, 146, 50, 14
-	PUSHBUTTON "Cancel", IDCANCEL, 266, 146, 48, 14
+	LTEXT "Boot uses saved console data. No PS5 connection is needed.", -1, 8, 10, 306, 8
+	LTEXT "Repository folder:", -1, 8, 28, 78, 8
+	EDITTEXT IDC_REPO, 90, 26, 172, 12, ES_AUTOHSCROLL
+	PUSHBUTTON "Browse...", IDC_REPO_BROWSE, 266, 25, 48, 14
+	LTEXT "Leave blank to search upwards from kyty_sysboot.exe.", -1, 90, 42, 224, 8
+	AUTOCHECKBOX "Write present readbacks", IDC_READBACKS, 90, 60, 200, 10
+	AUTOCHECKBOX "Show service windows", IDC_SHOW_SERVICES, 90, 74, 200, 10
+	PUSHBUTTON "Reset console state...", IDC_RESET_STATE, 8, 99, 112, 14
+	DEFPUSHBUTTON "OK", IDOK, 212, 99, 50, 14
+	PUSHBUTTON "Cancel", IDCANCEL, 266, 99, 48, 14
 END

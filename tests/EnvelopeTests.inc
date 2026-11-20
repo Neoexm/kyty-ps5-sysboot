@@ -759,6 +759,7 @@ void CheckEnvelope(const std::filesystem::path &root) {
   const auto saved_port = save_environment("KYTY_PS5_ENVELOPE_PROVIDER_PORT");
   const auto saved_token = save_environment("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE");
   const auto saved_timeout = save_environment("KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS");
+  const auto saved_replay = save_environment("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX");
   std::array<uint8_t, 32> provider_token {};
   for (size_t i = 0; i < provider_token.size(); i++) provider_token[i] = static_cast<uint8_t>(0x31 + i * 7);
   auto write_token = [&](const std::filesystem::path& path, const std::array<uint8_t, 32>& token, const char* suffix) {
@@ -778,6 +779,7 @@ void CheckEnvelope(const std::filesystem::path &root) {
   write_token(whitespace_token_path, provider_token, "\n\n");
   Check(_putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_PORT", "1") == 0 &&
         _putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS", "100") == 0 &&
+        _putenv_s("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX", "") == 0 &&
         _putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE", Common::PathToString(zero_token_path).c_str()) == 0,
         "set invalid envelope provider token configuration");
   std::shared_ptr<EnvelopeBackend> rejected_provider;
@@ -790,6 +792,35 @@ void CheckEnvelope(const std::filesystem::path &root) {
         CreateConsoleProviderFromEnvironment(&rejected_provider, &provider_error) == ConfigurationStatus::Invalid &&
         rejected_provider == nullptr && !provider_error.empty(),
         "the console provider rejects noncanonical token-file whitespace");
+
+  std::string replay_key;
+  const char* digits = "0123456789abcdef";
+  for (const auto byte: provider_token) {
+    replay_key += digits[byte >> 4];
+    replay_key += digits[byte & 15];
+  }
+  std::shared_ptr<EnvelopeBackend> replay_provider;
+  std::shared_ptr<RnpsBackend> replay_rnps;
+  Check(_putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE", "") == 0 &&
+        _putenv_s("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX", replay_key.c_str()) == 0 &&
+        CreateConsoleProviderFromEnvironment(&replay_provider, &provider_error) == ConfigurationStatus::Configured &&
+        CreateConsoleRnpsProviderFromEnvironment(&replay_rnps, &provider_error) == ConfigurationStatus::Configured &&
+        replay_provider != nullptr && replay_rnps != nullptr,
+        "configure both loopback providers without a token file");
+  replay_provider.reset();
+  replay_rnps.reset();
+  Check(_putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE", Common::PathToString(provider_token_path).c_str()) == 0 &&
+        CreateConsoleProviderFromEnvironment(&rejected_provider, &provider_error) == ConfigurationStatus::Invalid,
+        "reject a replay key combined with a provider token file");
+  Check(_putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE", "") == 0 &&
+        _putenv_s("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX", "invalid") == 0 &&
+        CreateConsoleProviderFromEnvironment(&rejected_provider, &provider_error) == ConfigurationStatus::Invalid,
+        "reject a malformed replay key");
+  Check(_putenv_s("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX", std::string(64, '0').c_str()) == 0 &&
+        CreateConsoleProviderFromEnvironment(&rejected_provider, &provider_error) == ConfigurationStatus::Invalid,
+        "reject an all-zero replay key");
+  Check(_putenv_s("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX", "") == 0,
+        "clear replay key before live provider cases");
 
   auto configure_console = [&](uint16_t port, uint32_t timeout_ms) {
     const auto port_text = std::to_string(port);
@@ -894,7 +925,8 @@ void CheckEnvelope(const std::filesystem::path &root) {
   SetEnvelopeBackendForTesting(nullptr);
   Check(_putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_PORT", saved_port.present ? saved_port.value.c_str() : "") == 0 &&
         _putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE", saved_token.present ? saved_token.value.c_str() : "") == 0 &&
-        _putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS", saved_timeout.present ? saved_timeout.value.c_str() : "") == 0,
+        _putenv_s("KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS", saved_timeout.present ? saved_timeout.value.c_str() : "") == 0 &&
+        _putenv_s("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX", saved_replay.present ? saved_replay.value.c_str() : "") == 0,
         "restore envelope provider environment");
   SecureZeroMemory(provider_token.data(), provider_token.size());
 

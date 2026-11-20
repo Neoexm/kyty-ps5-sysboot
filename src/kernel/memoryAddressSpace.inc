@@ -26,6 +26,15 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
 	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
 }
+
+static bool IsWholePlaceholder(uint64_t vaddr, uint64_t size) {
+	MEMORY_BASIC_INFORMATION info {};
+	return size != 0 &&
+	       VirtualQuery(reinterpret_cast<void*>(vaddr), &info, sizeof(info)) == sizeof(info) &&
+	       info.BaseAddress == reinterpret_cast<void*>(vaddr) &&
+	       info.AllocationBase == reinterpret_cast<void*>(vaddr) &&
+	       info.RegionSize == size && info.State == MEM_RESERVE && info.Type == MEM_PRIVATE;
+}
 #endif
 
 class GuestBackingStore {
@@ -310,6 +319,58 @@ public:
 		return true;
 	}
 
+	// Pages wholly inside one mapping are passed straight from the backing view, the rest are assembled zero-filled like TryReadSparseBacking.
+	bool TryVisitSparseBackingPages(uint64_t vaddr, uint64_t count, uint64_t page_size,
+	                                void (*visit)(void*, uint64_t, const uint8_t*), void* context) {
+		if (!IsAvailable() || visit == nullptr || count == 0 || page_size == 0 ||
+		    count > (UINT64_MAX - vaddr) / page_size) {
+			return false;
+		}
+
+		std::lock_guard lock(m_mutex);
+		const auto      end   = vaddr + count * page_size;
+		auto            first = m_maps.lower_bound(vaddr);
+		if (first != m_maps.begin()) {
+			auto previous = std::prev(first);
+			if (previous->second.vaddr + previous->second.size > vaddr) {
+				first = previous;
+			}
+		}
+		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
+		     ++mapping) {
+			const auto& entry = mapping->second;
+			const auto  start = std::max(vaddr, entry.vaddr);
+			const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
+			if (!RangeOk(entry.backing_offset + start - entry.vaddr, bytes)) {
+				return false;
+			}
+		}
+
+		std::vector<uint8_t> scratch;
+		auto                 mapping = first;
+		for (uint64_t index = 0; index < count; index++) {
+			const auto page     = vaddr + index * page_size;
+			const auto page_end = page + page_size;
+			while (mapping != m_maps.end() && mapping->second.vaddr + mapping->second.size <= page) {
+				++mapping;
+			}
+			if (mapping != m_maps.end() && mapping->second.vaddr <= page &&
+			    mapping->second.vaddr + mapping->second.size >= page_end) {
+				visit(context, index, BackingData(mapping->second.backing_offset + page - mapping->second.vaddr));
+				continue;
+			}
+			scratch.assign(page_size, 0);
+			for (auto it = mapping; it != m_maps.end() && it->second.vaddr < page_end; ++it) {
+				const auto& entry = it->second;
+				const auto  start = std::max(page, entry.vaddr);
+				const auto  bytes = std::min(page_end, entry.vaddr + entry.size) - start;
+				std::memcpy(scratch.data() + (start - page), BackingData(entry.backing_offset + start - entry.vaddr), bytes);
+			}
+			visit(context, index, scratch.data());
+		}
+		return true;
+	}
+
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
@@ -490,8 +551,8 @@ public:
 			if (right_size != 0 && Contains(right_addr, right_size)) {
 				EXIT_IF(!UnmapOne(right_addr, right_size));
 			}
-			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
-			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
+			EXIT_IF(!IsWholePlaceholder(old.vaddr, old.size) &&
+			        !CoalescePlaceholders(old.vaddr, old.size));
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
 			return false;
 		}
@@ -718,6 +779,12 @@ private:
 		if (size == 0) {
 			return true;
 		}
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_fail_next_backing_store_split) {
+			g_test_fail_next_backing_store_split = false;
+			return false;
+		}
+#endif
 		return VirtualFree(reinterpret_cast<void*>(vaddr), size,
 		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
@@ -923,6 +990,26 @@ public:
 			}
 		}
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
+	}
+
+	bool TryVisitSparseBackingPages(uint64_t vaddr, uint64_t count, uint64_t page_size,
+	                                void (*visit)(void*, uint64_t, const uint8_t*), void* context) {
+		if (page_size == 0 || count > UINT64_MAX / page_size || !Owns(vaddr, count * page_size)) {
+			return false;
+		}
+		const auto      size = count * page_size;
+		std::lock_guard lock(m_mutex);
+		auto            mapping = m_mapped.upper_bound(vaddr);
+		if (mapping != m_mapped.begin()) {
+			--mapping;
+		}
+		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
+			const auto& region = mapping->second;
+			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+				return false;
+			}
+		}
+		return m_backing->TryVisitSparseBackingPages(vaddr, count, page_size, visit, context);
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }

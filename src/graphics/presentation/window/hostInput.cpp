@@ -44,6 +44,7 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {"Circle", Controller::PAD_BUTTON_CIRCLE},
     ControlInfo {"Cross", Controller::PAD_BUTTON_CROSS},
     ControlInfo {"Square", Controller::PAD_BUTTON_SQUARE},
+    ControlInfo {"PS", Controller::PAD_BUTTON_PS},
     ControlInfo {"TouchPad", Controller::PAD_BUTTON_TOUCH_PAD, Controller::Axis::AxisMax, false,
 	             0.25f},
     ControlInfo {"TouchPadRight", Controller::PAD_BUTTON_TOUCH_PAD, Controller::Axis::AxisMax,
@@ -238,6 +239,7 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_C: return Controller::PAD_BUTTON_R2;
 		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
 		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
+		case SDLK_P: return Controller::PAD_BUTTON_PS;
 		default: return 0;
 	}
 }

@@ -32,6 +32,7 @@ public:
 	[[nodiscard]] bool           PresentLastFrame();
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
+	[[nodiscard]] bool           IsHeadless() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
 	void                         Present(Frame& frame);
 	void                         Present(std::span<const Layer> layers);

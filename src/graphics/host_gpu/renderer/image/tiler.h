@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <span>
 #include <vector>
@@ -59,7 +60,7 @@ public:
 		uint64_t target_slice_stride = 0;
 	};
 
-	TileManager(GraphicContext& graphics, CommandScheduler& scheduler, StreamBuffer& stream_buffer);
+	TileManager(GraphicContext& graphics, CommandScheduler& scheduler, std::function<StreamBuffer&()> stream_buffer);
 	~TileManager();
 	KYTY_CLASS_NO_COPY(TileManager);
 
@@ -129,7 +130,7 @@ private:
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
-	StreamBuffer&                           m_stream_buffer;
+	std::function<StreamBuffer&()>          m_stream_buffer;
 	std::array<std::unique_ptr<Buffer>, 2>   m_scratch;
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;

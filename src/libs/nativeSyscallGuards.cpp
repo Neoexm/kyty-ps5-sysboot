@@ -2,6 +2,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
+#include "kernel/process.h"
 #include "common/abi.h"
 #include "common/logging/log.h"
 #include "libs/errno.h"
@@ -336,6 +337,37 @@ static int64_t KYTY_SYSV_ABI OriginalSyscoreKevent(uint64_t fd, uint64_t changel
 	return 0;
 }
 
+int64_t KYTY_SYSV_ABI NativeKqueue(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                  uint64_t) {
+	const auto reply = NativeKernelBridge::DispatchSyscall({0x16a, {}});
+	if (reply.value < 0) {
+		*Posix::GetErrorAddr() = reply.posix_errno != 0
+		                             ? reply.posix_errno
+		                             : LibKernel::KernelToPosix(static_cast<int>(reply.value));
+		return -1;
+	}
+	return reply.value;
+}
+
+int64_t KYTY_SYSV_ABI NativeKevent(uint64_t fd, uint64_t changelist, uint64_t nchanges,
+                                  uint64_t eventlist, uint64_t nevents, uint64_t timeout) {
+	std::string process_name;
+	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_EQUEUE_FD") != nullptr &&
+	    LibKernel::Process::FindNameByPid(LibKernel::Process::GetPid(), &process_name) &&
+	    (process_name == "SceSysCore" || process_name == "SceSysCore.elf")) {
+		return OriginalSyscoreKevent(fd, changelist, nchanges, eventlist, nevents, timeout);
+	}
+	const auto reply = NativeKernelBridge::DispatchSyscall(
+	    {0x16b, {fd, changelist, nchanges, eventlist, nevents, timeout}});
+	if (reply.value < 0) {
+		*Posix::GetErrorAddr() = reply.posix_errno != 0
+		                             ? reply.posix_errno
+		                             : LibKernel::KernelToPosix(static_cast<int>(reply.value));
+		return -1;
+	}
+	return reply.value;
+}
+
 static int64_t KYTY_SYSV_ABI OriginalSyscoreRdup(uint64_t parent_pid, uint64_t source_fd, uint64_t,
                                                  uint64_t, uint64_t, uint64_t) {
 	if (parent_pid > INT32_MAX || source_fd > INT32_MAX) {
@@ -408,7 +440,7 @@ LIB_DEFINE(Register) {
 	LIB_FUNC("17Mfe1B3X6U", KernelFstatfs);
 	if (std::getenv("KYTY_DIAGNOSTIC_GUARD_RAW_LIBKERNEL_SYSCALLS") == nullptr) {
 		if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_EQUEUE_FD") != nullptr) {
-			LIB_FUNC("RW-GEfpnsqg", OriginalSyscoreKevent);
+			LIB_FUNC("RW-GEfpnsqg", NativeKevent);
 			LIB_FUNC("MZb0GKT3mo8", OriginalSyscoreSocketPair);
 		}
 		return;
@@ -536,12 +568,8 @@ LIB_DEFINE(Register) {
 	LIB_FUNC("40NtJm4om0A", Unsupported<0x151>);
 	LIB_FUNC("hpoDTzy9Yy0", Unsupported<0x157>);
 	LIB_FUNC("kT7ArRAAzRA", Unsupported<0x167>);
-	LIB_FUNC("nh2IFMgKTv8", Unsupported<0x16a>);
-	if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_EQUEUE_FD") != nullptr) {
-		LIB_FUNC("RW-GEfpnsqg", OriginalSyscoreKevent);
-	} else {
-		LIB_FUNC("RW-GEfpnsqg", Unsupported<0x16b>);
-	}
+	LIB_FUNC("nh2IFMgKTv8", NativeKqueue);
+	LIB_FUNC("RW-GEfpnsqg", NativeKevent);
 	LIB_FUNC("3YnXspQNyw8", Unsupported<0x17a>);
 	LIB_FUNC("t5Buq8foIvg", Unsupported<0x186>);
 	LIB_FUNC("DPd5RrM+-+A", Unsupported<0x187>);

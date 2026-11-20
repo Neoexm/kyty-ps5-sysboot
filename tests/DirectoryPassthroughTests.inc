@@ -1479,7 +1479,10 @@ void CheckFactoryStorageView(const std::filesystem::path& root) {
   const auto upper = root / "factory-storage-upper";
   Check(std::filesystem::create_directories(host / "priv" / "home" / "16f326cf") &&
             std::filesystem::create_directories(host / "priv" / "home" / "000000ff") &&
-            std::filesystem::create_directories(host / "priv" / "mms") && std::filesystem::create_directory(upper),
+            std::filesystem::create_directories(host / "priv" / "mms") &&
+            std::filesystem::create_directory(host / "savedata") &&
+            std::filesystem::create_directory(host / "savedata_prospero") &&
+            std::filesystem::create_directory(upper),
         "create configured-user capture and empty factory upper");
   auto node = [](std::string path, unsigned inode, unsigned mode, unsigned size) {
     return nlohmann::json {{"path", path}, {"inode", inode}, {"mode", mode}, {"size", size}, {"uid", 0u}, {"gid", 5u},
@@ -1487,8 +1490,11 @@ void CheckFactoryStorageView(const std::filesystem::path& root) {
   };
   auto entries = nlohmann::json::array({node("/", 800u, 0040755u, 512u), node("/priv", 801u, 0040755u, 512u),
       node("/priv/home", 802u, 0040755u, 512u), node("/priv/home/16f326cf", 803u, 0040700u, 512u),
-      node("/priv/home/000000ff", 804u, 0040700u, 512u), node("/priv/mms", 805u, 0040755u, 512u)});
-  unsigned inode = 806;
+      node("/priv/home/000000ff", 804u, 0040700u, 512u), node("/priv/mms", 805u, 0040755u, 512u),
+      node("/savedata", 806u, 0040755u, 512u), node("/savedata_prospero", 807u, 0040755u, 512u)});
+  entries[6]["complete"] = false;
+  entries[7]["complete"] = false;
+  unsigned inode = 808;
   const auto add_file = [&](const std::string& guest, const std::filesystem::path& relative, std::string_view bytes) {
     const auto file_path = host / relative;
     { std::ofstream output(file_path, std::ios::binary); output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -1542,9 +1548,20 @@ void CheckFactoryStorageView(const std::filesystem::path& root) {
             Mount::Stat("/system_data/priv/mms/notification2.db", &stat) == KERNEL_ERROR_ENOENT &&
             Mount::Stat("/system_data/priv/home/000000ff/system.dat", &stat) == OK &&
             Mount::Stat("/system_data/priv/mms/app.db", &stat) == OK &&
+            Mount::Stat("/system_data/savedata/a1b2c3d4", &stat) == KERNEL_ERROR_ENOENT &&
+            Mount::Stat("/system_data/savedata_prospero/a1b2c3d4", &stat) == KERNEL_ERROR_ENOENT &&
             names("/system_data/priv/home") == std::vector<std::string> {"000000ff"} &&
             names("/system_data/priv/mms") == std::vector<std::string> {"app.db", "av_content.db"},
         "factory view hides captured account state while preserving system and catalog state");
+  std::shared_ptr<Mount::Handle> save_db;
+  Check(Mount::Mkdir("/system_data/savedata/a1b2c3d4", 0700) == OK &&
+            Mount::Mkdir("/system_data/savedata/a1b2c3d4/db", 0700) == OK &&
+            Mount::Mkdir("/system_data/savedata/a1b2c3d4/db/user", 0700) == OK &&
+            Mount::Open("/system_data/savedata/a1b2c3d4/db/user/savedata.db", 0x202, &save_db, 0600) == OK &&
+            Mount::Write(save_db, "NEW-DB", 6) == 6 && Mount::Close(save_db) == OK &&
+            Mount::Mkdir("/system_data/savedata_prospero/a1b2c3d4", 0700) == OK &&
+            Mount::Stat("/system_data/savedata/a1b2c3d4/db/user/savedata.db", &stat) == OK && stat.size == 6,
+        "factory view creates new user save data under incomplete captured directories");
   std::shared_ptr<Mount::Handle> list, config, notification;
   Check(Mount::Open("/system_data/priv/home/user_list.dat", 0x202, &list, 0600) == OK && Mount::Write(list, "NEW-LIST", 8) == 8 &&
             Mount::Mkdir("/system_data/priv/home/16f326cf", 0700) == OK &&
@@ -1562,6 +1579,8 @@ void CheckFactoryStorageView(const std::filesystem::path& root) {
             Mount::Stat("/system_data/priv/home/16f326cf/config.dat", &stat) == OK && stat.size == 8 &&
             Mount::Stat("/system_data/priv/mms/av_content.db", &stat) == OK && stat.size == 11 &&
             Mount::Stat("/system_data/priv/mms/notification2.db", &stat) == KERNEL_ERROR_ENOENT &&
+            Mount::Stat("/system_data/savedata/a1b2c3d4/db/user/savedata.db", &stat) == OK && stat.size == 6 &&
+            Mount::Stat("/system_data/savedata_prospero/a1b2c3d4", &stat) == OK &&
             names("/system_data/priv/home") == std::vector<std::string> {"000000ff", "16f326cf", "user_list.dat"} &&
             names("/system_data/priv/mms") == std::vector<std::string> {"app.db", "av_content.db"} &&
             Mount::Unmount("/system_data") == OK,

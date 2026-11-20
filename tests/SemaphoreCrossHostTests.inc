@@ -89,8 +89,16 @@ int RunSemaphoreCrossHostChild(int argc, char** argv) {
           "fresh host cannot reopen a dead creator's unlinked name");
     Check(SetEvent(ready), "publish missing-name result");
   } else if (mode == "signal") {
+    sem = reinterpret_cast<Sema::KernelSema>(UINTPTR_MAX);
+    Check(Sema::KernelCreateSema(&sem, "SemaDoorbell", 0x101, 0, 722, nullptr) ==
+              KERNEL_ERROR_EPERM && sem == reinterpret_cast<Sema::KernelSema>(UINTPTR_MAX),
+          "foreign host creator receives EPERM without replacing the named semaphore");
     Check(Sema::KernelOpenExistingSema(&sem, "SemaDoorbell") == OK,
           "opener resolves the cross-host doorbell by name");
+    Sema::KernelSema duplicate = reinterpret_cast<Sema::KernelSema>(UINTPTR_MAX);
+    Check(Sema::KernelCreateSema(&duplicate, "SemaDoorbell", 0x101, 0, 722, nullptr) ==
+              KERNEL_ERROR_EPERM && duplicate == reinterpret_cast<Sema::KernelSema>(UINTPTR_MAX),
+          "foreign host cached opener still receives EPERM on create");
     Check(Sema::KernelDeleteSema(sem) == KERNEL_ERROR_EPERM,
           "opened handle cannot delete the creating host's semaphore");
     Check(SetEvent(ready), "publish opener before blocking on the doorbell");

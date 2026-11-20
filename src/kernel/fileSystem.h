@@ -116,6 +116,8 @@ int  ImportExecNullfsMounts(const std::string& manifest);
 int  ImportExecSandboxMounts(const std::string& root, const std::string& word);
 int  GetDescriptorFlags(int fd);
 int  SetDescriptorFlags(int fd, int flags);
+int  GetStatusFlags(int fd);
+int  SetStatusFlags(int fd, int flags);
 struct GuestSocketReadSource;
 std::shared_ptr<GuestSocketReadSource> PinGuestSocketReadSource(int fd);
 int  QueryGuestSocketReadSource(const std::shared_ptr<GuestSocketReadSource>& source,

@@ -15,6 +15,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+#include <bcrypt.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -27,9 +29,12 @@ namespace {
 constexpr std::array<uint8_t, 8> kCaptureMagic {'K', 'y', 't', 'y', 'A', 'I', '0', '2'};
 constexpr std::array<uint8_t, 8> kScopedMagic {'K', 'y', 't', 'y', 'A', 'P', '0', '2'};
 constexpr std::array<uint8_t, 8> kScopedObservationMagic {'K', 'y', 't', 'y', 'A', 'S', '0', '1'};
+constexpr std::array<uint8_t, 8> kCatalogueMagic {'K', 'y', 't', 'y', 'A', 'C', '0', '1'};
 constexpr uint32_t               kCaptureHeaderSize           = 0x80;
 constexpr uint32_t               kScopedHeaderSize            = 0x48;
 constexpr uint32_t               kScopedObservationHeaderSize = 0x50;
+constexpr uint32_t               kCatalogueHeaderSize         = 16;
+constexpr uint32_t               kCatalogueEntryHeaderSize    = 68;
 
 constexpr std::array<uint32_t, 64> kSha256Constants {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -465,6 +470,17 @@ bool FilterSelfAuthInfo(const Record& caller, const Record& target, Record* outp
 }
 
 Digest Sha256(const void* data, size_t size) {
+#if defined(_WIN32)
+	// Every module load hashes the whole SELF and decrypted ELF; CNG uses the SHA extensions and is an order of magnitude faster than the portable rounds below.
+	if (size <= ULONG_MAX) {
+		Digest digest {};
+		if (BCRYPT_SUCCESS(BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+		                              static_cast<PUCHAR>(const_cast<void*>(data)),
+		                              static_cast<ULONG>(size), digest.data(),
+		                              static_cast<ULONG>(digest.size()))))
+			return digest;
+	}
+#endif
 	Sha256State      state;
 	WipeObjectOnExit wipe_state(&state);
 	if (size != 0) Update(&state, static_cast<const uint8_t*>(data), size);
@@ -606,6 +622,36 @@ bool ParseCaptureEnvelope(const uint8_t* data, size_t size, const Digest& expect
 	                            &expected_elf_sha256, &expected_authority_id, capture, reason);
 }
 
+static CaptureLoadResult LoadCaptureFromPath(const std::filesystem::path& path,
+                                            const Digest& expected_envelope_sha256,
+                                            const Digest& expected_self_sha256,
+                                            const Digest& expected_elf_sha256,
+                                            uint64_t expected_authority_id, Capture* capture,
+                                            std::string* reason) {
+	if (capture == nullptr || !path.is_absolute()) {
+		if (reason != nullptr) *reason = "capture path invalid";
+		return CaptureLoadResult::Rejected;
+	}
+	*capture = {};
+	std::array<uint8_t, kCaptureEnvelopeSize> encoded {};
+	WipeBufferOnExit                          wipe_encoded(&encoded);
+	const auto                                snapshot = ReadCaptureSnapshot(path, &encoded);
+	if (snapshot != CaptureSnapshotResult::Read) {
+		if (reason != nullptr) {
+			*reason = snapshot == CaptureSnapshotResult::WrongSize ? "capture wrong size"
+			          : snapshot == CaptureSnapshotResult::Changed
+			              ? "capture size changed while reading"
+			              : "capture file unavailable";
+		}
+		return CaptureLoadResult::Rejected;
+	}
+	return ParseCaptureEnvelope(encoded.data(), encoded.size(), expected_envelope_sha256,
+	                            expected_self_sha256, expected_elf_sha256,
+	                            expected_authority_id, capture, reason)
+	           ? CaptureLoadResult::Verified
+	           : CaptureLoadResult::Rejected;
+}
+
 CaptureLoadResult LoadCaptureFromEnvironment(const Digest& expected_self_sha256,
                                              const Digest& expected_elf_sha256,
                                              uint64_t expected_authority_id, Capture* capture,
@@ -636,32 +682,120 @@ CaptureLoadResult LoadCaptureFromEnvironment(const Digest& expected_self_sha256,
 	}
 	try {
 		const auto path = std::filesystem::u8path(path_text);
-		if (!path.is_absolute()) {
-			if (reason != nullptr) *reason = "capture path is not absolute";
-			return CaptureLoadResult::Rejected;
-		}
-		std::array<uint8_t, kCaptureEnvelopeSize> encoded {};
-		WipeBufferOnExit                          wipe_encoded(&encoded);
-		const auto                                snapshot = ReadCaptureSnapshot(path, &encoded);
-		if (snapshot != CaptureSnapshotResult::Read) {
-			if (reason != nullptr) {
-				*reason = snapshot == CaptureSnapshotResult::WrongSize ? "capture wrong size"
-				          : snapshot == CaptureSnapshotResult::Changed
-				              ? "capture size changed while reading"
-				              : "capture file unavailable";
-			}
-			return CaptureLoadResult::Rejected;
-		}
-		if (!ParseCaptureEnvelope(encoded.data(), encoded.size(), expected_envelope_sha256,
-		                          expected_self_sha256, expected_elf_sha256, expected_authority_id,
-		                          capture, reason)) {
-			return CaptureLoadResult::Rejected;
-		}
-		return CaptureLoadResult::Verified;
+		return LoadCaptureFromPath(path, expected_envelope_sha256, expected_self_sha256,
+		                           expected_elf_sha256, expected_authority_id, capture, reason);
 	} catch (...) {
 		if (reason != nullptr) *reason = "capture path invalid";
 		return CaptureLoadResult::Rejected;
 	}
+}
+
+bool CaptureCatalogue::Add(const Digest& self_sha256, const Digest& envelope_sha256,
+                           const std::filesystem::path& path, std::string* reason) {
+	try {
+		const auto text = path.u8string();
+		if (!path.is_absolute() || text.empty() ||
+		    std::find(text.begin(), text.end(), char8_t {0}) != text.end())
+			return Fail(reason, "catalogue path invalid");
+		if (!m_entries.emplace(self_sha256, std::make_pair(envelope_sha256, path)).second)
+			return Fail(reason, "catalogue duplicate SELF hash");
+		return true;
+	} catch (...) {
+		return Fail(reason, "catalogue path invalid");
+	}
+}
+
+CaptureLoadResult CaptureCatalogue::Load(const ImageIdentity& image, Capture* capture,
+                                         std::string* reason) const {
+	if (capture == nullptr) {
+		if (reason != nullptr) *reason = "capture output unavailable";
+		return CaptureLoadResult::Rejected;
+	}
+	*capture = {};
+	const auto source = m_entries.find(image.self_sha256);
+	if (source == m_entries.end()) {
+		if (reason != nullptr) *reason = "absent";
+		return CaptureLoadResult::Absent;
+	}
+	return LoadCaptureFromPath(source->second.second, source->second.first,
+	                           image.self_sha256, image.elf_sha256, image.authority_id,
+	                           capture, reason);
+}
+
+bool CaptureCatalogue::Encode(uint8_t* output, size_t capacity, size_t* written,
+                              std::string* reason) const {
+	if (written == nullptr) return Fail(reason, "catalogue output unavailable");
+	*written = 0;
+	if (m_entries.empty()) return true;
+	if (output == nullptr || capacity > kCaptureCatalogueCapacity ||
+	    capacity < kCatalogueHeaderSize || m_entries.size() > UINT32_MAX)
+		return Fail(reason, "catalogue output unavailable");
+	std::copy(kCatalogueMagic.begin(), kCatalogueMagic.end(), output);
+	Store32Little(output + 8, 1);
+	Store32Little(output + 12, static_cast<uint32_t>(m_entries.size()));
+	size_t cursor = kCatalogueHeaderSize;
+	try {
+		for (const auto& [self_sha256, source]: m_entries) {
+			const auto path = source.second.u8string();
+			if (path.empty() || path.size() > UINT32_MAX ||
+			    path.size() > capacity - cursor ||
+			    kCatalogueEntryHeaderSize > capacity - cursor - path.size())
+				return Fail(reason, "catalogue exceeds handoff capacity");
+			std::memcpy(output + cursor, self_sha256.data(), self_sha256.size());
+			cursor += self_sha256.size();
+			std::memcpy(output + cursor, source.first.data(), source.first.size());
+			cursor += source.first.size();
+			Store32Little(output + cursor, static_cast<uint32_t>(path.size()));
+			cursor += 4;
+			std::memcpy(output + cursor, path.data(), path.size());
+			cursor += path.size();
+		}
+	} catch (...) {
+		return Fail(reason, "catalogue path invalid");
+	}
+	*written = cursor;
+	return true;
+}
+
+bool CaptureCatalogue::Decode(const uint8_t* data, size_t size, std::string* reason) {
+	Clear();
+	if (size == 0) return true;
+	if (data == nullptr || size > kCaptureCatalogueCapacity || size < kCatalogueHeaderSize ||
+	    !std::equal(kCatalogueMagic.begin(), kCatalogueMagic.end(), data) ||
+	    Load32Little(data + 8) != 1)
+		return Fail(reason, "catalogue header invalid");
+	const auto count = Load32Little(data + 12);
+	if (count == 0 || count > (size - kCatalogueHeaderSize) / (kCatalogueEntryHeaderSize + 1))
+		return Fail(reason, "catalogue count invalid");
+	CaptureCatalogue decoded;
+	size_t           cursor = kCatalogueHeaderSize;
+	for (uint32_t i = 0; i < count; ++i) {
+		if (kCatalogueEntryHeaderSize > size - cursor)
+			return Fail(reason, "catalogue entry truncated");
+		Digest self_sha256 {};
+		Digest envelope_sha256 {};
+		std::memcpy(self_sha256.data(), data + cursor, self_sha256.size());
+		cursor += self_sha256.size();
+		std::memcpy(envelope_sha256.data(), data + cursor, envelope_sha256.size());
+		cursor += envelope_sha256.size();
+		const auto path_size = Load32Little(data + cursor);
+		cursor += 4;
+		if (path_size == 0 || path_size > size - cursor ||
+		    std::memchr(data + cursor, 0, path_size) != nullptr)
+			return Fail(reason, "catalogue path invalid");
+		try {
+			const std::string path_text(reinterpret_cast<const char*>(data + cursor), path_size);
+			if (!decoded.Add(self_sha256, envelope_sha256,
+			                 std::filesystem::u8path(path_text), reason))
+				return false;
+		} catch (...) {
+			return Fail(reason, "catalogue path invalid");
+		}
+		cursor += path_size;
+	}
+	if (cursor != size) return Fail(reason, "catalogue trailing bytes");
+	m_entries = std::move(decoded.m_entries);
+	return true;
 }
 
 bool ParseObservation(const uint8_t* data, size_t size, const Digest& envelope_sha256,

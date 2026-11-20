@@ -33,6 +33,7 @@ constexpr uint32_t PAD_BUTTON_TRIANGLE  = 0x00001000;
 constexpr uint32_t PAD_BUTTON_CIRCLE    = 0x00002000;
 constexpr uint32_t PAD_BUTTON_CROSS     = 0x00004000;
 constexpr uint32_t PAD_BUTTON_SQUARE    = 0x00008000;
+constexpr uint32_t PAD_BUTTON_PS        = 0x00010000;
 constexpr uint32_t PAD_BUTTON_TOUCH_PAD = 0x00100000;
 
 enum class Axis {
@@ -47,6 +48,15 @@ enum class Axis {
 };
 
 enum class Sensor { Accel, Gyro };
+
+enum class HostConnectionTransport: uint8_t { None, Unknown, Wired, Wireless };
+
+struct HostPhysicalConnectionInfo {
+	bool                    connected = false;
+	bool                    ps5 = false;
+	HostConnectionTransport transport = HostConnectionTransport::None;
+	uint32_t                connected_count = 0;
+};
 
 struct PadControllerInformation;
 struct PadData;
@@ -74,6 +84,8 @@ void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
 void SetHostInputSharedProducer(bool enabled);
+void RefreshHostPhysicalConnection();
+void GetHostPhysicalConnectionInfo(HostPhysicalConnectionInfo* info);
 int  GetActiveControllerId();
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };

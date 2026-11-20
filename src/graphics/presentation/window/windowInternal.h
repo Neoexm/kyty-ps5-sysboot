@@ -56,6 +56,8 @@ struct WindowContext {
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
+	// Service-role windows are never shown, so they get no swapchain and present nothing.
+	bool headless = false;
 
 	Common::Mutex mutex;
 };

@@ -40,6 +40,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
@@ -87,8 +88,8 @@ namespace Libs::NpCommon {
 void SetDiagnosticNativeEntries(uint64_t create, uint64_t config, uint64_t start);
 }
 namespace Libs::LibcInternal {
-void SetNativeStdioEntries(uint64_t fopen, uint64_t fclose, uint64_t fread, uint64_t fseek,
-                           uint64_t ftell);
+void SetNativeStdioEntries(uint64_t fopen, uint64_t fclose, uint64_t fread, uint64_t fgets,
+                           uint64_t fseek, uint64_t ftell);
 }
 
 namespace Loader {
@@ -182,6 +183,1962 @@ static std::atomic<uint32_t> g_agc_pool_malloc_outcome_count {0};
 static std::atomic<uint32_t> g_agc_pool_malloc_install_count {0};
 static std::mutex            g_agc_pool_malloc_install_mutex;
 static std::atomic<uint32_t> g_mbus_guard_rejection_count {0};
+static std::atomic<uint64_t> g_db_recovery_status_entry {0};
+static std::atomic<uint32_t> g_db_recovery_status_calls {0};
+static std::mutex            g_db_recovery_status_mutex;
+static std::atomic<uint64_t> g_db_recovery_bridge_callback_trampoline {0};
+static std::atomic<uint32_t> g_db_recovery_bridge_calls {0};
+static thread_local bool     g_db_recovery_bridge_caught = false;
+static thread_local bool     g_db_recovery_bridge_active = false;
+static thread_local bool     g_db_recovery_pui_callback_entered = false;
+static thread_local bool     g_db_recovery_pui_context_entered = false;
+static thread_local bool     g_db_recovery_pui_closure_active = false;
+static thread_local uint32_t g_db_recovery_pui_closure_call = 0;
+static thread_local bool     g_db_recovery_pui_react_bridge_entered = false;
+static std::atomic<uint64_t> g_db_recovery_pui_resolve_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_pui_callback_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_pui_context_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_pui_enqueue_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_pui_closure_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_pui_react_bridge_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_native_executor_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_managed_progress_trampoline {0};
+static std::atomic<uint32_t> g_db_recovery_managed_progress_calls {0};
+static std::atomic<uint32_t> g_db_recovery_managed_divisor_bits {0};
+static std::atomic<uint64_t> g_db_recovery_managed_getter_trampoline {0};
+static std::atomic<uint32_t> g_db_recovery_managed_getter_calls {0};
+static thread_local bool     g_db_recovery_progress_getter_pending = false;
+static thread_local void*    g_db_recovery_progress_getter_object = nullptr;
+static std::atomic<uint64_t> g_db_recovery_expression_provider_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_float_formatter_trampoline {0};
+static std::atomic<uint64_t> g_db_recovery_single_tostring_trampoline {0};
+static std::atomic<uint64_t> g_background_auto_login_trampoline {0};
+static std::atomic<uint32_t> g_background_auto_login_calls {0};
+static std::atomic<uint64_t> g_system_passcode_input_trampoline {0};
+static std::atomic<uint32_t> g_system_passcode_input_calls {0};
+static std::atomic<uint64_t> g_eval_system_passcode_input_trampoline {0};
+static std::atomic<uint32_t> g_eval_system_passcode_input_calls {0};
+static std::atomic<uint64_t> g_eval_initial_setup_trampoline {0};
+static std::atomic<uint32_t> g_eval_initial_setup_calls {0};
+static std::atomic<uint64_t> g_initial_setup_db_recovery_trampoline {0};
+static std::atomic<uint32_t> g_initial_setup_db_recovery_calls {0};
+static std::atomic<uint64_t> g_ddd_fw_update_trampoline {0};
+static std::atomic<uint32_t> g_ddd_fw_update_calls {0};
+static std::atomic<uint64_t> g_ddd_service_queue_trampoline {0};
+static std::atomic<uint64_t> g_ddd_service_job_trampoline {0};
+static std::atomic<uint64_t> g_ddd_service_lookup_trampoline {0};
+static std::atomic<uint64_t> g_ddd_service_core_trampoline {0};
+static std::atomic<uint64_t> g_ddd_service_client_trampoline {0};
+static std::atomic<uint64_t> g_ddd_service_pus_trampoline {0};
+static std::atomic<uint32_t> g_ddd_service_queue_calls {0};
+static std::atomic<uint32_t> g_ddd_service_job_calls {0};
+static std::atomic<uint32_t> g_ddd_service_lookup_calls {0};
+static thread_local bool     g_ddd_service_job_active = false;
+static thread_local uint32_t g_ddd_service_job_call = 0;
+static std::atomic<uint64_t> g_boot_register_interface_trampoline {0};
+static std::atomic<uint32_t> g_boot_register_interface_calls {0};
+static std::atomic<uint64_t> g_run_manager_register_trampoline {0};
+static std::atomic<uint32_t> g_run_manager_register_legacy_calls {0};
+static std::atomic<uint32_t> g_run_manager_start_home_register_calls {0};
+static std::atomic<uint64_t> g_run_item_initialize_trampoline {0};
+static std::atomic<uint32_t> g_run_item_initialize_legacy_calls {0};
+static std::atomic<uint64_t> g_home_run_manager_call_trampoline {0};
+static std::atomic<uint32_t> g_home_run_manager_call_count {0};
+static std::atomic<uint64_t> g_home_boot_helper_trampoline {0};
+static std::atomic<uint32_t> g_home_boot_helper_calls {0};
+static std::atomic<uint64_t> g_home_first_login_trampoline {0};
+static std::atomic<uint32_t> g_home_first_login_calls {0};
+static std::atomic<uint64_t> g_home_first_login_move_next_trampoline {0};
+static std::atomic<uint32_t> g_home_first_login_move_next_calls {0};
+static std::atomic<uint64_t> g_home_scene_loader_trampoline {0};
+static std::atomic<uint32_t> g_home_scene_loader_calls {0};
+static std::mutex            g_db_recovery_pui_ids_mutex;
+static std::array<std::pair<int32_t, uint32_t>, 64> g_db_recovery_pui_ids {};
+static size_t                g_db_recovery_pui_ids_count = 0;
+
+static uint32_t DbRecoveryPuiTrackedCall(int32_t callback_id) {
+	std::lock_guard<std::mutex> lock(g_db_recovery_pui_ids_mutex);
+	for (size_t i = 0; i < g_db_recovery_pui_ids_count; i++) {
+		if (g_db_recovery_pui_ids[i].first == callback_id) return g_db_recovery_pui_ids[i].second;
+	}
+	return 0;
+}
+
+static void DbRecoveryPuiTrackId(int32_t callback_id, uint32_t call) {
+	std::lock_guard<std::mutex> lock(g_db_recovery_pui_ids_mutex);
+	if (g_db_recovery_pui_ids_count < g_db_recovery_pui_ids.size()) {
+		g_db_recovery_pui_ids[g_db_recovery_pui_ids_count++] = {callback_id, call};
+	}
+}
+
+extern "C" {
+uint64_t g_db_recovery_bridge_catch_trampoline = 0;
+uint64_t g_db_recovery_reflection_provider_trampoline = 0;
+uint64_t g_db_recovery_jtoken_float_trampoline = 0;
+
+void KYTY_SYSV_ABI DbRecoveryJTokenFloatLog(const float* input) {
+	if (!g_db_recovery_bridge_active || input == nullptr) return;
+	float value = 0;
+	std::memcpy(&value, input, sizeof(value));
+	const auto call = g_db_recovery_bridge_calls.load(std::memory_order_relaxed);
+	if (call <= 24 || call % 100 == 0) {
+		LOGF("DB_RECOVERY_FLOAT_TOKEN_AUDIT call=%u jtoken_writer_input=%f\n", call,
+		     value);
+	}
+}
+
+void KYTY_SYSV_ABI DbRecoveryBoxedFloatLog(void* boxed, void* target, int32_t provider) {
+	if (!g_db_recovery_progress_getter_pending ||
+	    target != g_db_recovery_progress_getter_object) return;
+	g_db_recovery_progress_getter_pending = false;
+	float value = 0;
+	if (boxed != nullptr) {
+		std::memcpy(&value, reinterpret_cast<const uint8_t*>(boxed) + 0x10,
+		            sizeof(value));
+	}
+	const auto call = g_db_recovery_bridge_calls.load(std::memory_order_relaxed);
+	if (call <= 24 || call % 100 == 0) {
+		LOGF("DB_RECOVERY_BOXED_FLOAT_AUDIT call=%u provider=%s"
+		     " box_present=%u boxed_progress_rate=%f\n", call,
+		     provider == 0 ? "reflection" : "expression", boxed != nullptr ? 1u : 0u, value);
+	}
+}
+
+void KYTY_SYSV_ABI DbRecoveryBridgeCatchLog() {
+	g_db_recovery_bridge_caught = true;
+	LOGF("DB_RECOVERY_BRIDGE_AUDIT exception_landing=1\n");
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+__attribute__((naked)) void KYTY_SYSV_ABI DbRecoveryBridgeCatchAudit() {
+	__asm__ volatile("pushfq\n\t"
+	                 "push %%rax\n\t"
+	                 "push %%rdi\n\t"
+	                 "push %%rsi\n\t"
+	                 "push %%rdx\n\t"
+	                 "push %%rcx\n\t"
+	                 "push %%r8\n\t"
+	                 "push %%r9\n\t"
+	                 "push %%r10\n\t"
+	                 "push %%r11\n\t"
+	                 "call DbRecoveryBridgeCatchLog\n\t"
+	                 "pop %%r11\n\t"
+	                 "pop %%r10\n\t"
+	                 "pop %%r9\n\t"
+	                 "pop %%r8\n\t"
+	                 "pop %%rcx\n\t"
+	                 "pop %%rdx\n\t"
+	                 "pop %%rsi\n\t"
+	                 "pop %%rdi\n\t"
+	                 "pop %%rax\n\t"
+	                 "popfq\n\t"
+	                 "jmp *g_db_recovery_bridge_catch_trampoline(%%rip)\n\t"
+	                 :
+	                 :
+	                 : "memory");
+}
+
+__attribute__((naked)) void KYTY_SYSV_ABI DbRecoveryReflectionProviderExitAudit() {
+	__asm__ volatile("pushfq\n\t"
+	                 "push %%rax\n\t"
+	                 "push %%rdi\n\t"
+	                 "push %%rsi\n\t"
+	                 "push %%rdx\n\t"
+	                 "push %%rcx\n\t"
+	                 "push %%r8\n\t"
+	                 "push %%r9\n\t"
+	                 "push %%r10\n\t"
+	                 "push %%r11\n\t"
+	                 "mov -0x38(%%rbp), %%rdi\n\t"
+	                 "mov -0x28(%%rbp), %%rsi\n\t"
+	                 "xor %%edx, %%edx\n\t"
+	                 "call DbRecoveryBoxedFloatLog\n\t"
+	                 "pop %%r11\n\t"
+	                 "pop %%r10\n\t"
+	                 "pop %%r9\n\t"
+	                 "pop %%r8\n\t"
+	                 "pop %%rcx\n\t"
+	                 "pop %%rdx\n\t"
+	                 "pop %%rsi\n\t"
+	                 "pop %%rdi\n\t"
+	                 "pop %%rax\n\t"
+	                 "popfq\n\t"
+	                 "jmp *g_db_recovery_reflection_provider_trampoline(%%rip)\n\t"
+	                 :
+	                 :
+	                 : "memory");
+}
+
+__attribute__((naked)) void KYTY_SYSV_ABI DbRecoveryJTokenFloatAudit() {
+	__asm__ volatile("pushfq\n\t"
+	                 "push %%rax\n\t"
+	                 "push %%rdi\n\t"
+	                 "push %%rsi\n\t"
+	                 "push %%rdx\n\t"
+	                 "push %%rcx\n\t"
+	                 "push %%r8\n\t"
+	                 "push %%r9\n\t"
+	                 "push %%r10\n\t"
+	                 "push %%r11\n\t"
+	                 "lea -0xc(%%rbp), %%rdi\n\t"
+	                 "call DbRecoveryJTokenFloatLog\n\t"
+	                 "pop %%r11\n\t"
+	                 "pop %%r10\n\t"
+	                 "pop %%r9\n\t"
+	                 "pop %%r8\n\t"
+	                 "pop %%rcx\n\t"
+	                 "pop %%rdx\n\t"
+	                 "pop %%rsi\n\t"
+	                 "pop %%rdi\n\t"
+	                 "pop %%rax\n\t"
+	                 "popfq\n\t"
+	                 "jmp *g_db_recovery_jtoken_float_trampoline(%%rip)\n\t"
+	                 :
+	                 :
+	                 : "memory");
+}
+
+#endif
+}
+
+static KYTY_SYSV_ABI void DbRecoveryBridgeCallbackAudit(void* closure) {
+	using callback_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_db_recovery_bridge_callback_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = g_db_recovery_bridge_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	g_db_recovery_bridge_caught = false;
+	if (call <= 24 || call % 100 == 0) {
+		uint64_t promise = 0;
+		uint64_t resolve_callback = 0;
+		if (closure != nullptr) {
+			std::memcpy(&promise, reinterpret_cast<const uint8_t*>(closure) + 0x18,
+			            sizeof(promise));
+			if (promise != 0) {
+				std::memcpy(&resolve_callback, reinterpret_cast<const uint8_t*>(promise) + 0x10,
+				            sizeof(resolve_callback));
+			}
+		}
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT call=%u callback_entered=1 promise_present=%u"
+		     " resolve_callback_present=%u\n", call, promise != 0 ? 1u : 0u,
+		     resolve_callback != 0 ? 1u : 0u);
+	}
+	const bool previous_active = g_db_recovery_bridge_active;
+	g_db_recovery_bridge_active = true;
+	reinterpret_cast<callback_t>(target)(closure);
+	g_db_recovery_bridge_active = previous_active;
+	if (call <= 24 || g_db_recovery_bridge_caught || call % 100 == 0) {
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT call=%u callback_returned=1 path=%s\n", call,
+		     g_db_recovery_bridge_caught ? "reject" : "resolve");
+	}
+}
+
+static KYTY_SYSV_ABI void DbRecoveryPuiResolveAudit(void* promise, void* value) {
+	using resolve_t = KYTY_SYSV_ABI void (*)(void*, void*);
+	const auto target = g_db_recovery_pui_resolve_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const bool route = g_db_recovery_bridge_active;
+	const auto call = g_db_recovery_bridge_calls.load(std::memory_order_relaxed);
+	uint64_t callback = 0;
+	if (route && promise != nullptr) {
+		std::memcpy(&callback, reinterpret_cast<const uint8_t*>(promise) + 0x10,
+		            sizeof(callback));
+	}
+	if (route) {
+		g_db_recovery_pui_callback_entered = false;
+		g_db_recovery_pui_context_entered = false;
+		if (call <= 24 || call % 100 == 0) {
+			LOGF("DB_RECOVERY_PUI_AUDIT call=%u resolve_entered=1 callback_present=%u\n",
+			     call, callback != 0 ? 1u : 0u);
+		}
+	}
+	reinterpret_cast<resolve_t>(target)(promise, value);
+	if (route && (call <= 24 || call % 100 == 0)) {
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u resolve_returned=1 callback_invoke=%u"
+		     " context_invoke=%u\n", call,
+		     g_db_recovery_pui_callback_entered ? 1u : 0u,
+		     g_db_recovery_pui_context_entered ? 1u : 0u);
+	}
+}
+
+static KYTY_SYSV_ABI void DbRecoveryPuiCallbackAudit(void* callback, void* arguments) {
+	using callback_t = KYTY_SYSV_ABI void (*)(void*, void*);
+	const auto target = g_db_recovery_pui_callback_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const bool route = g_db_recovery_bridge_active;
+	const auto call = g_db_recovery_bridge_calls.load(std::memory_order_relaxed);
+	if (route) {
+		g_db_recovery_pui_callback_entered = true;
+		if (call <= 24 || call % 100 == 0) {
+			LOGF("DB_RECOVERY_PUI_AUDIT call=%u callback_invoke_entered=1\n", call);
+		}
+	}
+	reinterpret_cast<callback_t>(target)(callback, arguments);
+	if (route && (call <= 24 || call % 100 == 0)) {
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u callback_invoke_returned=1"
+		     " context_invoke=%u\n", call,
+		     g_db_recovery_pui_context_entered ? 1u : 0u);
+	}
+}
+
+static KYTY_SYSV_ABI void DbRecoveryPuiContextAudit(void* context, int32_t callback_id,
+                                                     void* arguments) {
+	using context_t = KYTY_SYSV_ABI void (*)(void*, int32_t, void*);
+	const auto target = g_db_recovery_pui_context_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const bool route = g_db_recovery_bridge_active;
+	const auto call = g_db_recovery_bridge_calls.load(std::memory_order_relaxed);
+	uint8_t disposed = 0;
+	uint64_t bridge = 0;
+	uint64_t queue = 0;
+	int32_t queue_disposed = 0;
+	if (route && context != nullptr) {
+		std::memcpy(&disposed, reinterpret_cast<const uint8_t*>(context) + 0x92,
+		            sizeof(disposed));
+		std::memcpy(&bridge, reinterpret_cast<const uint8_t*>(context) + 0x30,
+		            sizeof(bridge));
+		if (bridge != 0) {
+			std::memcpy(&queue, reinterpret_cast<const uint8_t*>(bridge) + 0x40,
+			            sizeof(queue));
+			if (queue != 0) {
+				std::memcpy(&queue_disposed, reinterpret_cast<const uint8_t*>(queue) + 0x30,
+				            sizeof(queue_disposed));
+			}
+		}
+	}
+	if (route) {
+		g_db_recovery_pui_context_entered = true;
+		if (call <= 24 || call % 100 == 0) DbRecoveryPuiTrackId(callback_id, call);
+		if (call <= 24 || call % 100 == 0) {
+			LOGF("DB_RECOVERY_PUI_AUDIT call=%u context_invoke_entered=1"
+			     " disposed=%u bridge_present=%u queue_present=%u queue_disposed=%d\n", call,
+			     disposed != 0 ? 1u : 0u, bridge != 0 ? 1u : 0u,
+			     queue != 0 ? 1u : 0u, queue_disposed);
+		}
+	}
+	reinterpret_cast<context_t>(target)(context, callback_id, arguments);
+	if (route && (call <= 24 || call % 100 == 0)) {
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u context_invoke_returned=1\n", call);
+	}
+}
+
+static KYTY_SYSV_ABI void DbRecoveryPuiEnqueueAudit(void* queue, void* action) {
+	using enqueue_t = KYTY_SYSV_ABI void (*)(void*, void*);
+	const auto target = g_db_recovery_pui_enqueue_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const bool route = g_db_recovery_bridge_active;
+	const auto call = g_db_recovery_bridge_calls.load(std::memory_order_relaxed);
+	if (route && (call <= 24 || call % 100 == 0)) {
+		int32_t queue_disposed = 0;
+		uint64_t collection = 0;
+		if (queue != nullptr) {
+			std::memcpy(&queue_disposed, reinterpret_cast<const uint8_t*>(queue) + 0x30,
+			            sizeof(queue_disposed));
+			std::memcpy(&collection, reinterpret_cast<const uint8_t*>(queue) + 0x40,
+			            sizeof(collection));
+		}
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u enqueue_entered=1 queue_disposed=%d"
+		     " collection_present=%u action_present=%u\n", call, queue_disposed,
+		     collection != 0 ? 1u : 0u, action != nullptr ? 1u : 0u);
+	}
+	reinterpret_cast<enqueue_t>(target)(queue, action);
+	if (route && (call <= 24 || call % 100 == 0)) {
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u enqueue_returned=1\n", call);
+	}
+}
+
+static KYTY_SYSV_ABI void DbRecoveryPuiClosureAudit(void* closure) {
+	using closure_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_db_recovery_pui_closure_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	int32_t callback_id = 0;
+	uint64_t context = 0;
+	uint64_t data = 0;
+	uint64_t bridge = 0;
+	if (closure != nullptr) {
+		std::memcpy(&context, reinterpret_cast<const uint8_t*>(closure) + 0x10,
+		            sizeof(context));
+		std::memcpy(&callback_id, reinterpret_cast<const uint8_t*>(closure) + 0x20,
+		            sizeof(callback_id));
+		if (context != 0) {
+			std::memcpy(&data, reinterpret_cast<const uint8_t*>(context) + 0x30,
+				            sizeof(data));
+			if (data != 0) {
+				std::memcpy(&bridge, reinterpret_cast<const uint8_t*>(data) + 0x18,
+				            sizeof(bridge));
+			}
+		}
+	}
+	const auto call = DbRecoveryPuiTrackedCall(callback_id);
+	if (call != 0) {
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u closure_entered=1 context_present=%u"
+		     " data_present=%u react_bridge_present=%u\n", call,
+		     context != 0 ? 1u : 0u, data != 0 ? 1u : 0u, bridge != 0 ? 1u : 0u);
+	}
+	const bool previous_active = g_db_recovery_pui_closure_active;
+	const auto previous_call = g_db_recovery_pui_closure_call;
+	g_db_recovery_pui_closure_active = call != 0;
+	g_db_recovery_pui_closure_call = call;
+	g_db_recovery_pui_react_bridge_entered = false;
+	reinterpret_cast<closure_t>(target)(closure);
+	g_db_recovery_pui_closure_active = previous_active;
+	g_db_recovery_pui_closure_call = previous_call;
+	if (call != 0) {
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u closure_returned=1 react_bridge_invoke=%u\n",
+		     call, g_db_recovery_pui_react_bridge_entered ? 1u : 0u);
+	}
+}
+
+static std::string DbRecoveryJsonToken(const std::u16string& json,
+                                       const std::u16string& key) {
+	auto pos = json.find(key);
+	if (pos == std::u16string::npos) return "missing";
+	pos = json.find(u':', pos + key.size());
+	if (pos == std::u16string::npos) return "invalid";
+	pos++;
+	while (pos < json.size() && (json[pos] == u' ' || json[pos] == u'\t' ||
+	                             json[pos] == u'\r' || json[pos] == u'\n')) pos++;
+	std::string value;
+	while (pos < json.size() && value.size() < 24) {
+		const auto ch = json[pos++];
+		if ((ch >= u'0' && ch <= u'9') || ch == u'-' || ch == u'+' || ch == u'.' ||
+		    ch == u'e' || ch == u'E' || (ch >= u'a' && ch <= u'z') ||
+		    (ch >= u'A' && ch <= u'Z')) {
+			value.push_back(static_cast<char>(ch));
+		} else {
+			break;
+		}
+	}
+	if (value == "true" || value == "false" || value == "null") return value;
+	if (value.empty()) return "invalid";
+	char* end = nullptr;
+	std::strtod(value.c_str(), &end);
+	return end != value.c_str() && *end == '\0' ? value : "unexpected";
+}
+
+static KYTY_SYSV_ABI void DbRecoveryPuiReactBridgeAudit(void* bridge, int32_t callback_id,
+                                                        void* arguments) {
+	using bridge_t = KYTY_SYSV_ABI void (*)(void*, int32_t, void*);
+	const auto target = g_db_recovery_pui_react_bridge_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const bool route = g_db_recovery_pui_closure_active;
+	const auto call = route ? DbRecoveryPuiTrackedCall(callback_id) : 0;
+	uint64_t executor = 0;
+	if (call != 0 && bridge != nullptr) {
+		std::memcpy(&executor, reinterpret_cast<const uint8_t*>(bridge) + 0x18,
+		            sizeof(executor));
+	}
+	if (route) g_db_recovery_pui_react_bridge_entered = true;
+	if (call != 0) {
+		int32_t length = -1;
+		std::string is_completed = "missing";
+		std::string progress_rate = "missing";
+		std::string error_code = "missing";
+		std::string is_completed_pascal = "missing";
+		std::string progress_rate_pascal = "missing";
+		std::string error_code_pascal = "missing";
+		uint32_t progress_rate_keys = 0;
+		if (arguments != nullptr) {
+			std::memcpy(&length, reinterpret_cast<const uint8_t*>(arguments) + 0x10,
+			            sizeof(length));
+			if (length >= 0 && length <= 8192) {
+				const auto* chars = reinterpret_cast<const char16_t*>(
+				    reinterpret_cast<const uint8_t*>(arguments) + 0x14);
+				const std::u16string json(chars, static_cast<size_t>(length));
+				is_completed = DbRecoveryJsonToken(json, u"\"isCompleted\"");
+				progress_rate = DbRecoveryJsonToken(json, u"\"progressRate\"");
+				error_code = DbRecoveryJsonToken(json, u"\"errorCode\"");
+				is_completed_pascal = DbRecoveryJsonToken(json, u"\"IsCompleted\"");
+				progress_rate_pascal = DbRecoveryJsonToken(json, u"\"ProgressRate\"");
+				error_code_pascal = DbRecoveryJsonToken(json, u"\"ErrorCode\"");
+				for (size_t pos = 0; (pos = json.find(u"\"progressRate\"", pos)) !=
+				                       std::u16string::npos; pos += 14) {
+					progress_rate_keys++;
+				}
+			}
+		}
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u react_bridge_entered=1 args_present=%u"
+		     " executor_present=%u json_length=%d isCompleted=%s progressRate=%s"
+		     " progressRateKeys=%u errorCode=%s IsCompleted=%s ProgressRate=%s ErrorCode=%s\n", call,
+		     arguments != nullptr ? 1u : 0u, executor != 0 ? 1u : 0u, length,
+		     is_completed.c_str(), progress_rate.c_str(), progress_rate_keys,
+		     error_code.c_str(),
+		     is_completed_pascal.c_str(), progress_rate_pascal.c_str(),
+		     error_code_pascal.c_str());
+	}
+	reinterpret_cast<bridge_t>(target)(bridge, callback_id, arguments);
+	if (call != 0) {
+		LOGF("DB_RECOVERY_PUI_AUDIT call=%u react_bridge_returned=1\n", call);
+	}
+}
+
+static KYTY_SYSV_ABI void DbRecoveryNativeExecutorAudit(void* executor,
+                                                        int32_t callback_id, const char* args,
+                                                        void* result, void* exception) {
+	using executor_t = KYTY_SYSV_ABI void (*)(void*, int32_t, const char*, void*, void*);
+	const auto target = g_db_recovery_native_executor_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = DbRecoveryPuiTrackedCall(callback_id);
+	if (call != 0) {
+		LOGF("DB_RECOVERY_NATIVE_JS_AUDIT call=%u entered=1 executor_present=%u"
+		     " args_present=%u result_slot_present=%u exception_slot_present=%u\n", call,
+		     executor != nullptr ? 1u : 0u, args != nullptr ? 1u : 0u,
+		     result != nullptr ? 1u : 0u, exception != nullptr ? 1u : 0u);
+	}
+	reinterpret_cast<executor_t>(target)(executor, callback_id, args, result, exception);
+	if (call != 0) {
+		uint64_t result_ptr = 0;
+		uint64_t exception_ptr = 0;
+		if (result != nullptr) std::memcpy(&result_ptr, result, sizeof(result_ptr));
+		if (exception != nullptr) std::memcpy(&exception_ptr, exception, sizeof(exception_ptr));
+		LOGF("DB_RECOVERY_NATIVE_JS_AUDIT call=%u returned=1 result_present=%u"
+		     " exception_message_present=%u\n", call, result_ptr != 0 ? 1u : 0u,
+		     exception_ptr != 0 ? 1u : 0u);
+	}
+}
+
+static uint64_t MakeDbRecoveryAuditTrampoline(const uint8_t* original, size_t copied,
+                                              uint64_t continuation);
+static void FreeDbRecoveryAuditTrampoline(uint64_t address);
+
+static bool InstallDbRecoveryNativeExecutorAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x196eeu) return false;
+	static constexpr std::array<uint8_t, 14> expected = {
+	    0x48, 0x8b, 0x07, 0x48, 0x8b, 0x40, 0x30,
+	    0xff, 0xe0, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x196e0u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("DB_RECOVERY_NATIVE_JS_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x196eeu);
+	if (trampoline == 0) return false;
+	g_db_recovery_native_executor_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&DbRecoveryNativeExecutorAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), expected.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             expected.size());
+		g_db_recovery_native_executor_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("DB_RECOVERY_NATIVE_JS_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DB_RECOVERY_NATIVE_JS_AUDIT installed module=libNativeExtensions.sprx"
+	     " rva=0x196e0 original_calls=1\n");
+	return true;
+}
+
+static KYTY_SYSV_ABI void DbRecoveryManagedProgressAudit(void* object,
+                                                         const void* source) {
+	using ctor_t = KYTY_SYSV_ABI void (*)(void*, const void*);
+	const auto target = g_db_recovery_managed_progress_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = g_db_recovery_managed_progress_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	int32_t status = -1;
+	float input = 0;
+	if (source != nullptr) {
+		std::memcpy(&status, source, sizeof(status));
+		std::memcpy(&input, reinterpret_cast<const uint8_t*>(source) + 0x8,
+		            sizeof(input));
+	}
+	uint32_t divisor_bits = g_db_recovery_managed_divisor_bits.load(std::memory_order_acquire);
+	float divisor = 0;
+	std::memcpy(&divisor, &divisor_bits, sizeof(divisor));
+	if (call <= 24 || call % 100 == 0) {
+		LOGF("DB_RECOVERY_MANAGED_PROGRESS_AUDIT call=%u ctor_entered=1"
+		     " status=%d input_progress=%f divisor=%f object_present=%u\n", call,
+		     status, input, divisor, object != nullptr ? 1u : 0u);
+	}
+	reinterpret_cast<ctor_t>(target)(object, source);
+	if (call <= 24 || call % 100 == 0) {
+		float output = 0;
+		if (object != nullptr) {
+			std::memcpy(&output, reinterpret_cast<const uint8_t*>(object) + 0x20,
+			            sizeof(output));
+		}
+		LOGF("DB_RECOVERY_MANAGED_PROGRESS_AUDIT call=%u ctor_returned=1"
+		     " output_progress_rate=%f\n", call, output);
+	}
+}
+
+static bool InstallDbRecoveryManagedProgressAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1808cu) return false;
+	static constexpr std::array<uint8_t, 15> expected = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+	    0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x10};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1c60u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("DB_RECOVERY_MANAGED_PROGRESS_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	uint32_t divisor_bits = 0;
+	std::memcpy(&divisor_bits,
+	            reinterpret_cast<const uint8_t*>(program->base_vaddr + 0x18088u),
+	            sizeof(divisor_bits));
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1c6fu);
+	if (trampoline == 0) return false;
+	g_db_recovery_managed_divisor_bits.store(divisor_bits, std::memory_order_release);
+	g_db_recovery_managed_progress_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&DbRecoveryManagedProgressAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_db_recovery_managed_progress_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("DB_RECOVERY_MANAGED_PROGRESS_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DB_RECOVERY_MANAGED_PROGRESS_AUDIT installed"
+	     " module=Sce.Vsh.DbPreparationWrapper.dll.sprx ctor_rva=0x1c60"
+	     " original_calls=1\n");
+	return true;
+}
+
+static KYTY_SYSV_ABI float DbRecoveryManagedProgressGetterAudit(void* object) {
+	using getter_t = KYTY_SYSV_ABI float (*)(void*);
+	const auto target = g_db_recovery_managed_getter_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = g_db_recovery_managed_getter_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	float field = 0;
+	if (object != nullptr) {
+		std::memcpy(&field, reinterpret_cast<const uint8_t*>(object) + 0x20,
+		            sizeof(field));
+	}
+	const float result = reinterpret_cast<getter_t>(target)(object);
+	if (g_db_recovery_bridge_active) {
+		g_db_recovery_progress_getter_object = object;
+		g_db_recovery_progress_getter_pending = true;
+	}
+	if (call <= 24 || call % 100 == 0) {
+		LOGF("DB_RECOVERY_MANAGED_GETTER_AUDIT call=%u field_progress_rate=%f"
+		     " returned_progress_rate=%f\n", call, field, result);
+	}
+	return result;
+}
+
+static bool InstallDbRecoveryManagedProgressGetterAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1c0eu) return false;
+	static constexpr std::array<uint8_t, 14> expected = {
+	    0x55, 0x48, 0x89, 0xe5, 0xc5, 0xfa, 0x10,
+	    0x47, 0x20, 0x5d, 0xc3, 0xcc, 0xcc, 0xcc};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1c00u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("DB_RECOVERY_MANAGED_GETTER_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1c0eu);
+	if (trampoline == 0) return false;
+	g_db_recovery_managed_getter_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&DbRecoveryManagedProgressGetterAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), expected.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             expected.size());
+		g_db_recovery_managed_getter_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("DB_RECOVERY_MANAGED_GETTER_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DB_RECOVERY_MANAGED_GETTER_AUDIT installed"
+	     " module=Sce.Vsh.DbPreparationWrapper.dll.sprx getter_rva=0x1c00"
+	     " original_calls=1\n");
+	return true;
+}
+
+static KYTY_SYSV_ABI void* DbRecoveryExpressionProviderAudit(void* provider,
+                                                             void* target_object) {
+	using provider_t = KYTY_SYSV_ABI void* (*)(void*, void*);
+	const auto target = g_db_recovery_expression_provider_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	void* result = reinterpret_cast<provider_t>(target)(provider, target_object);
+	DbRecoveryBoxedFloatLog(result, target_object, 1);
+	return result;
+}
+
+static bool InstallDbRecoverySerializerFloatAudit(Program* program) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x80b9fu) return false;
+	static constexpr std::array<uint8_t, 14> reflection_expected = {
+	    0x48, 0x8b, 0x45, 0xc8, 0x48, 0x83, 0xc4,
+	    0x48, 0x5b, 0x41, 0x5e, 0x41, 0x5f, 0x5d};
+	static constexpr std::array<uint8_t, 15> expression_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0x90,
+	    0x00, 0x00, 0x00, 0x48, 0x89, 0x7d, 0xa8};
+	auto* reflection = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x281e8u);
+	auto* expression = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x80b90u);
+	if (std::memcmp(reflection, reflection_expected.data(), reflection_expected.size()) != 0 ||
+	    std::memcmp(expression, expression_expected.data(), expression_expected.size()) != 0) {
+		LOGF("DB_RECOVERY_BOXED_FLOAT_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto reflection_trampoline = MakeDbRecoveryAuditTrampoline(
+	    reflection, reflection_expected.size(), program->base_vaddr + 0x281f6u);
+	const auto expression_trampoline = MakeDbRecoveryAuditTrampoline(
+	    expression, expression_expected.size(), program->base_vaddr + 0x80b9fu);
+	if (reflection_trampoline == 0 || expression_trampoline == 0) {
+		if (reflection_trampoline != 0) FreeDbRecoveryAuditTrampoline(reflection_trampoline);
+		if (expression_trampoline != 0) FreeDbRecoveryAuditTrampoline(expression_trampoline);
+		LOGF("DB_RECOVERY_BOXED_FLOAT_AUDIT install_failed reason=trampoline\n");
+		return false;
+	}
+	g_db_recovery_reflection_provider_trampoline = reflection_trampoline;
+	g_db_recovery_expression_provider_trampoline.store(expression_trampoline,
+	                                                 std::memory_order_release);
+	const uint64_t reflection_hook =
+	    reinterpret_cast<uint64_t>(&DbRecoveryReflectionProviderExitAudit);
+	const uint64_t expression_hook = reinterpret_cast<uint64_t>(&DbRecoveryExpressionProviderAudit);
+	std::array<uint8_t, 14> reflection_patch = {0xff, 0x25};
+	std::array<uint8_t, 14> expression_patch = {0xff, 0x25};
+	std::memcpy(reflection_patch.data() + 6, &reflection_hook, sizeof(reflection_hook));
+	std::memcpy(expression_patch.data() + 6, &expression_hook, sizeof(expression_hook));
+	std::memcpy(reflection, reflection_patch.data(), reflection_patch.size());
+	std::memcpy(expression, expression_patch.data(), expression_patch.size());
+	const bool reflection_flush = Common::VirtualMemory::FlushInstructionCache(
+	    reinterpret_cast<uint64_t>(reflection), reflection_patch.size());
+	const bool expression_flush = Common::VirtualMemory::FlushInstructionCache(
+	    reinterpret_cast<uint64_t>(expression), expression_patch.size());
+	if (!reflection_flush || !expression_flush) {
+		std::memcpy(reflection, reflection_expected.data(), reflection_patch.size());
+		std::memcpy(expression, expression_expected.data(), expression_patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(reflection),
+		                                             reflection_patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(expression),
+		                                             expression_patch.size());
+		g_db_recovery_reflection_provider_trampoline = 0;
+		g_db_recovery_expression_provider_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(reflection_trampoline);
+		FreeDbRecoveryAuditTrampoline(expression_trampoline);
+		LOGF("DB_RECOVERY_BOXED_FLOAT_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DB_RECOVERY_BOXED_FLOAT_AUDIT installed"
+	     " module=Newtonsoft.Json.PlayStation.dll.sprx"
+	     " reflection_exit_rva=0x281e8 expression_rva=0x80b90 original_calls=1\n");
+	return true;
+#else
+	(void)program;
+	return false;
+#endif
+}
+
+static std::string DbRecoveryNumericMonoString(void* result, int32_t* length) {
+	*length = -1;
+	if (result == nullptr) return "invalid";
+	std::memcpy(length, reinterpret_cast<const uint8_t*>(result) + 0x10, sizeof(*length));
+	if (*length < 0 || *length > 32) return "invalid";
+	std::string number;
+	const auto* chars = reinterpret_cast<const char16_t*>(
+	    reinterpret_cast<const uint8_t*>(result) + 0x14);
+	for (int32_t i = 0; i < *length; i++) {
+		const auto ch = chars[i];
+		if ((ch >= u'0' && ch <= u'9') || ch == u'-' || ch == u'+' ||
+		    ch == u'.' || ch == u'e' || ch == u'E') {
+			number.push_back(static_cast<char>(ch));
+		} else {
+			return "non_numeric";
+		}
+	}
+	return number;
+}
+
+static KYTY_SYSV_ABI void* DbRecoveryFloatFormatterAudit(int32_t format,
+                                                         int32_t decimal_separator,
+                                                         int32_t quote, float input) {
+	using formatter_t = KYTY_SYSV_ABI void* (*)(int32_t, int32_t, int32_t, float);
+	const auto target = g_db_recovery_float_formatter_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const bool route = g_db_recovery_bridge_active || g_db_recovery_pui_closure_active;
+	const auto call = g_db_recovery_pui_closure_active ? g_db_recovery_pui_closure_call
+	                                                : g_db_recovery_bridge_calls.load(std::memory_order_relaxed);
+	void* result = reinterpret_cast<formatter_t>(target)(format, decimal_separator, quote,
+	                                                    input);
+	if (route && (call <= 24 || call % 100 == 0)) {
+		int32_t length = -1;
+		const auto number = DbRecoveryNumericMonoString(result, &length);
+		LOGF("DB_RECOVERY_FLOAT_FORMAT_AUDIT call=%u input=%f"
+		     " output_length=%d output_number=%s\n", call, input, length,
+		     number.c_str());
+	}
+	return result;
+}
+
+static KYTY_SYSV_ABI void* DbRecoverySingleToStringAudit(const float* value,
+                                                         void* format, void* provider) {
+	using tostring_t = KYTY_SYSV_ABI void* (*)(const float*, void*, void*);
+	const auto target = g_db_recovery_single_tostring_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const bool route = g_db_recovery_pui_closure_active;
+	const auto call = g_db_recovery_pui_closure_call;
+	float input = 0;
+	if (route && value != nullptr) std::memcpy(&input, value, sizeof(input));
+	void* result = reinterpret_cast<tostring_t>(target)(value, format, provider);
+	if (route && (call <= 24 || call % 100 == 0)) {
+		int32_t length = -1;
+		const auto number = DbRecoveryNumericMonoString(result, &length);
+		LOGF("DB_RECOVERY_SINGLE_TOSTRING_AUDIT call=%u input=%f"
+		     " output_length=%d output_number=%s\n", call, input, length,
+		     number.c_str());
+	}
+	return result;
+}
+
+static bool InstallDbRecoverySingleToStringAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x62020u) return false;
+	static constexpr std::array<uint8_t, 16> expected = {
+	    0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0xc5, 0xfa,
+	    0x10, 0x07, 0x48, 0x89, 0xd7, 0x48, 0x89, 0xf3};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x62010u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("DB_RECOVERY_SINGLE_TOSTRING_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x62020u);
+	if (trampoline == 0) return false;
+	g_db_recovery_single_tostring_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&DbRecoverySingleToStringAudit);
+	std::array<uint8_t, 16> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::fill(patch.begin() + 14, patch.end(), 0x90);
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), expected.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             expected.size());
+		g_db_recovery_single_tostring_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("DB_RECOVERY_SINGLE_TOSTRING_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DB_RECOVERY_SINGLE_TOSTRING_AUDIT installed module=mscorlib.dll.sprx"
+	     " rva=0x62010 original_calls=1\n");
+	return true;
+}
+
+static bool InstallDbRecoveryFloatTokenAudit(Program* program) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x37293u) return false;
+	static constexpr std::array<uint8_t, 16> token_expected = {
+	    0xc5, 0xfa, 0x10, 0x45, 0xf4, 0x48, 0x89, 0xdf,
+	    0x48, 0x89, 0xc6, 0xba, 0x08, 0x00, 0x00, 0x00};
+	static constexpr std::array<uint8_t, 17> format_expected = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
+	    0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
+	auto* token = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x37283u);
+	auto* format = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1000u);
+	if (std::memcmp(token, token_expected.data(), token_expected.size()) != 0 ||
+	    std::memcmp(format, format_expected.data(), format_expected.size()) != 0) {
+		LOGF("DB_RECOVERY_FLOAT_TOKEN_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto token_trampoline = MakeDbRecoveryAuditTrampoline(
+	    token, token_expected.size(), program->base_vaddr + 0x37293u);
+	const auto format_trampoline = MakeDbRecoveryAuditTrampoline(
+	    format, format_expected.size(), program->base_vaddr + 0x1011u);
+	if (token_trampoline == 0 || format_trampoline == 0) {
+		if (token_trampoline != 0) FreeDbRecoveryAuditTrampoline(token_trampoline);
+		if (format_trampoline != 0) FreeDbRecoveryAuditTrampoline(format_trampoline);
+		LOGF("DB_RECOVERY_FLOAT_TOKEN_AUDIT install_failed reason=trampoline\n");
+		return false;
+	}
+	g_db_recovery_jtoken_float_trampoline = token_trampoline;
+	g_db_recovery_float_formatter_trampoline.store(format_trampoline,
+	                                               std::memory_order_release);
+	const uint64_t token_hook = reinterpret_cast<uint64_t>(&DbRecoveryJTokenFloatAudit);
+	const uint64_t format_hook = reinterpret_cast<uint64_t>(&DbRecoveryFloatFormatterAudit);
+	std::array<uint8_t, 16> token_patch = {0xff, 0x25};
+	std::array<uint8_t, 17> format_patch = {0xff, 0x25};
+	std::memcpy(token_patch.data() + 6, &token_hook, sizeof(token_hook));
+	std::memcpy(format_patch.data() + 6, &format_hook, sizeof(format_hook));
+	std::fill(token_patch.begin() + 14, token_patch.end(), 0x90);
+	std::fill(format_patch.begin() + 14, format_patch.end(), 0x90);
+	std::memcpy(token, token_patch.data(), token_patch.size());
+	std::memcpy(format, format_patch.data(), format_patch.size());
+	const bool token_flush = Common::VirtualMemory::FlushInstructionCache(
+	    reinterpret_cast<uint64_t>(token), token_patch.size());
+	const bool format_flush = Common::VirtualMemory::FlushInstructionCache(
+	    reinterpret_cast<uint64_t>(format), format_patch.size());
+	if (!token_flush || !format_flush) {
+		std::memcpy(token, token_expected.data(), token_expected.size());
+		std::memcpy(format, format_expected.data(), format_expected.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(token),
+		                                             token_expected.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(format),
+		                                             format_expected.size());
+		g_db_recovery_jtoken_float_trampoline = 0;
+		g_db_recovery_float_formatter_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(token_trampoline);
+		FreeDbRecoveryAuditTrampoline(format_trampoline);
+		LOGF("DB_RECOVERY_FLOAT_TOKEN_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DB_RECOVERY_FLOAT_TOKEN_AUDIT installed"
+	     " module=Newtonsoft.Json.PlayStation.dll.sprx"
+	     " token_rva=0x37283 formatter_rva=0x1000 original_calls=1\n");
+	return true;
+#else
+	(void)program;
+	return false;
+#endif
+}
+
+static uint64_t MakeDbRecoveryAuditTrampoline(const uint8_t* original, size_t copied,
+                                              uint64_t continuation) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const uint64_t address = reinterpret_cast<uint64_t>(VirtualAlloc(
+	    nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+#else
+	const uint64_t address = Common::VirtualMemory::Alloc(
+	    0, 4096, Common::VirtualMemory::Mode::ExecuteReadWrite);
+#endif
+	if (address == 0) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT trampoline_alloc_failed win_error=%u\n",
+		     static_cast<uint32_t>(GetLastError()));
+#endif
+		return 0;
+	}
+	auto* code = reinterpret_cast<uint8_t*>(address);
+	std::memcpy(code, original, copied);
+	std::array<uint8_t, 14> jump = {0xff, 0x25};
+	std::memcpy(jump.data() + 6, &continuation, sizeof(continuation));
+	std::memcpy(code + copied, jump.data(), jump.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(address, copied + jump.size())) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		VirtualFree(reinterpret_cast<void*>(address), 0, MEM_RELEASE);
+#else
+		Common::VirtualMemory::Free(address);
+#endif
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT trampoline_flush_failed\n");
+		return 0;
+	}
+	return address;
+}
+
+static void FreeDbRecoveryAuditTrampoline(uint64_t address) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	VirtualFree(reinterpret_cast<void*>(address), 0, MEM_RELEASE);
+#else
+	Common::VirtualMemory::Free(address);
+#endif
+}
+
+static void LogBootAsyncState(const char* name, uint32_t call, const char* phase,
+                              void* state_machine, size_t task_offset = 0x20) {
+	if (call > 32) return;
+	int32_t  state = -3;
+	uint64_t task = 0;
+	uint32_t flags = 0;
+	std::memcpy(&state, state_machine, sizeof(state));
+	if (state >= 0 && state <= 3) {
+		std::memcpy(&task, reinterpret_cast<const uint8_t*>(state_machine) + task_offset,
+		            sizeof(task));
+		if (task != 0) {
+			std::memcpy(&flags, reinterpret_cast<const uint8_t*>(task) + 0x44,
+			            sizeof(flags));
+		}
+	}
+	LOGF("BOOT_ASYNC_AUDIT name=%s call=%u phase=%s state=%d"
+	     " task_present=%u task_flags=0x%08x task_completed=%u original=1\n",
+	     name, call, phase, state, task != 0 ? 1u : 0u, flags,
+	     (flags & 0x01600000u) != 0 ? 1u : 0u);
+}
+
+static KYTY_SYSV_ABI void BackgroundAutoLoginAudit(void* state_machine) {
+	using move_next_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_background_auto_login_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0 || state_machine == nullptr);
+	const auto call = g_background_auto_login_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	LogBootAsyncState("BackgroundAutoLogin", call, "entry", state_machine);
+	reinterpret_cast<move_next_t>(target)(state_machine);
+	LogBootAsyncState("BackgroundAutoLogin", call, "return", state_machine);
+}
+
+static KYTY_SYSV_ABI void SystemPasscodeInputAudit(void* state_machine) {
+	using move_next_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_system_passcode_input_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0 || state_machine == nullptr);
+	const auto call = g_system_passcode_input_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	LogBootAsyncState("SystemPasscodeInput", call, "entry", state_machine);
+	reinterpret_cast<move_next_t>(target)(state_machine);
+	LogBootAsyncState("SystemPasscodeInput", call, "return", state_machine);
+}
+
+static KYTY_SYSV_ABI void EvalInitialSetupAudit(void* state_machine) {
+	using move_next_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_eval_initial_setup_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0 || state_machine == nullptr);
+	const auto call = g_eval_initial_setup_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	LogBootAsyncState("EvalInitialSetup", call, "entry", state_machine);
+	reinterpret_cast<move_next_t>(target)(state_machine);
+	LogBootAsyncState("EvalInitialSetup", call, "return", state_machine);
+}
+
+static KYTY_SYSV_ABI void InitialSetupDbRecoveryAudit(void* state_machine) {
+	using move_next_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_initial_setup_db_recovery_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0 || state_machine == nullptr);
+	const auto call = g_initial_setup_db_recovery_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	LogBootAsyncState("ExecDBRecoveryForInitialSetup", call, "entry", state_machine, 0x28);
+	reinterpret_cast<move_next_t>(target)(state_machine);
+	LogBootAsyncState("ExecDBRecoveryForInitialSetup", call, "return", state_machine, 0x28);
+}
+
+static KYTY_SYSV_ABI void DddFwUpdateAudit(void* state_machine) {
+	using move_next_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_ddd_fw_update_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0 || state_machine == nullptr);
+	const auto call = g_ddd_fw_update_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	int32_t state = -3;
+	std::memcpy(&state, state_machine, sizeof(state));
+	if (call <= 32) LOGF("DDD_FW_UPDATE_AUDIT call=%u phase=entry state=%d original=1\n", call, state);
+	reinterpret_cast<move_next_t>(target)(state_machine);
+	std::memcpy(&state, state_machine, sizeof(state));
+	if (call <= 32) {
+		uint64_t task = 0;
+		uint32_t flags = 0;
+		if (state == 2) {
+			std::memcpy(&task, reinterpret_cast<const uint8_t*>(state_machine) + 0x30,
+			            sizeof(task));
+			if (task != 0) {
+				std::memcpy(&flags, reinterpret_cast<const uint8_t*>(task) + 0x44,
+				            sizeof(flags));
+			}
+		}
+		LOGF("DDD_FW_UPDATE_AUDIT call=%u phase=return state=%d"
+		     " task_present=%u task_flags=0x%08x task_completed=%u original=1\n",
+		     call, state, task != 0 ? 1u : 0u, flags,
+		     (flags & 0x01600000u) != 0 ? 1u : 0u);
+	}
+}
+
+static KYTY_SYSV_ABI int DddServiceQueueAudit(void* service, uint32_t request_id) {
+	using queue_t = KYTY_SYSV_ABI int (*)(void*, uint32_t);
+	const auto target = g_ddd_service_queue_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = g_ddd_service_queue_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (call <= 8) LOGF("DDD_SERVICE_AUDIT stage=queue phase=entry call=%u request=%u original=1\n",
+	                   call, request_id);
+	const int result = reinterpret_cast<queue_t>(target)(service, request_id);
+	if (call <= 8) LOGF("DDD_SERVICE_AUDIT stage=queue phase=return call=%u result=%08x original=1\n",
+	                   call, static_cast<uint32_t>(result));
+	return result;
+}
+
+static KYTY_SYSV_ABI int DddServiceLookupAudit(void* service, void* session) {
+	using lookup_t = KYTY_SYSV_ABI int (*)(void*, void*);
+	const auto target = g_ddd_service_lookup_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const int result = reinterpret_cast<lookup_t>(target)(service, session);
+	if (g_ddd_service_job_active) {
+		const auto call = g_ddd_service_lookup_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (call <= 8) LOGF("DDD_SERVICE_AUDIT stage=lookup call=%u result=%08x original=1\n",
+		                   call, static_cast<uint32_t>(result));
+	}
+	return result;
+}
+
+static KYTY_SYSV_ABI int DddServiceJobAudit(void* job) {
+	using job_t = KYTY_SYSV_ABI int (*)(void*);
+	const auto target = g_ddd_service_job_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = g_ddd_service_job_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (call <= 8) LOGF("DDD_SERVICE_AUDIT stage=job phase=entry call=%u original=1\n", call);
+	const bool previous = g_ddd_service_job_active;
+	const auto previous_call = g_ddd_service_job_call;
+	g_ddd_service_job_active = true;
+	g_ddd_service_job_call = call;
+	const int result = reinterpret_cast<job_t>(target)(job);
+	g_ddd_service_job_active = previous;
+	g_ddd_service_job_call = previous_call;
+	if (call <= 8) LOGF("DDD_SERVICE_AUDIT stage=job phase=return call=%u result=%08x original=1\n",
+	                   call, static_cast<uint32_t>(result));
+	return result;
+}
+
+static KYTY_SYSV_ABI int DddServiceCoreAudit(void* core, void* output) {
+	using core_t = KYTY_SYSV_ABI int (*)(void*, void*);
+	const auto target = g_ddd_service_core_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	if (g_ddd_service_job_active && g_ddd_service_job_call <= 8)
+		LOGF("DDD_SERVICE_AUDIT stage=core phase=entry original=1\n");
+	const int result = reinterpret_cast<core_t>(target)(core, output);
+	if (g_ddd_service_job_active && g_ddd_service_job_call <= 8) {
+		LOGF("DDD_SERVICE_AUDIT stage=core phase=return result=%08x original=1\n",
+		     static_cast<uint32_t>(result));
+	}
+	return result;
+}
+
+static KYTY_SYSV_ABI int DddServiceClientAudit(void* client, void* output) {
+	using client_t = KYTY_SYSV_ABI int (*)(void*, void*);
+	const auto target = g_ddd_service_client_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	if (g_ddd_service_job_active && g_ddd_service_job_call <= 8)
+		LOGF("DDD_SERVICE_AUDIT stage=client phase=entry original=1\n");
+	const int result = reinterpret_cast<client_t>(target)(client, output);
+	if (g_ddd_service_job_active && g_ddd_service_job_call <= 8) {
+		LOGF("DDD_SERVICE_AUDIT stage=client phase=return result=%08x original=1\n",
+		     static_cast<uint32_t>(result));
+	}
+	return result;
+}
+
+static KYTY_SYSV_ABI int DddServicePusAudit(void* client, void* request, void* result,
+                                            void* output) {
+	using pus_t = KYTY_SYSV_ABI int (*)(void*, void*, void*, void*);
+	const auto target = g_ddd_service_pus_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	if (g_ddd_service_job_active && g_ddd_service_job_call <= 8)
+		LOGF("DDD_SERVICE_AUDIT stage=pus phase=entry original=1\n");
+	const int status = reinterpret_cast<pus_t>(target)(client, request, result, output);
+	if (g_ddd_service_job_active && g_ddd_service_job_call <= 8) {
+		LOGF("DDD_SERVICE_AUDIT stage=pus phase=return result=%08x original=1\n",
+		     static_cast<uint32_t>(status));
+	}
+	return status;
+}
+
+static KYTY_SYSV_ABI void* EvalSystemPasscodeInputAudit() {
+	using eval_t = KYTY_SYSV_ABI void* (*)();
+	const auto target = g_eval_system_passcode_input_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = g_eval_system_passcode_input_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (call <= 32) {
+		LOGF("BOOT_ASYNC_AUDIT name=EvalSystemPasscodeInput call=%u phase=entry original=1\n",
+		     call);
+	}
+	void* task = reinterpret_cast<eval_t>(target)();
+	if (call <= 32) {
+		uint32_t flags = 0;
+		if (task != nullptr) {
+			std::memcpy(&flags, reinterpret_cast<const uint8_t*>(task) + 0x44,
+			            sizeof(flags));
+		}
+		LOGF("BOOT_ASYNC_AUDIT name=EvalSystemPasscodeInput call=%u phase=return"
+		     " task_present=%u task_flags=0x%08x task_completed=%u original=1\n",
+		     call, task != nullptr ? 1u : 0u, flags,
+		     (flags & 0x01600000u) != 0 ? 1u : 0u);
+	}
+	return task;
+}
+
+static KYTY_SYSV_ABI void BootRegisterInterfaceAudit(void* assembly_name) {
+	using register_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_boot_register_interface_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto call = g_boot_register_interface_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (call <= 8) {
+		LOGF("BOOT_REGISTRATION_AUDIT name=BootManager.RegisterInterface call=%u"
+		     " phase=entry assembly_present=%u original=1\n",
+		     call, assembly_name != nullptr ? 1u : 0u);
+	}
+	reinterpret_cast<register_t>(target)(assembly_name);
+	if (call <= 8) {
+		LOGF("BOOT_REGISTRATION_AUDIT name=BootManager.RegisterInterface call=%u"
+		     " phase=return original=1\n", call);
+	}
+}
+
+static std::string BootAuditMonoIdentifier(void* mono_string) {
+	if (mono_string == nullptr) return "<null>";
+	int32_t length = 0;
+	std::memcpy(&length, reinterpret_cast<const uint8_t*>(mono_string) + 0x10,
+	            sizeof(length));
+	if (length < 0 || length > 120) return "<invalid_length>";
+	std::string result;
+	result.reserve(static_cast<size_t>(length));
+	const auto* chars = reinterpret_cast<const char16_t*>(
+	    reinterpret_cast<const uint8_t*>(mono_string) + 0x14);
+	for (int32_t i = 0; i < length; i++) {
+		const char16_t ch = chars[i];
+		if ((ch >= u'A' && ch <= u'Z') || (ch >= u'a' && ch <= u'z') ||
+		    (ch >= u'0' && ch <= u'9') || ch == u'.' || ch == u'_' ||
+		    ch == u'+' || ch == u'-') {
+			result.push_back(static_cast<char>(ch));
+		} else {
+			return "<non_identifier>";
+		}
+	}
+	return result;
+}
+
+static KYTY_SYSV_ABI void RunManagerRegisterAudit(void* instance, void* assembly_name,
+                                                   void* interface_name, int32_t timing,
+                                                   int32_t priority) {
+	using register_t = KYTY_SYSV_ABI void (*)(void*, void*, void*, int32_t, int32_t);
+	const auto target = g_run_manager_register_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const auto assembly = BootAuditMonoIdentifier(assembly_name);
+	const bool legacy = assembly == "Sce.Vsh.ShellUI.Legacy";
+	const auto call = legacy ?
+	    g_run_manager_register_legacy_calls.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+	const auto interface_name_text = legacy ? BootAuditMonoIdentifier(interface_name) : std::string();
+	if (legacy && call <= 128) {
+		LOGF("BOOT_SCHEDULER_AUDIT name=RunManager.Register call=%u phase=entry"
+		     " assembly=%s interface=%s timing=%d priority=%d original=1\n",
+		     call, assembly.c_str(), interface_name_text.c_str(), timing, priority);
+	}
+	reinterpret_cast<register_t>(target)(instance, assembly_name, interface_name, timing,
+	                                     priority);
+	if (legacy && call <= 128) {
+		LOGF("BOOT_SCHEDULER_AUDIT name=RunManager.Register call=%u phase=return"
+		     " interface=%s original=1\n", call, interface_name_text.c_str());
+	}
+}
+
+static KYTY_SYSV_ABI void RunItemInitializeAudit(void* item) {
+	using initialize_t = KYTY_SYSV_ABI void (*)(void*);
+	const auto target = g_run_item_initialize_trampoline.load(std::memory_order_acquire);
+	EXIT_IF(target == 0 || item == nullptr);
+	void* assembly_name = nullptr;
+	void* interface_name = nullptr;
+	std::memcpy(&assembly_name, reinterpret_cast<const uint8_t*>(item) + 0x20,
+	            sizeof(assembly_name));
+	std::memcpy(&interface_name, reinterpret_cast<const uint8_t*>(item) + 0x28,
+	            sizeof(interface_name));
+	const auto assembly = BootAuditMonoIdentifier(assembly_name);
+	const bool legacy = assembly == "Sce.Vsh.ShellUI.Legacy";
+	const auto call = legacy ?
+	    g_run_item_initialize_legacy_calls.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+	const auto interface_name_text = legacy ? BootAuditMonoIdentifier(interface_name) : std::string();
+	if (legacy && call <= 128) {
+		LOGF("BOOT_SCHEDULER_AUDIT name=RunItem.Initialize call=%u phase=entry"
+		     " assembly=%s interface=%s original=1\n",
+		     call, assembly.c_str(), interface_name_text.c_str());
+	}
+	reinterpret_cast<initialize_t>(target)(item);
+	if (legacy && call <= 128) {
+		void* sync = nullptr;
+		void* async = nullptr;
+		uint8_t initialized = 0;
+		std::memcpy(&sync, reinterpret_cast<const uint8_t*>(item) + 0x38, sizeof(sync));
+		std::memcpy(&async, reinterpret_cast<const uint8_t*>(item) + 0x40, sizeof(async));
+		std::memcpy(&initialized, reinterpret_cast<const uint8_t*>(item) + 0x48,
+		            sizeof(initialized));
+		LOGF("BOOT_SCHEDULER_AUDIT name=RunItem.Initialize call=%u phase=return"
+		     " interface=%s initialized=%u sync_present=%u async_present=%u original=1\n",
+		     call, interface_name_text.c_str(), initialized != 0 ? 1u : 0u,
+		     sync != nullptr ? 1u : 0u, async != nullptr ? 1u : 0u);
+	}
+}
+
+static bool InstallBackgroundAutoLoginAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1d41d0u) return false;
+	static constexpr std::array<uint8_t, 16> expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x70,
+	    0x4c, 0x89, 0x7d, 0xf8, 0x48, 0x89, 0x7d, 0x98};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1d41c0u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("BACKGROUND_AUTOLOGIN_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1d41d0u);
+	if (trampoline == 0) return false;
+	g_background_auto_login_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&BackgroundAutoLoginAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_background_auto_login_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("BACKGROUND_AUTOLOGIN_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("BACKGROUND_AUTOLOGIN_AUDIT installed module=Sce.Vsh.ShellUI.Legacy.dll.sprx"
+	     " move_next_rva=0x1d41c0 original_calls=1\n");
+	return true;
+}
+
+static bool InstallSystemPasscodeInputAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1de8cfu) return false;
+	static constexpr std::array<uint8_t, 15> expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0xc0,
+	    0x00, 0x00, 0x00, 0x4c, 0x89, 0x7d, 0xf8};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1de8c0u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("SYSTEM_PASSCODE_INPUT_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1de8cfu);
+	if (trampoline == 0) return false;
+	g_system_passcode_input_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&SystemPasscodeInputAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_system_passcode_input_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("SYSTEM_PASSCODE_INPUT_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("SYSTEM_PASSCODE_INPUT_AUDIT installed module=Sce.Vsh.ShellUI.Legacy.dll.sprx"
+	     " move_next_rva=0x1de8c0 original_calls=1\n");
+	return true;
+}
+
+static bool InstallEvalInitialSetupAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1dd17fu) return false;
+	static constexpr std::array<uint8_t, 15> expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0xb0,
+	    0x00, 0x00, 0x00, 0x4c, 0x89, 0x7d, 0xf8};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1dd170u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("EVAL_INITIAL_SETUP_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1dd17fu);
+	if (trampoline == 0) return false;
+	g_eval_initial_setup_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&EvalInitialSetupAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_eval_initial_setup_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("EVAL_INITIAL_SETUP_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("EVAL_INITIAL_SETUP_AUDIT installed module=Sce.Vsh.ShellUI.Legacy.dll.sprx"
+	     " move_next_rva=0x1dd170 original_calls=1\n");
+	return true;
+}
+
+static bool InstallInitialSetupDbRecoveryAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1df54fu) return false;
+	static constexpr std::array<uint8_t, 15> expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0x80,
+	    0x00, 0x00, 0x00, 0x4c, 0x89, 0x7d, 0xf8};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1df540u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("INITIAL_SETUP_DB_RECOVERY_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1df54fu);
+	if (trampoline == 0) return false;
+	g_initial_setup_db_recovery_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&InitialSetupDbRecoveryAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_initial_setup_db_recovery_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("INITIAL_SETUP_DB_RECOVERY_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("INITIAL_SETUP_DB_RECOVERY_AUDIT installed"
+	     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx move_next_rva=0x1df540 original_calls=1\n");
+	return true;
+}
+
+static bool InstallDddFwUpdateAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1d831fu) return false;
+	static constexpr std::array<uint8_t, 15> expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0x60,
+	    0x02, 0x00, 0x00, 0x4c, 0x89, 0x65, 0xe0};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1d8310u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("DDD_FW_UPDATE_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1d831fu);
+	if (trampoline == 0) return false;
+	g_ddd_fw_update_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&DddFwUpdateAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_ddd_fw_update_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("DDD_FW_UPDATE_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DDD_FW_UPDATE_AUDIT installed module=Sce.Vsh.ShellUI.Legacy.dll.sprx"
+	     " move_next_rva=0x1d8310 original_calls=1\n");
+	return true;
+}
+
+static bool InstallDddServiceAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x25c461u) return false;
+	static constexpr std::array<uint8_t, 17> expected_queue = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+	    0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
+	static constexpr std::array<uint8_t, 13> expected_job = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+	    0x56, 0x53, 0x48, 0x83, 0xec, 0x18};
+	static constexpr std::array<uint8_t, 14> expected_lookup = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+	    0x56, 0x53, 0x50, 0x48, 0x8d, 0x5f, 0x08};
+	auto* queue = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x25c450u);
+	auto* job = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x258fa0u);
+	auto* lookup = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x259ad0u);
+	if (std::memcmp(queue, expected_queue.data(), expected_queue.size()) != 0 ||
+	    std::memcmp(job, expected_job.data(), expected_job.size()) != 0 ||
+	    std::memcmp(lookup, expected_lookup.data(), expected_lookup.size()) != 0) {
+		LOGF("DDD_SERVICE_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto queue_trampoline = MakeDbRecoveryAuditTrampoline(
+	    queue, expected_queue.size(), program->base_vaddr + 0x25c461u);
+	const auto job_trampoline = MakeDbRecoveryAuditTrampoline(
+	    job, expected_job.size(), program->base_vaddr + 0x258fadu);
+	const auto lookup_trampoline = MakeDbRecoveryAuditTrampoline(
+	    lookup, expected_lookup.size(), program->base_vaddr + 0x259adeu);
+	if (queue_trampoline == 0 || job_trampoline == 0 || lookup_trampoline == 0) {
+		if (queue_trampoline != 0) FreeDbRecoveryAuditTrampoline(queue_trampoline);
+		if (job_trampoline != 0) FreeDbRecoveryAuditTrampoline(job_trampoline);
+		if (lookup_trampoline != 0) FreeDbRecoveryAuditTrampoline(lookup_trampoline);
+		LOGF("DDD_SERVICE_AUDIT install_failed reason=trampoline\n");
+		return false;
+	}
+	g_ddd_service_queue_trampoline.store(queue_trampoline, std::memory_order_release);
+	g_ddd_service_job_trampoline.store(job_trampoline, std::memory_order_release);
+	g_ddd_service_lookup_trampoline.store(lookup_trampoline, std::memory_order_release);
+	const uint64_t queue_hook = reinterpret_cast<uint64_t>(&DddServiceQueueAudit);
+	const uint64_t job_hook = reinterpret_cast<uint64_t>(&DddServiceJobAudit);
+	const uint64_t lookup_hook = reinterpret_cast<uint64_t>(&DddServiceLookupAudit);
+	std::array<uint8_t, 17> queue_patch = {
+	    0xff, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+	std::memcpy(queue_patch.data() + 6, &queue_hook, sizeof(queue_hook));
+	std::array<uint8_t, 13> job_patch = {
+	    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe0, 0x90};
+	std::memcpy(job_patch.data() + 2, &job_hook, sizeof(job_hook));
+	std::array<uint8_t, 14> lookup_patch = {0xff, 0x25};
+	std::memcpy(lookup_patch.data() + 6, &lookup_hook, sizeof(lookup_hook));
+	std::memcpy(queue, queue_patch.data(), queue_patch.size());
+	std::memcpy(job, job_patch.data(), job_patch.size());
+	std::memcpy(lookup, lookup_patch.data(), lookup_patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(queue),
+	                                                  queue_patch.size()) ||
+	    !Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(job),
+	                                                  job_patch.size()) ||
+	    !Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(lookup),
+	                                                  lookup_patch.size())) {
+		std::memcpy(queue, expected_queue.data(), expected_queue.size());
+		std::memcpy(job, expected_job.data(), expected_job.size());
+		std::memcpy(lookup, expected_lookup.data(), expected_lookup.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(queue),
+		                                             expected_queue.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(job),
+		                                             expected_job.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(lookup),
+		                                             expected_lookup.size());
+		g_ddd_service_queue_trampoline.store(0, std::memory_order_release);
+		g_ddd_service_job_trampoline.store(0, std::memory_order_release);
+		g_ddd_service_lookup_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(queue_trampoline);
+		FreeDbRecoveryAuditTrampoline(job_trampoline);
+		FreeDbRecoveryAuditTrampoline(lookup_trampoline);
+		LOGF("DDD_SERVICE_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DDD_SERVICE_AUDIT installed module=SceShellCore.elf"
+	     " queue_rva=0x25c450 job_rva=0x258fa0 lookup_rva=0x259ad0 original_calls=1\n");
+	return true;
+}
+
+static bool InstallDddServiceInnerAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x15d8d11u) return false;
+	static constexpr std::array<uint8_t, 17> expected_core = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+	    0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x58};
+	static constexpr std::array<uint8_t, 17> expected_client = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,
+	    0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
+	static constexpr std::array<uint8_t, 14> expected_pus = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+	    0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+	auto* core = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x15afc90u);
+	auto* client = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x15d8d00u);
+	auto* pus = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x15d82a0u);
+	if (std::memcmp(core, expected_core.data(), expected_core.size()) != 0 ||
+	    std::memcmp(client, expected_client.data(), expected_client.size()) != 0 ||
+	    std::memcmp(pus, expected_pus.data(), expected_pus.size()) != 0) {
+		LOGF("DDD_SERVICE_AUDIT inner_install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto core_trampoline = MakeDbRecoveryAuditTrampoline(
+	    core, expected_core.size(), program->base_vaddr + 0x15afca1u);
+	const auto client_trampoline = MakeDbRecoveryAuditTrampoline(
+	    client, expected_client.size(), program->base_vaddr + 0x15d8d11u);
+	const auto pus_trampoline = MakeDbRecoveryAuditTrampoline(
+	    pus, expected_pus.size(), program->base_vaddr + 0x15d82aeu);
+	if (core_trampoline == 0 || client_trampoline == 0 || pus_trampoline == 0) {
+		if (core_trampoline != 0) FreeDbRecoveryAuditTrampoline(core_trampoline);
+		if (client_trampoline != 0) FreeDbRecoveryAuditTrampoline(client_trampoline);
+		if (pus_trampoline != 0) FreeDbRecoveryAuditTrampoline(pus_trampoline);
+		LOGF("DDD_SERVICE_AUDIT inner_install_failed reason=trampoline\n");
+		return false;
+	}
+	g_ddd_service_core_trampoline.store(core_trampoline, std::memory_order_release);
+	g_ddd_service_client_trampoline.store(client_trampoline, std::memory_order_release);
+	g_ddd_service_pus_trampoline.store(pus_trampoline, std::memory_order_release);
+	const uint64_t core_hook = reinterpret_cast<uint64_t>(&DddServiceCoreAudit);
+	const uint64_t client_hook = reinterpret_cast<uint64_t>(&DddServiceClientAudit);
+	const uint64_t pus_hook = reinterpret_cast<uint64_t>(&DddServicePusAudit);
+	std::array<uint8_t, 17> core_patch = {
+	    0xff, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+	std::memcpy(core_patch.data() + 6, &core_hook, sizeof(core_hook));
+	std::array<uint8_t, 17> client_patch = {
+	    0xff, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+	std::memcpy(client_patch.data() + 6, &client_hook, sizeof(client_hook));
+	std::array<uint8_t, 14> pus_patch = {0xff, 0x25};
+	std::memcpy(pus_patch.data() + 6, &pus_hook, sizeof(pus_hook));
+	std::memcpy(core, core_patch.data(), core_patch.size());
+	std::memcpy(client, client_patch.data(), client_patch.size());
+	std::memcpy(pus, pus_patch.data(), pus_patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(core),
+	                                                  core_patch.size()) ||
+	    !Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(client),
+	                                                  client_patch.size()) ||
+	    !Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(pus),
+	                                                  pus_patch.size())) {
+		std::memcpy(core, expected_core.data(), expected_core.size());
+		std::memcpy(client, expected_client.data(), expected_client.size());
+		std::memcpy(pus, expected_pus.data(), expected_pus.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(core),
+		                                             expected_core.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(client),
+		                                             expected_client.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(pus),
+		                                             expected_pus.size());
+		g_ddd_service_core_trampoline.store(0, std::memory_order_release);
+		g_ddd_service_client_trampoline.store(0, std::memory_order_release);
+		g_ddd_service_pus_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(core_trampoline);
+		FreeDbRecoveryAuditTrampoline(client_trampoline);
+		FreeDbRecoveryAuditTrampoline(pus_trampoline);
+		LOGF("DDD_SERVICE_AUDIT inner_install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("DDD_SERVICE_AUDIT inner_installed module=SceShellCore.elf"
+	     " core_rva=0x15afc90 client_rva=0x15d8d00 pus_rva=0x15d82a0 original_calls=1\n");
+	return true;
+}
+
+static bool InstallEvalSystemPasscodeInputAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1d0950u) return false;
+	static constexpr std::array<uint8_t, 16> expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x50,
+	    0x4c, 0x89, 0x75, 0xf0, 0x4c, 0x89, 0x7d, 0xf8};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1d0940u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("EVAL_SYSTEM_PASSCODE_INPUT_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1d0950u);
+	if (trampoline == 0) return false;
+	g_eval_system_passcode_input_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&EvalSystemPasscodeInputAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_eval_system_passcode_input_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("EVAL_SYSTEM_PASSCODE_INPUT_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("EVAL_SYSTEM_PASSCODE_INPUT_AUDIT installed"
+	     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx eval_rva=0x1d0940 original_calls=1\n");
+	return true;
+}
+
+static bool InstallBootRegisterInterfaceAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1cc70fu) return false;
+	static constexpr std::array<uint8_t, 15> expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0xb0,
+	    0x02, 0x00, 0x00, 0x48, 0x89, 0x5d, 0xd8};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1cc700u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) {
+		LOGF("BOOT_REGISTRATION_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto trampoline = MakeDbRecoveryAuditTrampoline(
+	    code, expected.size(), program->base_vaddr + 0x1cc70fu);
+	if (trampoline == 0) return false;
+	g_boot_register_interface_trampoline.store(trampoline, std::memory_order_release);
+	const uint64_t hook = reinterpret_cast<uint64_t>(&BootRegisterInterfaceAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                             patch.size());
+		g_boot_register_interface_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(trampoline);
+		LOGF("BOOT_REGISTRATION_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("BOOT_REGISTRATION_AUDIT installed"
+	     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx register_rva=0x1cc700 original_calls=1\n");
+	return true;
+}
+
+static bool InstallBootSchedulerAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0xbf00u) return false;
+	static constexpr std::array<uint8_t, 14> register_expected = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+	    0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+	static constexpr std::array<uint8_t, 16> initialize_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x40,
+	    0x4c, 0x89, 0x75, 0xf0, 0x4c, 0x89, 0x7d, 0xf8};
+	auto* register_code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x1c40u);
+	auto* initialize_code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0xbef0u);
+	if (std::memcmp(register_code, register_expected.data(), register_expected.size()) != 0 ||
+	    std::memcmp(initialize_code, initialize_expected.data(), initialize_expected.size()) != 0) {
+		LOGF("BOOT_SCHEDULER_AUDIT install_failed reason=code_signature\n");
+		return false;
+	}
+	const auto register_trampoline = MakeDbRecoveryAuditTrampoline(
+	    register_code, register_expected.size(), program->base_vaddr + 0x1c4eu);
+	if (register_trampoline == 0) return false;
+	const auto initialize_trampoline = MakeDbRecoveryAuditTrampoline(
+	    initialize_code, initialize_expected.size(), program->base_vaddr + 0xbf00u);
+	if (initialize_trampoline == 0) {
+		FreeDbRecoveryAuditTrampoline(register_trampoline);
+		return false;
+	}
+	g_run_manager_register_trampoline.store(register_trampoline, std::memory_order_release);
+	g_run_item_initialize_trampoline.store(initialize_trampoline, std::memory_order_release);
+	const uint64_t register_hook = reinterpret_cast<uint64_t>(&RunManagerRegisterAudit);
+	const uint64_t initialize_hook = reinterpret_cast<uint64_t>(&RunItemInitializeAudit);
+	std::array<uint8_t, 14> register_patch = {0xff, 0x25};
+	std::array<uint8_t, 14> initialize_patch = {0xff, 0x25};
+	std::memcpy(register_patch.data() + 6, &register_hook, sizeof(register_hook));
+	std::memcpy(initialize_patch.data() + 6, &initialize_hook, sizeof(initialize_hook));
+	std::memcpy(register_code, register_patch.data(), register_patch.size());
+	std::memcpy(initialize_code, initialize_patch.data(), initialize_patch.size());
+	const bool register_flushed = Common::VirtualMemory::FlushInstructionCache(
+	    reinterpret_cast<uint64_t>(register_code), register_patch.size());
+	const bool initialize_flushed = Common::VirtualMemory::FlushInstructionCache(
+	    reinterpret_cast<uint64_t>(initialize_code), initialize_patch.size());
+	if (!register_flushed || !initialize_flushed) {
+		std::memcpy(register_code, register_expected.data(), register_patch.size());
+		std::memcpy(initialize_code, initialize_expected.data(), initialize_patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(register_code),
+		                                             register_patch.size());
+		Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(initialize_code),
+		                                             initialize_patch.size());
+		g_run_manager_register_trampoline.store(0, std::memory_order_release);
+		g_run_item_initialize_trampoline.store(0, std::memory_order_release);
+		FreeDbRecoveryAuditTrampoline(register_trampoline);
+		FreeDbRecoveryAuditTrampoline(initialize_trampoline);
+		LOGF("BOOT_SCHEDULER_AUDIT install_failed reason=flush\n");
+		return false;
+	}
+	LOGF("BOOT_SCHEDULER_AUDIT installed"
+	     " module=Sce.Vsh.ShellUI.BaseSystem.dll.sprx"
+	     " register_rva=0x1c40 initialize_rva=0xbef0 original_calls=1\n");
+	return true;
+}
+
+static bool InstallDbRecoveryPuiAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x1e2860u) {
+		LOGF("DB_RECOVERY_PUI_AUDIT install_failed reason=program_range\n");
+		return false;
+	}
+	static constexpr std::array<uint8_t, 15> resolve_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x20,
+	    0x4c, 0x89, 0x75, 0xf8, 0x4c, 0x8b, 0xf7};
+	static constexpr std::array<uint8_t, 16> callback_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x30,
+	    0x4c, 0x89, 0x65, 0xf0, 0x4c, 0x89, 0x75, 0xf8};
+	static constexpr std::array<uint8_t, 14> context_expected = {
+	    0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+	    0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x50};
+	static constexpr std::array<uint8_t, 15> enqueue_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0x90,
+	    0x00, 0x00, 0x00, 0x48, 0x89, 0x7d, 0x80};
+	static constexpr std::array<uint8_t, 16> closure_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x40,
+	    0x4c, 0x89, 0x75, 0xf0, 0x4c, 0x89, 0x7d, 0xf8};
+	static constexpr std::array<uint8_t, 15> react_bridge_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x20,
+	    0x4c, 0x89, 0x6d, 0xf8, 0x4c, 0x8b, 0xef};
+	struct Site {
+		uint32_t              rva;
+		const uint8_t*        expected;
+		size_t                size;
+		uint64_t              hook;
+		std::atomic<uint64_t>* target;
+		uint64_t              trampoline;
+	};
+	std::array<Site, 6> sites = {{
+	    {0x1cba30u, resolve_expected.data(), resolve_expected.size(),
+	     reinterpret_cast<uint64_t>(&DbRecoveryPuiResolveAudit),
+	     &g_db_recovery_pui_resolve_trampoline, 0},
+	    {0x127e90u, callback_expected.data(), callback_expected.size(),
+	     reinterpret_cast<uint64_t>(&DbRecoveryPuiCallbackAudit),
+	     &g_db_recovery_pui_callback_trampoline, 0},
+	    {0x93000u, context_expected.data(), context_expected.size(),
+	     reinterpret_cast<uint64_t>(&DbRecoveryPuiContextAudit),
+	     &g_db_recovery_pui_context_trampoline, 0},
+	    {0x1cddc0u, enqueue_expected.data(), enqueue_expected.size(),
+	     reinterpret_cast<uint64_t>(&DbRecoveryPuiEnqueueAudit),
+	     &g_db_recovery_pui_enqueue_trampoline, 0},
+	    {0x1e2850u, closure_expected.data(), closure_expected.size(),
+	     reinterpret_cast<uint64_t>(&DbRecoveryPuiClosureAudit),
+	     &g_db_recovery_pui_closure_trampoline, 0},
+	    {0x1cbf90u, react_bridge_expected.data(), react_bridge_expected.size(),
+	     reinterpret_cast<uint64_t>(&DbRecoveryPuiReactBridgeAudit),
+	     &g_db_recovery_pui_react_bridge_trampoline, 0},
+	}};
+	for (const auto& site: sites) {
+		const auto* code = reinterpret_cast<const uint8_t*>(program->base_vaddr + site.rva);
+		if (std::memcmp(code, site.expected, site.size) != 0) {
+			LOGF("DB_RECOVERY_PUI_AUDIT install_failed reason=code_signature rva=0x%x\n",
+			     site.rva);
+			return false;
+		}
+	}
+	for (auto& site: sites) {
+		const auto* code = reinterpret_cast<const uint8_t*>(program->base_vaddr + site.rva);
+		site.trampoline = MakeDbRecoveryAuditTrampoline(
+		    code, site.size, program->base_vaddr + site.rva + site.size);
+		if (site.trampoline == 0) {
+			for (const auto& allocated: sites) {
+				if (allocated.trampoline != 0) FreeDbRecoveryAuditTrampoline(allocated.trampoline);
+			}
+			LOGF("DB_RECOVERY_PUI_AUDIT install_failed reason=trampoline_alloc\n");
+			return false;
+		}
+	}
+	bool flush_ok = true;
+	for (auto& site: sites) {
+		site.target->store(site.trampoline, std::memory_order_release);
+		std::array<uint8_t, 14> patch = {0xff, 0x25};
+		std::memcpy(patch.data() + 6, &site.hook, sizeof(site.hook));
+		auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + site.rva);
+		std::memcpy(code, patch.data(), patch.size());
+		if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+		                                                  patch.size())) {
+			LOGF("DB_RECOVERY_PUI_AUDIT install_failed reason=flush rva=0x%x\n", site.rva);
+			flush_ok = false;
+			break;
+		}
+	}
+	if (!flush_ok) {
+		for (const auto& site: sites) {
+			auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + site.rva);
+			std::memcpy(code, site.expected, 14);
+			Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), 14);
+			site.target->store(0, std::memory_order_release);
+			FreeDbRecoveryAuditTrampoline(site.trampoline);
+		}
+		return false;
+	}
+	LOGF("DB_RECOVERY_PUI_AUDIT installed module=ReactNative.PUI.dll.sprx"
+	     " resolve_rva=0x1cba30 callback_rva=0x127e90 context_rva=0x93000"
+	     " enqueue_rva=0x1cddc0 closure_rva=0x1e2850 react_bridge_rva=0x1cbf90"
+	     " original_calls=1\n");
+	return true;
+}
+
+static bool InstallDbRecoveryBridgeAudit(Program* program) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x194a5au) {
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT install_failed reason=program_range base_present=%u"
+		     " size=0x%llx\n", program != nullptr && program->base_vaddr != 0 ? 1u : 0u,
+		     static_cast<unsigned long long>(program != nullptr ? program->base_size_aligned : 0));
+		return false;
+	}
+	static constexpr std::array<uint8_t, 15> callback_expected = {
+	    0x55, 0x48, 0x8b, 0xec, 0x48, 0x81, 0xec, 0x90, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x7d, 0xf8};
+	static constexpr std::array<uint8_t, 16> catch_expected = {
+	    0x48, 0x89, 0x45, 0xe8, 0x48, 0x89, 0x45, 0xf0,
+	    0x48, 0x8b, 0x45, 0xb0, 0x48, 0x8b, 0x78, 0x18};
+	auto* callback = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x194940u);
+	auto* caught = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x194a4au);
+	if (std::memcmp(callback, callback_expected.data(), callback_expected.size()) != 0 ||
+	    std::memcmp(caught, catch_expected.data(), catch_expected.size()) != 0) {
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT install_failed reason=code_signature callback_match=%u"
+		     " catch_match=%u callback_first=%02x catch_first=%02x\n",
+		     std::memcmp(callback, callback_expected.data(), callback_expected.size()) == 0 ? 1u : 0u,
+		     std::memcmp(caught, catch_expected.data(), catch_expected.size()) == 0 ? 1u : 0u,
+		     callback[0], caught[0]);
+		return false;
+	}
+	const uint64_t callback_trampoline = MakeDbRecoveryAuditTrampoline(
+	    callback, callback_expected.size(), program->base_vaddr + 0x19494fu);
+	const uint64_t catch_trampoline = MakeDbRecoveryAuditTrampoline(
+	    caught, catch_expected.size(), program->base_vaddr + 0x194a5au);
+	if (callback_trampoline == 0 || catch_trampoline == 0) {
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT install_failed reason=trampoline_alloc callback=%u"
+		     " catch=%u\n", callback_trampoline != 0 ? 1u : 0u,
+		     catch_trampoline != 0 ? 1u : 0u);
+		if (callback_trampoline != 0) FreeDbRecoveryAuditTrampoline(callback_trampoline);
+		if (catch_trampoline != 0) FreeDbRecoveryAuditTrampoline(catch_trampoline);
+		return false;
+	}
+	std::array<uint8_t, 14> callback_patch = {0xff, 0x25};
+	std::array<uint8_t, 14> catch_patch = {0xff, 0x25};
+	const uint64_t callback_hook = reinterpret_cast<uint64_t>(&DbRecoveryBridgeCallbackAudit);
+	const uint64_t catch_hook = reinterpret_cast<uint64_t>(&DbRecoveryBridgeCatchAudit);
+	std::memcpy(callback_patch.data() + 6, &callback_hook, sizeof(callback_hook));
+	std::memcpy(catch_patch.data() + 6, &catch_hook, sizeof(catch_hook));
+	g_db_recovery_bridge_catch_trampoline = catch_trampoline;
+	g_db_recovery_bridge_callback_trampoline.store(callback_trampoline, std::memory_order_release);
+	std::memcpy(caught, catch_patch.data(), catch_patch.size());
+	std::memcpy(callback, callback_patch.data(), callback_patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(caught),
+	                                                  catch_patch.size()) ||
+	    !Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(callback),
+	                                                  callback_patch.size())) {
+		LOGF("DB_RECOVERY_BRIDGE_AUDIT install_failed reason=flush\n");
+		std::memcpy(callback, callback_expected.data(), callback_patch.size());
+		std::memcpy(caught, catch_expected.data(), catch_patch.size());
+		g_db_recovery_bridge_callback_trampoline.store(0, std::memory_order_release);
+		g_db_recovery_bridge_catch_trampoline = 0;
+		FreeDbRecoveryAuditTrampoline(callback_trampoline);
+		FreeDbRecoveryAuditTrampoline(catch_trampoline);
+		return false;
+	}
+	LOGF("DB_RECOVERY_BRIDGE_AUDIT installed module=ReactNative.Modules.Vsh.dll.sprx"
+	     " callback_rva=0x194940 catch_rva=0x194a4a original_calls=1\n");
+	return true;
+#else
+	(void)program;
+	return false;
+#endif
+}
+
+struct DbRecoveryStatusAuditResult {
+	int32_t  status;
+	int32_t  error_code;
+	float    progress_rate;
+	uint32_t remaining_time;
+	int32_t  error_type;
+};
+
+static_assert(sizeof(DbRecoveryStatusAuditResult) == 20);
+
+static KYTY_SYSV_ABI int DbRecoveryStatusAudit(void* output) {
+	using status_func_t = KYTY_SYSV_ABI int (*)(void*);
+	const auto target = g_db_recovery_status_entry.load(std::memory_order_acquire);
+	EXIT_IF(target == 0);
+	const int result = reinterpret_cast<status_func_t>(target)(output);
+	const auto call = g_db_recovery_status_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (result != 0 || output == nullptr) {
+		if (call <= 20 || call % 100 == 0) {
+			LOGF("DB_RECOVERY_STATUS_AUDIT call=%u result=0x%08x output_present=%u\n", call,
+			     static_cast<uint32_t>(result), output != nullptr ? 1u : 0u);
+		}
+		return result;
+	}
+	DbRecoveryStatusAuditResult value {};
+	std::memcpy(&value, output, sizeof(value));
+	static DbRecoveryStatusAuditResult previous {};
+	std::lock_guard lock(g_db_recovery_status_mutex);
+	const bool changed = std::memcmp(&value, &previous, sizeof(value)) != 0;
+	if (changed) previous = value;
+	if (call <= 20 || changed || call % 100 == 0) {
+		LOGF("DB_RECOVERY_STATUS_AUDIT call=%u result=0x%08x status=%d error=0x%08x"
+		     " progress=%f remaining_time=%u error_type=%d changed=%u\n",
+		     call, static_cast<uint32_t>(result), value.status,
+		     static_cast<uint32_t>(value.error_code), value.progress_rate, value.remaining_time,
+		     value.error_type, changed ? 1u : 0u);
+	}
+	return result;
+}
+
+static bool InstallDbRecoveryStatusAudit(Program* program) {
+	if (program == nullptr || program->base_vaddr == 0 ||
+	    program->base_size_aligned < 0x7b8ceu) {
+		return false;
+	}
+	static constexpr std::array<uint8_t, 14> expected = {
+	    0xe9, 0x7b, 0x7b, 0xff, 0xff, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc};
+	auto* code = reinterpret_cast<uint8_t*>(program->base_vaddr + 0x7b8c0u);
+	if (std::memcmp(code, expected.data(), expected.size()) != 0) return false;
+	const uint64_t original = program->base_vaddr + 0x73440u;
+	const uint64_t hook = reinterpret_cast<uint64_t>(&DbRecoveryStatusAudit);
+	std::array<uint8_t, 14> patch = {0xff, 0x25};
+	std::memcpy(patch.data() + 6, &hook, sizeof(hook));
+	g_db_recovery_status_entry.store(original, std::memory_order_release);
+	std::memcpy(code, patch.data(), patch.size());
+	if (!Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code),
+	                                                  patch.size())) {
+		std::memcpy(code, expected.data(), expected.size());
+		g_db_recovery_status_entry.store(0, std::memory_order_release);
+		return false;
+	}
+	LOGF("DB_RECOVERY_STATUS_AUDIT installed module=NPXS40087_eboot_decrypted.elf"
+	     " entry_rva=0x7b8c0 original_rva=0x73440 read_only=1\n");
+	return true;
+}
 
 static void* AgcPoolMallocOutcomeCall(size_t size, uint64_t caller) {
 	const auto target = g_agc_pool_malloc_target.load(std::memory_order_acquire);
@@ -766,6 +2723,7 @@ bool TestAgcPoolMallocOutcomeDiagnostic() {
 	linker.m_programs.push_back(&provider);
 	auto relocate = [&] {
 		importer.rela_bits.assign(1, 0);
+		importer.rela_pending_valid = false;
 		uint64_t empty = 0;
 		std::memcpy(importer_image.data() + jump_relocation.r_offset, &empty, sizeof(empty));
 		RuntimeLinker::Relocate(&importer);
@@ -5728,7 +7686,8 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 					ret.bind = (ret.bind == BindType::Unknown ? BindType::Weak : ret.bind);
 					ret.name = names + sym.st_name;
 					program->rt->Resolve(ret.name, ret.type, program, &sr, &ret.bind_self);
-					if (std::getenv("KYTY_DIAGNOSTIC_SYSCORE_PRINTF_FAULT") != nullptr &&
+					static const bool printf_fault = std::getenv("KYTY_DIAGNOSTIC_SYSCORE_PRINTF_FAULT") != nullptr;
+					if (printf_fault &&
 					    Common::PathToString(program->file_name).find("SceSysCore.elf") !=
 					        std::string::npos &&
 					    (ret.name.rfind("pDBDcY6uLSA", 0) == 0 ||
@@ -5775,14 +7734,9 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	const auto ri      = GetRelocationInfo(r, program);
 	auto       value   = ri.value;
 	bool       stubbed = false;
+	bool       weak    = true;
 	if (!ri.resolved) {
-		const bool weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
-		if (!weak) {
-			LOGF("Stubbed: %s\n",
-			     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
-			                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
-			                 ri.dbg_name).c_str());
-		}
+		weak = ri.bind == BindType::Weak || !program->fail_if_global_not_resolved;
 		if (ri.type == SymbolType::Object) {
 			value = g_invalid_memory;
 		} else {
@@ -5792,6 +7746,13 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
+	// unresolved records are retried after every load, only the first write is news
+	if (!weak && patched) {
+		LOGF("Stubbed: %s\n",
+		     fmt::format("[{:016x}] <- {:016x}, {}, {}, {}, {}", ri.vaddr, ri.value, ri.name,
+		                 magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
+		                 ri.dbg_name).c_str());
+	}
 	if (patched && stubbed) {
 		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
@@ -6555,6 +8516,166 @@ void RuntimeLinker::RelocateProgram(Program* program) {
 	if (!GamePatch::ApplyPending(program)) {
 		EXIT("Failed to apply pending game cheat\n");
 	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.Legacy.dll.sprx" &&
+	    g_background_auto_login_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallBackgroundAutoLoginAudit(program)) {
+			LOGF("BACKGROUND_AUTOLOGIN_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.Legacy.dll.sprx" &&
+	    g_system_passcode_input_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallSystemPasscodeInputAudit(program)) {
+			LOGF("SYSTEM_PASSCODE_INPUT_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.Legacy.dll.sprx" &&
+	    g_eval_system_passcode_input_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallEvalSystemPasscodeInputAudit(program)) {
+			LOGF("EVAL_SYSTEM_PASSCODE_INPUT_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.Legacy.dll.sprx" &&
+	    g_eval_initial_setup_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallEvalInitialSetupAudit(program)) {
+			LOGF("EVAL_INITIAL_SETUP_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.Legacy.dll.sprx" &&
+	    g_initial_setup_db_recovery_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallInitialSetupDbRecoveryAudit(program)) {
+			LOGF("INITIAL_SETUP_DB_RECOVERY_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.Legacy.dll.sprx" &&
+	    g_ddd_fw_update_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallDddFwUpdateAudit(program)) {
+			LOGF("DDD_FW_UPDATE_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.Legacy.dll.sprx" &&
+	    g_boot_register_interface_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallBootRegisterInterfaceAudit(program)) {
+			LOGF("BOOT_REGISTRATION_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.Legacy.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.ShellUI.BaseSystem.dll.sprx" &&
+	    g_run_manager_register_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallBootSchedulerAudit(program)) {
+			LOGF("BOOT_SCHEDULER_AUDIT install_failed"
+			     " module=Sce.Vsh.ShellUI.BaseSystem.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_DB_RECOVERY_BRIDGE") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Newtonsoft.Json.PlayStation.dll.sprx" &&
+	    g_db_recovery_reflection_provider_trampoline == 0) {
+		if (!InstallDbRecoverySerializerFloatAudit(program)) {
+			LOGF("DB_RECOVERY_BOXED_FLOAT_AUDIT install_failed"
+			     " module=Newtonsoft.Json.PlayStation.dll.sprx continuing_original=1\n");
+		}
+		if (!InstallDbRecoveryFloatTokenAudit(program)) {
+			LOGF("DB_RECOVERY_FLOAT_TOKEN_AUDIT install_failed"
+			     " module=Newtonsoft.Json.PlayStation.dll.sprx continuing_original=1\n");
+		}
+		if (g_db_recovery_single_tostring_trampoline.load(std::memory_order_acquire) == 0) {
+			for (auto* loaded: m_programs) {
+				if (loaded->file_name.filename() == "mscorlib.dll.sprx") {
+					if (!InstallDbRecoverySingleToStringAudit(loaded)) {
+						LOGF("DB_RECOVERY_SINGLE_TOSTRING_AUDIT install_failed"
+						     " module=mscorlib.dll.sprx continuing_original=1\n");
+					}
+					break;
+				}
+			}
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_DB_RECOVERY_BRIDGE") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "Sce.Vsh.DbPreparationWrapper.dll.sprx" &&
+	    g_db_recovery_managed_progress_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallDbRecoveryManagedProgressAudit(program)) {
+			LOGF("DB_RECOVERY_MANAGED_PROGRESS_AUDIT install_failed"
+			     " module=Sce.Vsh.DbPreparationWrapper.dll.sprx continuing_original=1\n");
+		}
+		if (!InstallDbRecoveryManagedProgressGetterAudit(program)) {
+			LOGF("DB_RECOVERY_MANAGED_GETTER_AUDIT install_failed"
+			     " module=Sce.Vsh.DbPreparationWrapper.dll.sprx continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_DB_RECOVERY_BRIDGE") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "libNativeExtensions.sprx" &&
+	    g_db_recovery_native_executor_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallDbRecoveryNativeExecutorAudit(program)) {
+			LOGF("DB_RECOVERY_NATIVE_JS_AUDIT install_failed module=libNativeExtensions.sprx"
+			     " continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_DB_RECOVERY_BRIDGE") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "ReactNative.PUI.dll.sprx" &&
+	    g_db_recovery_pui_resolve_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallDbRecoveryPuiAudit(program)) {
+			LOGF("DB_RECOVERY_PUI_AUDIT install_failed module=ReactNative.PUI.dll.sprx"
+			     " continuing_original=1\n");
+		}
+		if (g_db_recovery_native_executor_trampoline.load(std::memory_order_acquire) == 0) {
+			for (auto* loaded: m_programs) {
+				if (loaded->file_name.filename() == "libNativeExtensions.sprx") {
+					if (!InstallDbRecoveryNativeExecutorAudit(loaded)) {
+						LOGF("DB_RECOVERY_NATIVE_JS_AUDIT install_failed"
+						     " module=libNativeExtensions.sprx continuing_original=1\n");
+					}
+					break;
+				}
+			}
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_DB_RECOVERY_BRIDGE") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+	    program->file_name.filename() == "ReactNative.Modules.Vsh.dll.sprx" &&
+	    g_db_recovery_bridge_callback_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallDbRecoveryBridgeAudit(program)) {
+			LOGF("DB_RECOVERY_BRIDGE_AUDIT install_failed module=ReactNative.Modules.Vsh.dll.sprx"
+			     " continuing_original=1\n");
+		}
+	}
 }
 
 bool RuntimeLinker::EnableOriginalFontProvider(int32_t handle) {
@@ -6621,6 +8742,7 @@ bool RuntimeLinker::EnableOriginalFontProvider(int32_t handle) {
 			const auto target = value - (relocation_type == R_X86_64_64 ? relocation->r_addend : 0);
 			if (target == hle->vaddr) {
 				bits &= ~mask;
+				importer->rela_pending_valid = false;
 				++rebound;
 			}
 		});
@@ -6949,6 +9071,7 @@ int RuntimeLinker::UnloadProgram(Program* program) {
 		return status;
 	}
 	m_programs.erase(it);
+	RebuildAddrRanges();
 	std::erase(m_needed_modules, program);
 	std::erase(m_module_start_order, program->unique_id);
 	for (auto* importer: m_programs) {
@@ -6994,6 +9117,8 @@ int RuntimeLinker::UnloadProgram(Program* program) {
 				bits &= ~mask;
 				if (RelocateRecord(index, r, importer, jmprela)) {
 					bits |= mask;
+				} else {
+					importer->rela_pending_valid = false;
 				}
 			}
 		});
@@ -7061,6 +9186,7 @@ Program* RuntimeLinker::LoadProgramImpl(const std::filesystem::path& elf_name,
 	++g_exec_load_timing.programs;
 
 	m_programs.push_back(program_owner.release());
+	RebuildAddrRanges();
 	const auto refresh_start = std::chrono::steady_clock::now();
 	RefreshNeededModules();
 	g_exec_load_timing.refresh_us += MicrosecondsSince(refresh_start);
@@ -7288,6 +9414,22 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	RelocateAll();
 	Libs::LibKernel::Process::MarkExecChildStartupStage(9);
 	Common::HostException::PrepareUnhandledFaultProvenance(Libs::LibKernel::Process::GetPid());
+	if (std::getenv("KYTY_DIAGNOSTIC_BACKGROUND_AUTOLOGIN_AUDIT") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "SceShellCore.elf" &&
+	    g_ddd_service_queue_trampoline.load(std::memory_order_acquire) == 0) {
+		if (!InstallDddServiceAudit(g_tls_main_program)) {
+			LOGF("DDD_SERVICE_AUDIT install_failed module=SceShellCore.elf continuing_original=1\n");
+		}
+		if (!InstallDddServiceInnerAudit(g_tls_main_program)) {
+			LOGF("DDD_SERVICE_AUDIT inner_install_failed module=SceShellCore.elf continuing_original=1\n");
+		}
+	}
+	if (std::getenv("KYTY_DIAGNOSTIC_DB_RECOVERY_STATUS") != nullptr &&
+	    g_tls_main_program != nullptr &&
+	    g_tls_main_program->file_name.filename() == "NPXS40087_eboot_decrypted.elf") {
+		EXIT_IF(!InstallDbRecoveryStatusAudit(g_tls_main_program));
+	}
 	if (std::getenv("KYTY_DIAGNOSTIC_NPCOMMON_NATIVE_TRACE") != nullptr) {
 		for (const auto* module: m_needed_modules) {
 			if (module->file_name.filename() == "libSceNpCommon.sprx") {
@@ -7367,15 +9509,18 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 					    module->export_symbols->FindByNid("uodLYyUip20", SymbolType::Func);
 					const auto* native_fread =
 					    module->export_symbols->FindByNid("lbB+UlZqVG0", SymbolType::Func);
+					const auto* native_fgets =
+					    module->export_symbols->FindByNid("KdP-nULpuGw", SymbolType::Func);
 					const auto* native_fseek =
 					    module->export_symbols->FindByNid("rQFVBXp-Cxg", SymbolType::Func);
 					const auto* native_ftell =
 					    module->export_symbols->FindByNid("Qazy8LmXTvw", SymbolType::Func);
-					if (native_fclose != nullptr && native_fread != nullptr &&
+					if (native_fclose != nullptr && native_fread != nullptr && native_fgets != nullptr &&
 					    native_fseek != nullptr && native_ftell != nullptr) {
 						Libs::LibcInternal::SetNativeStdioEntries(
 						    native_fopen != nullptr ? native_fopen->vaddr : 0, native_fclose->vaddr,
-						    native_fread->vaddr, native_fseek->vaddr, native_ftell->vaddr);
+						    native_fread->vaddr, native_fgets->vaddr, native_fseek->vaddr,
+						    native_ftell->vaddr);
 					}
 					const auto* heap_init =
 					    module->export_symbols->FindByNid("z8GPiQwaAEY", SymbolType::Func);
@@ -7468,10 +9613,23 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 				}
 			}
 		}
+		const char* native_npmanager_process = [&]() -> const char* {
+			if (std::getenv("KYTY_DIAGNOSTIC_NATIVE_NPMANAGER_INIT") == nullptr ||
+			    g_tls_main_program == nullptr)
+				return nullptr;
+			const auto& file = g_tls_main_program->file_name;
+			if (file.filename() == "NPXS40087_eboot_decrypted.elf") return "NPXS40087";
+			if (file.filename() == "eboot.bin" && file.parent_path().filename() == "NPXS40153")
+				return "NPXS40153";
+			if (std::getenv("KYTY_DIAGNOSTIC_NATIVE_NPMANAGER_JSCD_INIT") != nullptr &&
+			    file.filename() == "eboot.bin" && file.parent_path().filename() == "NPXS40000")
+				return "NPXS40000";
+			return nullptr;
+		}();
 		for (auto* module: m_needed_modules) {
 			const bool hle_npmanager =
 			    std::strcmp(module->dynamic_info->so_name, "libSceNpManager.prx") == 0 &&
-			    std::getenv("KYTY_DIAGNOSTIC_NATIVE_NPMANAGER_INIT") == nullptr;
+			    native_npmanager_process == nullptr;
 			if (std::strcmp(module->dynamic_info->so_name, "libSceSysmodule.prx") == 0 ||
 			    std::strcmp(module->dynamic_info->so_name, "libSceAgc.prx") == 0 ||
 			    (std::strcmp(module->dynamic_info->so_name, "libSceAgcDriver.prx") == 0 &&
@@ -7523,10 +9681,11 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NATIVE_AGC_DRIVER_INIT NON_AUTHENTIC\n");
 			}
 			if (std::strcmp(module->dynamic_info->so_name, "libSceNpManager.prx") == 0 &&
-			    std::getenv("KYTY_DIAGNOSTIC_NATIVE_NPMANAGER_INIT") != nullptr) {
+			    native_npmanager_process != nullptr) {
 				// module_start (+0x27920) runs sceNpManagerPrxStart unless the arg is 1. That sets
 				// up the IPC client memory; without it IPC-backed entries return 0x80550002
-				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NATIVE_NPMANAGER_INIT native module_start\n");
+				LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_NATIVE_NPMANAGER_INIT "
+				     "process=%s native module_start\n", native_npmanager_process);
 			}
 			if (started_modules.insert(module).second && module->dynamic_info->init_vaddr != 0) {
 				int result = 0;
@@ -7709,6 +9868,10 @@ void RuntimeLinker::Clear() {
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
 
+	{
+		std::unique_lock ranges_lock(m_addr_ranges_mutex);
+		m_addr_ranges.clear();
+	}
 	for (auto* p: m_programs) {
 		DeleteProgram(p);
 	}
@@ -7813,9 +9976,11 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 					return;
 				}
 			}
-			const auto* mbus_guard = std::getenv("KYTY_DIAGNOSTIC_MBUS_UNINITIALIZED_GUARD");
-			if (mbus_guard != nullptr && std::strcmp(mbus_guard, "1") == 0 &&
-			    sr.module == "libSceMbus" && sr.library == "libSceMbus" &&
+			const bool mbus_guard = [] {
+				const auto* value = std::getenv("KYTY_DIAGNOSTIC_MBUS_UNINITIALIZED_GUARD");
+				return value != nullptr && std::strcmp(value, "1") == 0;
+			}();
+			if (mbus_guard && sr.module == "libSceMbus" && sr.library == "libSceMbus" &&
 			    sr.name == "DOFWwhLN09E") {
 				for (auto* provider: m_programs) {
 					if (provider == nullptr || provider->export_symbols == nullptr ||
@@ -7857,10 +10022,23 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 				}
 			}
 
-			const auto* original_pad = std::getenv("KYTY_DIAGNOSTIC_HOST_INPUT_HID_PAD");
-			if (original_pad != nullptr && std::strcmp(original_pad, "1") == 0 &&
-			    sr.module == "libSceMbus" && sr.library == "libSceMbus" &&
-			    sr.name == "KRL-S9qBqXw") {
+			const bool original_pad = [] {
+				const auto* value = std::getenv("KYTY_DIAGNOSTIC_HOST_INPUT_HID_PAD");
+				return value != nullptr && std::strcmp(value, "1") == 0;
+			}();
+			const bool virtual_usb_pad = [] {
+				const auto* value = std::getenv("KYTY_DIAGNOSTIC_VIRTUAL_USB_PAD");
+				return value != nullptr && std::strcmp(value, "1") == 0;
+			}();
+			const bool mbus_condition_query = sr.name == "KRL-S9qBqXw";
+			const bool mbus_id_query        = sr.name == "RsKVKhSWt28";
+			if ((original_pad || virtual_usb_pad) && sr.module == "libSceMbus" &&
+			    sr.library == "libSceMbus" && (mbus_condition_query || mbus_id_query)) {
+				const auto importer_file = program->file_name.filename();
+				const bool psm_bridge = original_pad && mbus_condition_query &&
+				                        importer_file == "libScePsm.sprx";
+				const bool shellui_bridge = virtual_usb_pad &&
+				                            importer_file == "NPXS40087_eboot_decrypted.elf";
 				for (auto* provider: m_programs) {
 					if (provider == nullptr || provider->export_symbols == nullptr ||
 					    provider->file_name.filename() != "libSceMbus.sprx") {
@@ -7868,15 +10046,19 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 					}
 					if (const auto* original = provider->export_symbols->Find(sr);
 					    original != nullptr) {
-						if (program->file_name.filename() == "libScePsm.sprx" &&
-						    m_symbols != nullptr) {
+						if ((psm_bridge || shellui_bridge) && m_symbols != nullptr) {
 							if (const auto* hle = m_symbols->Find(sr); hle != nullptr) {
-								Libs::Mbus::SetOriginalGetDeviceInfoByCondition(original->vaddr);
+								if (mbus_condition_query) {
+									Libs::Mbus::SetOriginalGetDeviceInfoByCondition(original->vaddr);
+								} else {
+									Libs::Mbus::SetOriginalGetDeviceInfoById(original->vaddr);
+								}
 								*out_info = *hle;
-								LOGF("NON_AUTHENTIC_INPUT_BRIDGE MBus controller query route"
-								     " importer=%s original=0x%016" PRIx64 " hle=0x%016" PRIx64
+								LOGF("NON_AUTHENTIC_MBUS_ROUTE importer=%s nid=%s"
+								     " virtual_usb_pad=%u original=0x%016" PRIx64 " hle=0x%016" PRIx64
 								     "\n",
 								     Common::PathToString(program->file_name).c_str(),
+								     sr.name.c_str(), shellui_bridge ? 1u : 0u,
 								     original->vaddr, hle->vaddr);
 								return;
 							}
@@ -7887,7 +10069,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 					}
 				}
 			}
-			if (original_pad != nullptr && std::strcmp(original_pad, "1") == 0 &&
+			if (original_pad &&
 			    sr.module == "libScePad" && sr.library == "libScePad") {
 				const auto importer_file       = program->file_name.filename();
 				const bool host_input_consumer = importer_file == "libScePsm.sprx" ||
@@ -7948,8 +10130,8 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 					     by_nid != nullptr ? by_nid->name.c_str() : "(null)",
 					     by_nid != nullptr ? by_nid->vaddr : 0);
 				}
-				if (std::getenv("KYTY_DIAGNOSTIC_SHELLUI_PIPE_HLE") != nullptr &&
-				    program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
+				static const bool pipe_hle = std::getenv("KYTY_DIAGNOSTIC_SHELLUI_PIPE_HLE") != nullptr;
+				if (pipe_hle && program->file_name.filename() == "NPXS40087_eboot_decrypted.elf" &&
 				    (sr.name == "-Jp7F+pXxNg" || sr.name == "wdUufa9g-D8") &&
 				    (sr.library == "libkernel" || sr.library == "Posix") &&
 				    type == SymbolType::Func) {
@@ -8083,8 +10265,8 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			if (rec != nullptr) {
-				if (std::getenv("KYTY_DIAGNOSTIC_AGC_POOL_MALLOC_OUTCOME") != nullptr &&
-				    name == "gQX+4GDQjpM#M#N" && type == SymbolType::Func &&
+				if (name == "gQX+4GDQjpM#M#N" && std::getenv("KYTY_DIAGNOSTIC_AGC_POOL_MALLOC_OUTCOME") != nullptr &&
+				    type == SymbolType::Func &&
 				    program->file_name.filename() == "AgcCompositor.elf") {
 					const Program* provider = nullptr;
 					for (const auto* candidate: m_programs) {
@@ -8211,8 +10393,20 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 }
 
 Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
-	Common::LockGuard lock(m_mutex);
+	std::shared_lock lock(m_addr_ranges_mutex);
 
+	auto it = std::upper_bound(m_addr_ranges.begin(), m_addr_ranges.end(), vaddr,
+	                           [](uint64_t a, const AddrRange& r) { return a < r.begin; });
+	if (it == m_addr_ranges.begin()) {
+		return nullptr;
+	}
+	--it;
+	return vaddr < it->end ? it->program : nullptr;
+}
+
+// Callers hold m_mutex. Ranges go in scan order and only claim space no earlier segment owns, so the index answers exactly what the linear scan over m_programs did.
+void RuntimeLinker::RebuildAddrRanges() {
+	std::map<uint64_t, AddrRange> owned;
 	for (auto* p: m_programs) {
 		const auto* ehdr = p->elf->GetEhdr();
 		const auto* phdr = p->elf->GetPhdr();
@@ -8220,19 +10414,35 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 		EXIT_IF(phdr == nullptr || ehdr == nullptr);
 
 		for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
-			if (phdr[i].p_memsz != 0 &&
-			    (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
-				uint64_t segment_addr = phdr[i].p_vaddr + p->base_vaddr;
-				uint64_t segment_size = GetAlignedSize(phdr + i);
-
-				if (vaddr >= segment_addr && vaddr < segment_addr + segment_size) {
-					return p;
+			if (phdr[i].p_memsz == 0 || (phdr[i].p_type != PT_LOAD && phdr[i].p_type != PT_OS_RELRO)) {
+				continue;
+			}
+			uint64_t begin = phdr[i].p_vaddr + p->base_vaddr;
+			uint64_t end   = begin + GetAlignedSize(phdr + i);
+			auto     next  = owned.upper_bound(begin);
+			if (next != owned.begin() && std::prev(next)->second.end > begin) {
+				begin = std::prev(next)->second.end;
+			}
+			while (begin < end) {
+				if (next == owned.end() || next->first >= end) {
+					owned.emplace(begin, AddrRange {begin, end, p});
+					break;
 				}
+				if (next->first > begin) {
+					owned.emplace(begin, AddrRange {begin, next->first, p});
+				}
+				begin = next->second.end;
+				++next;
 			}
 		}
 	}
-
-	return nullptr;
+	std::vector<AddrRange> ranges;
+	ranges.reserve(owned.size());
+	for (const auto& [begin, range]: owned) {
+		ranges.push_back(range);
+	}
+	std::unique_lock lock(m_addr_ranges_mutex);
+	m_addr_ranges = std::move(ranges);
 }
 
 bool RuntimeLinker::GetOriginalUd2ProgramInfo(uint64_t vaddr, uint64_t* base_vaddr,
@@ -9980,6 +12190,10 @@ void RuntimeLinker::Relocate(Program* program) {
 	if (program->elf != nullptr && program->elf->IsStaticExec()) {
 		return;
 	}
+	// RelocateAll runs after every dynamic load; ShellUI does ~130 of them over ~400 programs
+	if (program->rela_pending_valid && program->rela_pending.empty()) {
+		return;
+	}
 
 	if (g_invalid_memory == 0) {
 		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
@@ -9999,13 +12213,33 @@ void RuntimeLinker::Relocate(Program* program) {
 	const auto rela_count = static_cast<uint32_t>(
 	    program->dynamic_info->rela_table_total_size / sizeof(Elf64_Rela));
 
-	ForEachRelocation(program, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
-		const auto bit_index = (jmprela ? rela_count : 0) + index;
-		if ((program->rela_bits[bit_index >> 3u] & (1u << (bit_index & 7u))) == 0 &&
-		    RelocateRecord(index, r, program, jmprela)) {
+	if (program->rela_pending_valid) {
+		std::erase_if(program->rela_pending, [&](uint32_t bit_index) {
+			const bool jmprela = bit_index >= rela_count;
+			const auto index   = jmprela ? bit_index - rela_count : bit_index;
+			auto*      table   = jmprela ? program->dynamic_info->jmprela_table
+			                             : program->dynamic_info->rela_table;
+			if (!RelocateRecord(index, table + index, program, jmprela)) {
+				return false;
+			}
 			program->rela_bits[bit_index >> 3u] |= 1u << (bit_index & 7u);
-		}
-	});
+			return true;
+		});
+	} else {
+		program->rela_pending.clear();
+		ForEachRelocation(program, [&](Elf64_Rela* r, uint32_t index, bool jmprela) {
+			const auto bit_index = (jmprela ? rela_count : 0) + index;
+			if ((program->rela_bits[bit_index >> 3u] & (1u << (bit_index & 7u))) != 0) {
+				return;
+			}
+			if (RelocateRecord(index, r, program, jmprela)) {
+				program->rela_bits[bit_index >> 3u] |= 1u << (bit_index & 7u);
+			} else {
+				program->rela_pending.push_back(bit_index);
+			}
+		});
+		program->rela_pending_valid = true;
+	}
 
 	if (program->tls.image_vaddr != 0 && program->tls.init_size != 0 &&
 	    program->tls.init_image.empty()) {

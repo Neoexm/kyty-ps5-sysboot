@@ -965,6 +965,46 @@ void TestFragmentedBackingUnmapRollback() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestPartialBackingUnmapSplitRollback() {
+	const char* test     = "PartialBackingUnmapSplitRollback";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	const auto  base =
+	    MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw, "split_rollback");
+	auto* first_word = reinterpret_cast<uint64_t*>(base);
+	auto* last_word =
+	    reinterpret_cast<uint64_t*>(base + SceKernelPageSize * 3 - sizeof(uint64_t));
+	*first_word = 0x53504c49544c4546ull;
+	*last_word  = 0x53504c4954524748ull;
+
+	Libs::LibKernel::Memory::TestFailNextGuestBackingStoreSplit();
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize,
+	                                                  SceKernelPageSize),
+	            "KernelMunmap(injected split failure)");
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize * 3,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "split_rollback");
+	Check(test, *first_word == 0x53504c49544c4546ull &&
+	                *last_word == 0x53504c4954524748ull,
+	      "partial backing-unmap rollback lost mapped contents");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize,
+	                                              SceKernelPageSize),
+	        "KernelMunmap(retry middle page)");
+	ExpectUnmapped(test, base + SceKernelPageSize);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(left cleanup)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2,
+	                                              SceKernelPageSize),
+	        "KernelMunmap(right cleanup)");
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "partial backing-unmap rollback leaked flexible capacity");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestRuntimeMemoryOwnerLifecycle() {
 	const char* test = "RuntimeMemoryOwnerLifecycle";
 	Check(test,
@@ -4360,6 +4400,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestInitialModuleStageStackContract);
 	RunTest(TestFragmentedBackingUnmapRollback);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestPartialBackingUnmapSplitRollback);
+#endif
 	RunTest(TestRuntimeMemoryOwnerLifecycle);
 	RunTest(TestFlexibleMapQueryAndWholeMunmap);
 	RunTest(TestPartialFlexibleMunmapAndFindNext);

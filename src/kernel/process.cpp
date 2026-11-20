@@ -1474,6 +1474,14 @@ bool FindPeerByPid(int pid, PeerProcess* peer) {
 		}
 	}
 	if (!HostProcessAlive(peer->host_pid)) return false;
+#if defined(_WIN32)
+	// Windows hands a dead child's host pid to new processes within minutes under spawn churn.
+	if (auth_markers_valid && birth_markers == 1) {
+		HANDLE same = OpenMatchingLiveProcess(peer->host_pid, host_birth);
+		if (same == nullptr) return false;
+		CloseHandle(same);
+	}
+#endif
 	if (auth_markers_valid && birth_markers == 1) peer->host_birth = host_birth;
 	const bool has_auth_commit = auth_markers_valid && self_markers == 1 && elf_markers == 1 &&
 	                             birth_markers == 1 && auth_info_markers == 1;

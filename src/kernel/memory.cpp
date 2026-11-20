@@ -174,6 +174,9 @@ static bool VirtualRangesOverlap(uint64_t left_start, uint64_t left_size, uint64
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static bool            g_test_fail_next_backing_store_split        = false;
+#endif
 #endif
 
 #include "memoryAddressSpace.inc"
@@ -463,6 +466,11 @@ public:
 
 		out->clear();
 		return false;
+	}
+
+	std::vector<Range> Snapshot() {
+		Common::LockGuard lock(m_mutex);
+		return m_ranges;
 	}
 
 	bool CanWriteGpuBacking(GuestAddressSpace& address_space, uint64_t vaddr, uint64_t size) {
@@ -1202,7 +1210,8 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 }
 
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {
-	if (size == 0) {
+	// no GPU caches exist yet while an exec child loads its image
+	if (size == 0 || g_gpu_resources == nullptr) {
 		return;
 	}
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
@@ -1339,7 +1348,18 @@ bool CopyFromGuest(void* destination, const void* source, uint64_t size) {
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	EXIT_IF(resources != nullptr && g_gpu_resources != nullptr);
 	g_gpu_resources = resources;
-	if (resources == nullptr || g_physical_memory == nullptr) {
+	if (resources == nullptr) {
+		return;
+	}
+	// exec children load their main image before graphics comes up; those loader ranges went through MapGpuRange while it was still a no-op
+	if (g_virtual_ranges != nullptr) {
+		for (const auto& range: g_virtual_ranges->Snapshot()) {
+			if (IsPrivateCommittedRangeType(range.type) || range.type == VirtualRangeType::Flexible) {
+				MapGpuRange(range.start, range.size);
+			}
+		}
+	}
+	if (g_physical_memory == nullptr) {
 		return;
 	}
 
@@ -1391,6 +1411,11 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
+}
+
+bool TryVisitSparseBackingPages(uint64_t vaddr, uint64_t count, uint64_t page_size,
+                                void (*visit)(void*, uint64_t, const uint8_t*), void* context) {
+	return g_guest_address_space->TryVisitSparseBackingPages(vaddr, count, page_size, visit, context);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {
@@ -3585,10 +3610,15 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 
 	std::lock_guard<MemoryOperationMutex> memory_operation_lock(g_memory_operation_mutex);
 
-	LOGF("\t offset    = 0x%016" PRIx64 "\n"
-	     "\t flags     = 0x%08" PRIx32 "\n"
-	     "\t info_size = 0x%016" PRIx64 "\n",
-	     offset, flags, info_size);
+	static std::atomic<uint32_t> dmq_log_count {0};
+	const bool                   dmq_log = dmq_log_count.fetch_add(1) < 64;
+
+	if (dmq_log) {
+		LOGF("\t offset    = 0x%016" PRIx64 "\n"
+		     "\t flags     = 0x%08" PRIx32 "\n"
+		     "\t info_size = 0x%016" PRIx64 "\n",
+		     offset, flags, info_size);
+	}
 
 	struct QueryInfo {
 		int64_t start;
@@ -3623,11 +3653,11 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 				query_info->start       = static_cast<int64_t>(PhysicalMemory::Size());
 				query_info->end         = static_cast<int64_t>(PhysicalMemory::Size());
 				query_info->memory_type = 0;
-				LOGF_COLOR(Log::Color::Green, "\t terminal    = true\n\t[Ok]\n");
+				if (dmq_log) LOGF_COLOR(Log::Color::Green, "\t terminal    = true\n\t[Ok]\n");
 				return OK;
 			}
 
-			LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
+			if (dmq_log) LOGF_COLOR(Log::Color::Red, "\t[Fail]\n");
 			return KERNEL_ERROR_EACCES;
 		}
 
@@ -3646,12 +3676,14 @@ int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info,
 	query_info->end         = static_cast<int64_t>(block.start_addr + block.size);
 	query_info->memory_type = block.memory_type;
 
-	LOGF_COLOR(Log::Color::Green,
-	           "\t start       = %016" PRIx64 "\n"
-	           "\t end         = %016" PRIx64 "\n"
-	           "\t memory_type = %d\n"
-	           "\t[Ok]\n",
-	           query_info->start, query_info->end, query_info->memory_type);
+	if (dmq_log) {
+		LOGF_COLOR(Log::Color::Green,
+		           "\t start       = %016" PRIx64 "\n"
+		           "\t end         = %016" PRIx64 "\n"
+		           "\t memory_type = %d\n"
+		           "\t[Ok]\n",
+		           query_info->start, query_info->end, query_info->memory_type);
+	}
 
 	return OK;
 }
@@ -4836,6 +4868,12 @@ void TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps) {
 	g_test_backing_store_unmaps_before_failure = successful_unmaps;
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestFailNextGuestBackingStoreSplit() {
+	g_test_fail_next_backing_store_split = true;
+}
+#endif
+
 void TestFailNextFixedReserveRangeRegistration() {
 	g_test_fail_next_fixed_reserve_range_add = true;
 }
@@ -4908,10 +4946,13 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
 
-	LOGF("\t addr      = 0x%016" PRIx64 "\n"
-	     "\t flags     = 0x%08" PRIx32 "\n"
-	     "\t info_size = 0x%016" PRIx64 "\n",
-	     vaddr, flags, info_size);
+	static std::atomic<uint32_t> arg_log_count {0};
+	if (arg_log_count.fetch_add(1) < 64) {
+		LOGF("\t addr      = 0x%016" PRIx64 "\n"
+		     "\t flags     = 0x%08" PRIx32 "\n"
+		     "\t info_size = 0x%016" PRIx64 "\n",
+		     vaddr, flags, info_size);
+	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (vq_caller_log) {

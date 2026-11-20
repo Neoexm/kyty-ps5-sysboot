@@ -24,11 +24,13 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -63,6 +65,7 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_GAMEPAD_BUTTON_WEST: return Controller::PAD_BUTTON_SQUARE;
 		case SDL_GAMEPAD_BUTTON_NORTH: return Controller::PAD_BUTTON_TRIANGLE;
 		case SDL_GAMEPAD_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
+		case SDL_GAMEPAD_BUTTON_GUIDE: return Controller::PAD_BUTTON_PS;
 		case SDL_GAMEPAD_BUTTON_LEFT_STICK: return Controller::PAD_BUTTON_L3;
 		case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return Controller::PAD_BUTTON_R3;
 		case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return Controller::PAD_BUTTON_L1;
@@ -153,6 +156,7 @@ struct EventController {
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+std::vector<std::pair<SDL_JoystickID, SDL_Gamepad*>> g_open_gamepads;
 
 } // namespace
 
@@ -287,13 +291,51 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 #endif
 }
 
+static void ConnectGamepad(SDL_JoystickID id) {
+	const auto existing = std::find_if(g_open_gamepads.begin(), g_open_gamepads.end(),
+	                                   [id](const auto& item) { return item.first == id; });
+	if (existing != g_open_gamepads.end()) return;
+
+	auto* pad = SDL_OpenGamepad(id);
+	if (pad == nullptr) {
+		LOGF("Controller: ignoring gamepad %u that could not be opened: %s\n", id, SDL_GetError());
+		return;
+	}
+	g_open_gamepads.emplace_back(id, pad);
+	Controller::Connect(static_cast<int>(id));
+	LOGF("Controller opened: id=%u type=%d\n", id, static_cast<int>(SDL_GetGamepadType(pad)));
+}
+
+static void DisconnectGamepad(SDL_JoystickID id) {
+	const auto existing = std::find_if(g_open_gamepads.begin(), g_open_gamepads.end(),
+	                                   [id](const auto& item) { return item.first == id; });
+	if (existing == g_open_gamepads.end()) return;
+
+	Controller::Disconnect(static_cast<int>(id));
+	SDL_CloseGamepad(existing->second);
+	g_open_gamepads.erase(existing);
+	LOGF("Controller closed: id=%u\n", id);
+}
+
+static void DiscoverGamepads() {
+	int count = 0;
+	auto* ids = SDL_GetGamepads(&count);
+	if (ids == nullptr) {
+		LOGF("Controller discovery failed: %s\n", SDL_GetError());
+		return;
+	}
+	for (int index = 0; index < count; ++index) {
+		ConnectGamepad(ids[index]);
+	}
+	SDL_free(ids);
+}
+
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
 
 #ifdef KYTY_DBG_INPUT
-	if (f.added || f.removed) {
-		LOGF("Controller %s: %d, time = %.04f\n", (f.added ? "added" : "removed"), f.id,
-		     f.timestamp_seconds);
+	if (f.added || f.removed || f.remapped) {
+		LOGF("Controller %s: %d, time = %.04f\n",
+		     f.added ? "added" : f.removed ? "removed" : "remapped", f.id, f.timestamp_seconds);
 	} else if (f.axis) {
 		LOGF("Controller axis: %d, axis = %d, value = %d, time = %.04f\n", f.id, f.axis_id,
 		     f.axis_value, f.timestamp_seconds);
@@ -306,24 +348,22 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
-		auto* pad = SDL_OpenGamepad(f.id);
-		if (pad == nullptr) {
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
-			     SDL_GetError());
-			return;
-		}
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
+		ConnectGamepad(static_cast<SDL_JoystickID>(f.id));
 	}
 
 	if (f.removed) {
-		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
-			Controller::Disconnect(f.id);
-			SDL_CloseGamepad(pad);
-		}
+		DisconnectGamepad(static_cast<SDL_JoystickID>(f.id));
+	}
+
+	if (f.remapped) {
+		ConnectGamepad(static_cast<SDL_JoystickID>(f.id));
+		Controller::RefreshHostPhysicalConnection();
 	}
 
 	if (f.down || f.up) {
+		if (f.button == SDL_GAMEPAD_BUTTON_GUIDE) {
+			LOGF("Controller PS button %s: id=%d\n", f.down ? "pressed" : "released", f.id);
+		}
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
@@ -783,6 +823,11 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+	// Every guest process is its own host process with its own swapchain, so capture/overlay layers (Overwolf, OBS, Steam, EOS, ...) get injected ~30 times over and hook each present. Keep only GPU-vendor driver layers unless the user set their own filter.
+	if (std::getenv("VK_LOADER_LAYERS_DISABLE") == nullptr && std::getenv("VK_LOADER_LAYERS_ALLOW") == nullptr) {
+		SDL_setenv_unsafe("VK_LOADER_LAYERS_DISABLE", "~implicit~", 0);
+		SDL_setenv_unsafe("VK_LOADER_LAYERS_ALLOW", "VK_LAYER_NV_*,VK_LAYER_AMD_*,VK_LAYER_INTEL_*,VK_LAYER_MESA_*", 0);
+	}
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {
@@ -799,10 +844,12 @@ static void WindowCreate(WindowContext& context) {
 	}
 	Controller::SetHostInputSharedProducer(
 	    (SDL_GetWindowFlags(context.window) & SDL_WINDOW_HIDDEN) == 0);
-	LOGF("HostWindow: role=%u visible=%d brokered=%d\n",
+	DiscoverGamepads();
+	context.headless = g_host_window_policy.role == HostWindowPolicy::Role::Service;
+	LOGF("HostWindow: role=%u visible=%d brokered=%d headless=%d\n",
 	     static_cast<unsigned>(g_host_window_policy.role),
 	     (SDL_GetWindowFlags(context.window) & SDL_WINDOW_HIDDEN) == 0,
-	     HostWindowPolicy::UsesBroker() ? 1 : 0);
+	     HostWindowPolicy::UsesBroker() ? 1 : 0, context.headless ? 1 : 0);
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
@@ -846,8 +893,9 @@ void WindowRun() {
 
 void WindowShutdown() {
 	if (g_window != nullptr) {
-		HostInputShutdown();
 		Controller::EmergencyShutdown();
+		HostInputShutdown();
+		g_open_gamepads.clear();
 		g_window.reset();
 	}
 }

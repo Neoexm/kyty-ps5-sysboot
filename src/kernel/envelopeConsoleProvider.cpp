@@ -79,6 +79,19 @@ int Hex(char value) {
 	return -1;
 }
 
+bool ParseTokenHex(const char* text, std::array<uint8_t, 32>* token) {
+	if (text == nullptr || std::strlen(text) != token->size() * 2) return false;
+	uint8_t any = 0;
+	for (size_t i = 0; i < token->size(); i++) {
+		const int high = Hex(text[i * 2]);
+		const int low  = Hex(text[i * 2 + 1]);
+		if (high < 0 || low < 0) return false;
+		(*token)[i] = static_cast<uint8_t>(high << 4 | low);
+		any |= (*token)[i];
+	}
+	return any != 0;
+}
+
 bool LoadToken(const char* path, std::array<uint8_t, 32>* token) {
 	if (path == nullptr || path[0] == '\0') return false;
 	std::ifstream input(path, std::ios::binary);
@@ -99,21 +112,16 @@ bool LoadToken(const char* path, std::array<uint8_t, 32>* token) {
 		text.resize(text.size() - 2);
 	else if (!text.empty() && text.back() == '\n')
 		text.pop_back();
-	bool    ok  = text.size() == token->size() * 2;
-	uint8_t any = 0;
-	for (size_t i = 0; ok && i < token->size(); i++) {
-		const int high = Hex(text[i * 2]);
-		const int low  = Hex(text[i * 2 + 1]);
-		ok             = high >= 0 && low >= 0;
-		if (ok) {
-			(*token)[i] = static_cast<uint8_t>(high << 4 | low);
-			any |= (*token)[i];
-		}
-	}
-	ok = ok && any != 0;
+	const bool ok = ParseTokenHex(text.c_str(), token);
 	if (!text.empty())
 		Wipe(std::span<uint8_t>(reinterpret_cast<uint8_t*>(text.data()), text.size()));
 	return ok;
+}
+
+bool LoadConfiguredToken(const char* path, const char* replay_hex,
+                         std::array<uint8_t, 32>* token) {
+	if (replay_hex == nullptr) return LoadToken(path, token);
+	return (path == nullptr || path[0] == '\0') && ParseTokenHex(replay_hex, token);
 }
 
 #if defined(_WIN32)
@@ -653,8 +661,9 @@ ConfigurationStatus CreateConsoleProviderFromEnvironment(std::shared_ptr<Envelop
 	if (provider == nullptr) return ConfigurationStatus::Invalid;
 	const char* port_text    = std::getenv("KYTY_PS5_ENVELOPE_PROVIDER_PORT");
 	const char* token_path   = std::getenv("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE");
+	const char* replay_hex   = std::getenv("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX");
 	const char* timeout_text = std::getenv("KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS");
-	if (port_text == nullptr && token_path == nullptr && timeout_text == nullptr)
+	if (port_text == nullptr && token_path == nullptr && timeout_text == nullptr && replay_hex == nullptr)
 		return ConfigurationStatus::NotRequested;
 #if defined(_WIN32)
 	Configuration configuration;
@@ -669,8 +678,10 @@ ConfigurationStatus CreateConsoleProviderFromEnvironment(std::shared_ptr<Envelop
 		if (error != nullptr) *error = "invalid loopback provider timeout";
 		return ConfigurationStatus::Invalid;
 	}
-	if (!LoadToken(token_path, &configuration.token)) {
-		if (error != nullptr) *error = "invalid loopback provider token file";
+	if (!LoadConfiguredToken(token_path, replay_hex, &configuration.token)) {
+		if (error != nullptr)
+			*error = replay_hex == nullptr ? "invalid loopback provider token file"
+			                              : "invalid offline replay authentication key";
 		return ConfigurationStatus::Invalid;
 	}
 	*provider = std::make_shared<ConsoleBackend>(std::move(configuration));
@@ -686,8 +697,9 @@ ConfigurationStatus CreateConsoleRnpsProviderFromEnvironment(std::shared_ptr<Rnp
 	if (provider == nullptr) return ConfigurationStatus::Invalid;
 	const char* port_text    = std::getenv("KYTY_PS5_ENVELOPE_PROVIDER_PORT");
 	const char* token_path   = std::getenv("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE");
+	const char* replay_hex   = std::getenv("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX");
 	const char* timeout_text = std::getenv("KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS");
-	if (port_text == nullptr && token_path == nullptr && timeout_text == nullptr)
+	if (port_text == nullptr && token_path == nullptr && timeout_text == nullptr && replay_hex == nullptr)
 		return ConfigurationStatus::NotRequested;
 #if defined(_WIN32)
 	Configuration configuration;
@@ -702,8 +714,10 @@ ConfigurationStatus CreateConsoleRnpsProviderFromEnvironment(std::shared_ptr<Rnp
 		if (error != nullptr) *error = "invalid loopback provider timeout";
 		return ConfigurationStatus::Invalid;
 	}
-	if (!LoadToken(token_path, &configuration.token)) {
-		if (error != nullptr) *error = "invalid loopback provider token file";
+	if (!LoadConfiguredToken(token_path, replay_hex, &configuration.token)) {
+		if (error != nullptr)
+			*error = replay_hex == nullptr ? "invalid loopback provider token file"
+			                              : "invalid offline replay authentication key";
 		return ConfigurationStatus::Invalid;
 	}
 	*provider = std::make_shared<ConsoleBackend>(std::move(configuration));

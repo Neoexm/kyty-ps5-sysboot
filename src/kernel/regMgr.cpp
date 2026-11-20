@@ -327,6 +327,73 @@ void Initialize(ScopeRegistry* table) {
 	     reset, changed, kept);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct PersistHeader {
+	uint64_t         signature;
+	uint32_t         version;
+	uint32_t         size;
+	AuthInfo::Digest sha256;
+};
+
+constexpr uint64_t kPersistSignature = 0x315347525954594bull;
+
+bool LoadPersistent(const std::filesystem::path& path, ScopeRegistry* table) {
+	std::vector<uint8_t> raw;
+	if (!ReadFile(path, sizeof(PersistHeader) + sizeof(ScopeRegistry), &raw) ||
+	    raw.size() != sizeof(PersistHeader) + sizeof(ScopeRegistry))
+		return false;
+	PersistHeader header {};
+	std::memcpy(&header, raw.data(), sizeof(header));
+	const uint8_t* state = raw.data() + sizeof(header);
+	if (header.signature != kPersistSignature || header.version != 1 ||
+	    header.size != sizeof(ScopeRegistry) ||
+	    AuthInfo::Sha256(state, sizeof(ScopeRegistry)) != header.sha256)
+		return false;
+	auto saved = std::make_unique<ScopeRegistry>();
+	std::memcpy(saved.get(), state, sizeof(*saved));
+	if (saved->signature != ScopeRegistry::Signature || saved->manifest != g_snapshot.manifest ||
+	    saved->count != static_cast<uint32_t>(g_snapshot.rows.size()) ||
+	    saved->pool_size != static_cast<uint32_t>(g_snapshot.pool.size()))
+		return false;
+	for (uint32_t i = 0; i < saved->count; i++) {
+		const Row& actual = saved->rows[i];
+		const Row& original = g_snapshot.rows[i];
+		if (actual.key != original.key || actual.type != original.type ||
+		    actual.size != original.size || actual.nvs != original.nvs)
+			return false;
+	}
+	*table = *saved;
+	table->backup_restore_mode = -1;
+	return true;
+}
+
+bool SavePersistent(const std::filesystem::path& path, const ScopeRegistry& table) {
+	PersistHeader header {};
+	header.signature = kPersistSignature;
+	header.version   = 1;
+	header.size      = static_cast<uint32_t>(sizeof(table));
+	header.sha256    = AuthInfo::Sha256(&table, sizeof(table));
+	std::vector<uint8_t> raw(sizeof(header) + sizeof(table));
+	std::memcpy(raw.data(), &header, sizeof(header));
+	std::memcpy(raw.data() + sizeof(header), &table, sizeof(table));
+	const auto temp = std::filesystem::path(path.wstring() + L".tmp." +
+	                                        std::to_wstring(GetCurrentProcessId()) + L"." +
+	                                        std::to_wstring(GetCurrentThreadId()));
+	const HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+	                                FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) return false;
+	DWORD written = 0;
+	const bool ok = WriteFile(file, raw.data(), static_cast<DWORD>(raw.size()), &written, nullptr) &&
+	                written == static_cast<DWORD>(raw.size()) && FlushFileBuffers(file);
+	CloseHandle(file);
+	if (ok && MoveFileExW(temp.c_str(), path.c_str(),
+	                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		return true;
+	DeleteFileW(temp.c_str());
+	return false;
+}
+#endif
+
 RegistryContext* GetContext() {
 	std::string scope;
 	if (!Process::GetScope(&scope)) {
@@ -356,9 +423,26 @@ RegistryContext* GetContext() {
 		context->table = static_cast<ScopeRegistry*>(MapViewOfFile(
 		    context->section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(ScopeRegistry)));
 	}
-	if (context->table != nullptr && created) Initialize(context->table);
+	bool state_valid = true;
+	if (context->table != nullptr && created) {
+		Initialize(context->table);
+		if (const char* configured = std::getenv("KYTY_DIAGNOSTIC_REGMGR_PERSIST_PATH");
+		    configured != nullptr && configured[0] != '\0') {
+			const std::filesystem::path path = configured;
+			std::error_code error;
+			const bool exists = std::filesystem::exists(path, error);
+			if (error || (exists && !LoadPersistent(path, context->table))) {
+				LOGF("REGMGR_PERSIST_REJECTED invalid_or_unreadable_state\n");
+				context->table->signature = 0;
+				state_valid = false;
+			} else if (exists) {
+				LOGF("REGMGR_PERSIST_LOADED snapshot_matched=1\n");
+			}
+		}
+	}
 	ReleaseMutex(context->mutex);
-	if (context->table == nullptr || context->table->signature != ScopeRegistry::Signature ||
+	if (!state_valid || context->table == nullptr ||
+	    context->table->signature != ScopeRegistry::Signature ||
 	    context->table->manifest != g_snapshot.manifest)
 		return nullptr;
 	auto* result = context.get();
@@ -1121,6 +1205,12 @@ int Call(uint32_t op, uint32_t key, uint64_t size, const Guest& guest, int32_t* 
 		std::array<uint8_t, 0x818> kbuf {};
 		if (writes && !guest.read(guest.value, kbuf.data(), op == 1 ? 4 : size))
 			return finish(Code(0x800d020f));
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		std::unique_ptr<ScopeRegistry> before;
+		if (const char* configured = std::getenv("KYTY_DIAGNOSTIC_REGMGR_PERSIST_PATH");
+		    writes && configured != nullptr && configured[0] != '\0')
+			before = std::make_unique<ScopeRegistry>(*lock.table);
+#endif
 		int32_t rc = 0;
 		switch (op) {
 			case 1: rc = registry.SetInt(inst, key, kbuf.data()); break;
@@ -1135,6 +1225,17 @@ int Call(uint32_t op, uint32_t key, uint64_t size, const Guest& guest, int32_t* 
 			case 0x13: rc = registry.Op13(kbuf.data(), size); break;
 		}
 		if (registry.unmodelled == nullptr) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (rc == 0 && before != nullptr &&
+			    std::memcmp(before.get(), lock.table, sizeof(ScopeRegistry)) != 0 &&
+			    !SavePersistent(std::getenv("KYTY_DIAGNOSTIC_REGMGR_PERSIST_PATH"),
+			                    *lock.table)) {
+				*lock.table = *before;
+				LOGF("REGMGR_PERSIST_WRITE_FAILED key=0x%08" PRIx32 " op=%" PRIu32 "\n",
+				     key, static_cast<uint32_t>(op));
+				return finish(Code(0x800d0002));
+			}
+#endif
 			if (rc == 0 && reads &&
 			    !guest.write(guest.value, kbuf.data(), op == 2 || op == 7 ? 4 : size))
 				rc = Code(0x800d0210);

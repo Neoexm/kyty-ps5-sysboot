@@ -126,6 +126,9 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// visit gets each page's index and bytes, read in place where the page lies inside one mapping
+bool TryVisitSparseBackingPages(uint64_t vaddr, uint64_t count, uint64_t page_size,
+                                void (*visit)(void*, uint64_t, const uint8_t*), void* context);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -251,6 +254,9 @@ void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void     TestFailNextGuestBackingStoreSplit();
+#endif
 void     TestFailNextFixedReserveRangeRegistration();
 void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);

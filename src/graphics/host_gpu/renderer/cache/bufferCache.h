@@ -11,8 +11,10 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -76,18 +78,11 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t>
 	ObtainBuffer(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer = false,
 	             BufferId id = {}, bool cross_process_prevalidated = false);
-	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
-		switch (usage) {
-			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
-			case MemoryUsage::Download: return m_download_buffer;
-			case MemoryUsage::DeviceLocal: return m_device_buffer;
-		}
-		EXIT("BufferCache: invalid utility-buffer usage\n");
-	}
+	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage);
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
-	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return m_bda_pagetable_buffer.get(); }
+	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager->GetFaultBuffer(); }
+	void                  EnsureBdaResources();
 	[[nodiscard]] ImageBufferSource ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -159,9 +154,10 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
-	FaultManager                                      m_fault_manager;
+	// Only DMA shaders read these, and the page table alone is 768 MiB of VRAM in every guest process.
+	std::unique_ptr<FaultManager>                     m_fault_manager;
 	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
+	std::unique_ptr<Buffer>                           m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
@@ -173,10 +169,12 @@ private:
 	mutable std::mutex                                 m_cross_process_page_mutex;
 	std::unordered_map<uint64_t, CrossProcessPage>     m_cross_process_pages;
 	std::atomic_bool                                   m_cross_process_ranges_present = false;
-	StreamBuffer                                      m_staging_buffer;
-	StreamBuffer                                      m_stream_buffer;
-	StreamBuffer                                      m_download_buffer;
-	StreamBuffer                                      m_device_buffer;
+	struct UtilityBuffer {
+		std::once_flag                once;
+		std::unique_ptr<StreamBuffer> buffer;
+	};
+	// Created on first use. Most guest processes never touch the GPU, and these rings are 768 MiB per process.
+	std::array<UtilityBuffer, 4>                      m_utility_buffers;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                           m_total_used_memory        = 0;
 	uint64_t                                           m_cross_process_epoch      = 1;

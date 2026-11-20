@@ -36,6 +36,13 @@ void CheckSemaphoreLifetimes() {
         "semaphore lookup rejects a live handle from another kernel object family");
   Check(Sema::KernelCreateSema(&alias, name.c_str(), 0x101, 0, 2, nullptr) == KERNEL_ERROR_EEXIST &&
         alias == reinterpret_cast<Handle>(UINTPTR_MAX), "duplicate named create preserves output");
+  {
+    Process::ScopedGuestProcessPid foreign(pid + 701);
+    Handle foreign_duplicate = reinterpret_cast<Handle>(UINTPTR_MAX);
+    Check(Sema::KernelCreateSema(&foreign_duplicate, name.c_str(), 0x101, 0, 2, nullptr) ==
+              KERNEL_ERROR_EPERM && foreign_duplicate == reinterpret_cast<Handle>(UINTPTR_MAX),
+          "foreign guest creator receives EPERM without replacing the named semaphore");
+  }
   Check(Sema::KernelOpenSema(&alias, name.c_str()) == OK && alias != creator &&
         Sema::KernelDeleteSema(alias) == KERNEL_ERROR_EPERM &&
         Sema::KernelCloseSema(creator) == KERNEL_ERROR_EPERM,

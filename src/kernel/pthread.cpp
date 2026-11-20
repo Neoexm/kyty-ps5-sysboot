@@ -5008,6 +5008,7 @@ int KYTY_SYSV_ABI pthread_suspend_user_context_np(LibKernel::Pthread thread) {
 		return POSIX_ESRCH;
 	}
 
+	const auto suspend_start = Common::Timer::QueryPerformanceCounter();
 	thread->suspend_requests++;
 	LibKernel::PthreadWakeForSignal(thread);
 
@@ -5127,6 +5128,16 @@ int KYTY_SYSV_ABI pthread_suspend_user_context_np(LibKernel::Pthread thread) {
 		thread->suspend_requests--;
 	}
 	CloseHandle(host_thread);
+
+	static const bool timing = std::getenv("KYTY_DIAGNOSTIC_SUSPEND_TIMING") != nullptr;
+	// a forced stop may be holding the log lock, and already logs "stays in host code"
+	if (timing && !forced) {
+		LOGF("FIRST_FRAME_AUDIT DIAGNOSTIC_SUSPEND_TIMING t=%.3f thread=%s us=%llu parked=%d last_rip=0x%016" PRIx64 "\n",
+		     Loader::Timer::GetTimeMs() / 1000.0, thread->name.c_str(),
+		     static_cast<unsigned long long>((Common::Timer::QueryPerformanceCounter() - suspend_start) * 1000000 /
+		                                     Common::Timer::QueryPerformanceFrequency()),
+		     thread->suspend_parked ? 1 : 0, last_rip);
+	}
 
 	return result;
 }

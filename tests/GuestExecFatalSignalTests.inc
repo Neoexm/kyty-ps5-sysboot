@@ -22,6 +22,8 @@ struct GuestExecFatalSignalHandoff {
   uint8_t auth_info_capture[0x108];
   char request[1024 * 1024];
   volatile LONG startup_stage;
+  uint32_t catalogue_bytes;
+  uint8_t catalogue[Libs::LibKernel::AuthInfo::kCaptureCatalogueCapacity];
 };
 
 static_assert(offsetof(GuestExecFatalSignalHandoff, auth_info_present) == 80);
@@ -181,6 +183,17 @@ int RunGuestExecFatalSignalChild(int argc, char** argv) {
   if (std::strcmp(argv[1], "--guest-exec-auth-handoff-reject-child") == 0) {
     return Libs::LibKernel::Process::InitializeExecChild(argv[2]) ? 3 : 0;
   }
+  if (std::strcmp(argv[1], "--guest-exec-auth-catalogue-reject-child") == 0) {
+    if (Libs::LibKernel::Process::InitializeExecChild(argv[2])) return 3;
+    const std::string token(argv[2]);
+    const std::wstring name = L"Local\\KytyExec_" + std::wstring(token.begin(), token.end()) +
+        L"_release";
+    const HANDLE release = OpenEventW(SYNCHRONIZE, FALSE, name.c_str());
+    if (release == nullptr) return 4;
+    const DWORD waited = WaitForSingleObject(release, 10000);
+    CloseHandle(release);
+    return waited == WAIT_OBJECT_0 ? 0 : 5;
+  }
   if (std::strcmp(argv[1], "--guest-exec-auth-json-value-child") == 0) {
     return Libs::LibKernel::Process::InitializeExecChild(argv[2]) ? 0 : 8;
   }
@@ -190,6 +203,9 @@ int RunGuestExecFatalSignalChild(int argc, char** argv) {
     const auto dir = Common::PathFromUtf8(argv[2]);
     WriteGuestExecAuthInfoFile(dir / "root.self", image.self);
     WriteGuestExecAuthInfoFile(dir / "root.elf", image.elf);
+    WriteGuestExecAuthInfoFile(dir / "root.authinfo",
+                               std::vector<uint8_t>(image.capture.envelope.begin(),
+                                                    image.capture.envelope.end()));
     // same ELF header with the first p_vaddr bumped, so it doesn't match the SELF
     auto other = image.elf;
     uint64_t phoff = 0;
@@ -218,6 +234,10 @@ void CheckGuestExecAuthInfoSlotAcceptance() {
   const auto elf_path = temporary.Path() / "exec_auth_info.elf";
   WriteGuestExecAuthInfoFile(self_path, auth_info.self);
   WriteGuestExecAuthInfoFile(elf_path, auth_info.elf);
+  const auto capture_path = temporary.Path() / "exec_auth_info.authinfo";
+  WriteGuestExecAuthInfoFile(capture_path,
+                             std::vector<uint8_t>(auth_info.capture.envelope.begin(),
+                                                  auth_info.capture.envelope.end()));
   LARGE_INTEGER counter {};
   Check(QueryPerformanceCounter(&counter) != FALSE,
         "read a unique accepted auth-info handoff counter");
@@ -262,6 +282,17 @@ void CheckGuestExecAuthInfoSlotAcceptance() {
               auth_info.capture.envelope_sha256.size());
   std::memcpy(handoff.shared->auth_info_capture, auth_info.capture.envelope.data(),
               auth_info.capture.envelope.size());
+  Libs::LibKernel::AuthInfo::CaptureCatalogue catalogue;
+  std::string catalogue_reason;
+  Check(catalogue.Add(auth_info.identity.self_sha256,
+                      auth_info.capture.envelope_sha256, capture_path, &catalogue_reason),
+        "add a pinned host-only catalogue entry");
+  size_t catalogue_bytes = 0;
+  Check(catalogue.Encode(handoff.shared->catalogue,
+                         sizeof(handoff.shared->catalogue), &catalogue_bytes,
+                         &catalogue_reason),
+        "encode the exec-child catalogue handoff");
+  handoff.shared->catalogue_bytes = static_cast<uint32_t>(catalogue_bytes);
   std::memcpy(handoff.shared->request, request.data(), request.size());
   const auto inherited_names = GuestExecAuthInfoEnvironmentNames(auth_info.identity);
   for (size_t i = 0; i != inherited_names.size(); ++i) {
@@ -295,15 +326,18 @@ void CheckGuestExecAuthInfoSlotAcceptance() {
         GetExitCodeProcess(handoff.process.hProcess, &exit_code) != FALSE && exit_code == 0,
         "accepted auth-info handoff installs the exact child record");
   Check(handoff.shared->auth_info_present == 0 && handoff.shared->auth_info_bytes == 0 &&
+        handoff.shared->catalogue_bytes == 0 &&
         handoff.shared->request_bytes == 0 &&
         std::all_of(handoff.shared->request, handoff.shared->request + request.size(),
                     [](char byte) { return byte == 0; }) &&
         std::all_of(std::begin(handoff.shared->auth_info_sha256),
                     std::end(handoff.shared->auth_info_sha256), [](uint8_t byte) { return byte == 0; }) &&
         std::all_of(std::begin(handoff.shared->auth_info_capture),
-                    std::end(handoff.shared->auth_info_capture), [](uint8_t byte) { return byte == 0; }),
-        "accept and wipe the v2 auth-info slot and request bytes");
-  std::printf("GuestExecFatalSignalTests: auth_info_handoff_v2 acceptance=pass exact_record=pass mixed_case_env_strip=pass slot_wipe=pass request_wipe=pass\n");
+                    std::end(handoff.shared->auth_info_capture), [](uint8_t byte) { return byte == 0; }) &&
+        std::all_of(std::begin(handoff.shared->catalogue),
+                    std::end(handoff.shared->catalogue), [](uint8_t byte) { return byte == 0; }),
+        "accept and wipe the v2 auth-info, catalogue, and request bytes");
+  std::printf("GuestExecFatalSignalTests: auth_info_handoff_v2 acceptance=pass exact_record=pass mixed_case_env_strip=pass slot_wipe=pass catalogue_wipe=pass request_wipe=pass\n");
 #endif
 }
 
@@ -315,6 +349,18 @@ void CheckRootOriginalSelfFromApp0() {
   const auto self_path = temporary.Path() / "root.self";
   WriteGuestExecAuthInfoFile(self_path, image.self);
   WriteGuestExecAuthInfoFile(temporary.Path() / "root.elf", image.elf);
+  const auto capture_path = temporary.Path() / "root.authinfo";
+  WriteGuestExecAuthInfoFile(capture_path,
+                             std::vector<uint8_t>(image.capture.envelope.begin(),
+                                                  image.capture.envelope.end()));
+  const auto capture_path_name = Libs::LibKernel::AuthInfo::CapturePathEnvironmentName(
+      image.identity.self_sha256);
+  const auto capture_hash_name = Libs::LibKernel::AuthInfo::CaptureSha256EnvironmentName(
+      image.identity.self_sha256);
+  Check(_putenv_s(capture_path_name.c_str(), Common::PathToString(capture_path).c_str()) == 0 &&
+        _putenv_s(capture_hash_name.c_str(),
+                  Libs::LibKernel::AuthInfo::DigestHex(image.capture.envelope_sha256).c_str()) == 0,
+        "pin the root capture to the exact image");
   Check(_putenv_s("KYTY_DIAGNOSTIC_ORIGINAL_SELF", Common::PathToString(self_path).c_str()) == 0,
         "point the root at its SELF");
   Emulator::RunOptions options;
@@ -326,6 +372,11 @@ void CheckRootOriginalSelfFromApp0() {
   const bool exact = Libs::LibKernel::Process::GetVerifiedOriginalSelfIdentity(&installed) &&
       installed.self_sha256 == image.identity.self_sha256 && installed.elf_sha256 == image.identity.elf_sha256 &&
       installed.authority_id == image.identity.authority_id;
+  Libs::LibKernel::AuthInfo::Capture installed_capture {};
+  const bool exact_capture = Libs::LibKernel::Process::GetVerifiedAuthInfoForImage(
+      image.identity, &installed_capture) && installed_capture.record == image.record &&
+      installed_capture.envelope_sha256 == image.capture.envelope_sha256;
+  SecureZeroMemory(&installed_capture, sizeof(installed_capture));
   // a byte-identical copy is still a different file
   std::filesystem::copy_file(temporary.Path() / "root.elf", temporary.Path() / "copy.elf");
   const bool same_file = Libs::LibKernel::Process::RootOriginalSelfIsLoadedFile(temporary.Path() / "root.elf");
@@ -337,7 +388,10 @@ void CheckRootOriginalSelfFromApp0() {
   std::filesystem::remove(temporary.Path() / "root.elf", released);
   Libs::LibKernel::Process::ClearVerifiedOriginalSelf();
   _putenv_s("KYTY_DIAGNOSTIC_ORIGINAL_SELF", "");
+  _putenv_s(capture_path_name.c_str(), "");
+  _putenv_s(capture_hash_name.c_str(), "");
   Check(exact, "validate the root SELF against the host file behind /app0");
+  Check(exact_capture, "install the root's exact pinned full AuthInfo capture");
   Check(same_file && copy_refused, "match the loaded ELF by file identity, not by contents");
   Check(static_cast<bool>(locked) && !released, "hold the validated ELF until the test releases it");
 #endif
@@ -345,9 +399,87 @@ void CheckRootOriginalSelfFromApp0() {
 
 void CheckGuestExecLegacyAuthInfoJsonRejection();
 
+void CheckGuestExecMalformedCatalogueRejection() {
+#if defined(_WIN32)
+  GuestExecFatalSignalFixture fixture;
+  LARGE_INTEGER counter {};
+  Check(QueryPerformanceCounter(&counter) != FALSE,
+        "read a unique malformed catalogue handoff counter");
+  std::array<char, 33> token {};
+  const int token_size = std::snprintf(token.data(), token.size(), "%08lx%08lx%016llx",
+      GetCurrentProcessId(), GetTickCount(),
+      static_cast<unsigned long long>(counter.QuadPart));
+  Check(token_size == 32, "format a malformed catalogue endpoint token");
+  const std::wstring endpoint(token.begin(), token.end() - 1);
+  const std::wstring prefix = L"Local\\KytyExec_" + endpoint;
+  fixture.mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+      static_cast<DWORD>(sizeof(GuestExecFatalSignalHandoff)), (prefix + L"_map").c_str());
+  const bool mapping_created = fixture.mapping != nullptr && GetLastError() != ERROR_ALREADY_EXISTS;
+  fixture.prepared = CreateEventW(nullptr, TRUE, FALSE, (prefix + L"_prepared").c_str());
+  fixture.release = CreateEventW(nullptr, TRUE, FALSE, (prefix + L"_release").c_str());
+  fixture.job = CreateJobObjectW(nullptr, nullptr);
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  Check(mapping_created && fixture.prepared != nullptr && fixture.release != nullptr &&
+        fixture.job != nullptr && SetInformationJobObject(fixture.job,
+            JobObjectExtendedLimitInformation, &limits, sizeof(limits)) != FALSE,
+        "create malformed catalogue handoff objects");
+  fixture.shared = static_cast<GuestExecFatalSignalHandoff*>(MapViewOfFile(
+      fixture.mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(GuestExecFatalSignalHandoff)));
+  Check(fixture.shared != nullptr, "map the malformed catalogue handoff");
+  std::memset(fixture.shared, 0, sizeof(*fixture.shared));
+  constexpr uint32_t guest_pid = 6195;
+  std::array<wchar_t, 32768> executable {};
+  const DWORD length = GetModuleFileNameW(nullptr, executable.data(), executable.size());
+  Check(length != 0 && length < executable.size(),
+        "locate the malformed catalogue child executable");
+  const std::string request =
+      "{\"argv\":[],\"envp\":[],\"guest_pid\":" + std::to_string(guest_pid) +
+      ",\"host_path\":" + GuestExecJsonString(Common::PathToString(
+          std::filesystem::path(executable.data(), executable.data() + length))) + "}";
+  fixture.shared->magic = 0x45584543u;
+  fixture.shared->version = 2;
+  fixture.shared->request_bytes = static_cast<uint32_t>(request.size());
+  fixture.shared->guest_pid = guest_pid;
+  fixture.shared->parent_host_pid = GetCurrentProcessId();
+  fixture.shared->catalogue_bytes = 1;
+  fixture.shared->catalogue[0] = 0xa5;
+  std::memcpy(fixture.shared->request, request.data(), request.size());
+  std::wstring command = L"\"" + std::wstring(executable.data(), length) +
+      L"\" --guest-exec-auth-catalogue-reject-child " + endpoint;
+  STARTUPINFOW startup {};
+  startup.cb = sizeof(startup);
+  Check(CreateProcessW(executable.data(), command.data(), nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup, &fixture.process) != FALSE,
+        "create malformed catalogue handoff consumer");
+  fixture.shared->child_host_pid = fixture.process.dwProcessId;
+  Check(AssignProcessToJobObject(fixture.job, fixture.process.hProcess) != FALSE &&
+        ResumeThread(fixture.process.hThread) != DWORD(-1),
+        "contain and resume malformed catalogue consumer");
+  Check(WaitForSingleObject(fixture.prepared, 10000) == WAIT_OBJECT_0 &&
+        WaitForSingleObject(fixture.process.hProcess, 0) == WAIT_TIMEOUT,
+        "malformed catalogue is rejected while the child retains its mapping");
+  Check(fixture.shared->error == Libs::LibKernel::KERNEL_ERROR_ENOEXEC &&
+        fixture.shared->state == 2 && fixture.shared->request_bytes == 0 &&
+        fixture.shared->catalogue_bytes == 0 &&
+        std::all_of(fixture.shared->request, fixture.shared->request + request.size(),
+                    [](char byte) { return byte == 0; }) &&
+        std::all_of(std::begin(fixture.shared->catalogue),
+                    std::end(fixture.shared->catalogue), [](uint8_t byte) { return byte == 0; }),
+        "malformed catalogue rejection wipes the retained request and catalogue");
+  Check(SetEvent(fixture.release) != FALSE, "release the malformed catalogue child");
+  DWORD exit_code = 0xffffffffu;
+  Check(WaitForSingleObject(fixture.process.hProcess, 10000) == WAIT_OBJECT_0 &&
+        GetExitCodeProcess(fixture.process.hProcess, &exit_code) != FALSE && exit_code == 0,
+        "malformed catalogue child exits after the live mapping check");
+  std::printf("GuestExecFatalSignalTests: malformed_catalogue rejection=pass request_wipe=pass catalogue_wipe=pass\n");
+#endif
+}
+
 void CheckGuestExecAuthInfoSlotRejection() {
 #if defined(_WIN32)
   CheckGuestExecAuthInfoSlotAcceptance();
+  CheckGuestExecMalformedCatalogueRejection();
   GuestExecFatalSignalFixture fixture;
   LARGE_INTEGER counter {};
   Check(QueryPerformanceCounter(&counter) != FALSE,

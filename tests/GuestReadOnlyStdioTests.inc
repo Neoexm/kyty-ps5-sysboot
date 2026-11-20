@@ -10,11 +10,13 @@ void CheckGuestReadOnlyStdio(const std::filesystem::path& root) {
   using Open = void* (KYTY_SYSV_ABI *)(const char*, const char*);
   using Close = int (KYTY_SYSV_ABI *)(void*);
   using Read = size_t (KYTY_SYSV_ABI *)(void*, size_t, size_t, void*);
+  using Gets = char* (KYTY_SYSV_ABI *)(char*, int, void*);
   using Seek = int (KYTY_SYSV_ABI *)(void*, int64_t, int);
   using Tell = int64_t (KYTY_SYSV_ABI *)(void*);
   const auto open = reinterpret_cast<Open>(find("xeYO4u7uyJ0"));
   const auto close = reinterpret_cast<Close>(find("uodLYyUip20"));
   const auto read = reinterpret_cast<Read>(find("lbB+UlZqVG0"));
+  const auto gets = reinterpret_cast<Gets>(find("KdP-nULpuGw"));
   const auto seek = reinterpret_cast<Seek>(find("rQFVBXp-Cxg"));
   const auto tell = reinterpret_cast<Tell>(find("Qazy8LmXTvw"));
   const auto backing = root / "read_only_stdio";
@@ -24,6 +26,11 @@ void CheckGuestReadOnlyStdio(const std::filesystem::path& root) {
   Check(fixture.Create(backing / "bytes.bin"), "create backed binary fixture");
   fixture.Write(payload.data(), payload.size());
   fixture.Close();
+  constexpr char lines[] = "alpha\nbeta\r\nomega";
+  Common::File text_fixture;
+  Check(text_fixture.Create(backing / "lines.txt"), "create backed text fixture");
+  text_fixture.Write(lines, sizeof(lines) - 1);
+  text_fixture.Close();
   FileSystem::MountReadOnly(backing, "/stdio_read_test");
   const auto address = Memory::AllocateProgramMemory(0, 0x4000,
       Common::VirtualMemory::Mode::ReadWrite, "stdio_read_test");
@@ -32,6 +39,29 @@ void CheckGuestReadOnlyStdio(const std::filesystem::path& root) {
   char path[] = "/stdio_read_test/bytes.bin";
   char binary_mode[] = "rb";
   auto* error = Libs::Posix::GetErrorAddr();
+  void* line_stream = open("/stdio_read_test/lines.txt", "r");
+  Check(line_stream != nullptr, "open mounted text file for fgets");
+  Check(gets(reinterpret_cast<char*>(bytes), 4, line_stream) == reinterpret_cast<char*>(bytes) &&
+        std::strcmp(reinterpret_cast<char*>(bytes), "alp") == 0 && tell(line_stream) == 3,
+        "fgets respects buffer size and advances guest descriptor");
+  Check(gets(reinterpret_cast<char*>(bytes), 16, line_stream) == reinterpret_cast<char*>(bytes) &&
+        std::strcmp(reinterpret_cast<char*>(bytes), "ha\n") == 0 && tell(line_stream) == 6,
+        "fgets stops at newline and preserves unread bytes");
+  Check(gets(reinterpret_cast<char*>(bytes), 16, line_stream) == reinterpret_cast<char*>(bytes) &&
+        std::strcmp(reinterpret_cast<char*>(bytes), "beta\r\n") == 0 && tell(line_stream) == 12,
+        "fgets preserves CRLF from original file");
+  Check(gets(reinterpret_cast<char*>(bytes), 16, line_stream) == reinterpret_cast<char*>(bytes) &&
+        std::strcmp(reinterpret_cast<char*>(bytes), "omega") == 0 &&
+        gets(reinterpret_cast<char*>(bytes), 16, line_stream) == nullptr && tell(line_stream) == 17,
+        "fgets returns final unterminated line then EOF");
+  Check(seek(line_stream, 0, 0) == 0 && read(bytes, 1, 6, line_stream) == 6 &&
+        std::memcmp(bytes, "alpha\n", 6) == 0,
+        "fgets and fread share the same guest cursor");
+  *error = 0;
+  Check(gets(reinterpret_cast<char*>(1), 16, line_stream) == nullptr &&
+        *error == Libs::Posix::POSIX_EFAULT && tell(line_stream) == 6 &&
+        close(line_stream) == 0,
+        "fgets rejects invalid guest buffers before consuming file data");
   *error = Libs::Posix::POSIX_EIO;
   void* stream = open(path, binary_mode);
   Check(stream != nullptr && *error == Libs::Posix::POSIX_EIO,

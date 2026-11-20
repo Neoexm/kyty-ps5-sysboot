@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PROFILE = ROOT / "scripts/boot_profile.json"
 CONFIG = ROOT / "kyty.ini"
 CACHE = ROOT / "runtime/cache/immutable_metadata"
+DEFAULT_STATE_DIR = Path(r"D:\PS5_Backups\13.60_2026-11-20\kyty_console_state\default")
 PSNOW_SELF_SHA256 = "a6826c981e0227552f1cd08c59dd2e9995b69e9b10b568138a08dcc28a509a18"
 PSNOW_OBSERVATION_SHA256 = "3a899ca1e3334410138c2986a9085cc032ca202bbc78cf47a1edf82e1ab9f65c"
 ERROR_OBJECT_LIMIT = 4 * 1024 * 1024
@@ -679,17 +680,34 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def environment(boot, run_dir, scope, build_id, readbacks, show_services, display_window):
+def console_state_dir(boot, requested, run_dir):
+    if requested is None:
+        requested = DEFAULT_STATE_DIR if Path("D:/").is_dir() else ROOT / "runtime/console_state/default"
+    state_dir = requested.resolve()
+    firmware = boot.firmware_root
+    if (state_dir == firmware or firmware in state_dir.parents or state_dir in firmware.parents or
+            state_dir == run_dir or run_dir in state_dir.parents or state_dir in run_dir.parents or
+            state_dir == ROOT):
+        raise ValueError("console state directory overlaps firmware, project root, or boot evidence")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
+
+
+def environment(boot, run_dir, state_dir, scope, build_id, readbacks, show_services, display_window):
     env = dict(boot.environment)
     env["KYTY_DIAGNOSTIC_IPMI_SHARED_SCOPE"] = scope
     env["KYTY_DIAGNOSTIC_PSM_LOCAL_UNIX_SCOPE"] = scope
-    env["KYTY_PS5_ICCNVS4_OVERLAY"] = str(run_dir / "mini_a53_nvram.kytycow")
-    env["KYTY_DIAGNOSTIC_PASSTHROUGH_UPPER"] = str(run_dir / "upper")
+    env["KYTY_PS5_ICCNVS4_OVERLAY"] = str(state_dir / "mini_a53_nvram.kytycow")
+    env["KYTY_DIAGNOSTIC_PASSTHROUGH_UPPER"] = str(state_dir / "upper")
+    env["KYTY_DIAGNOSTIC_REGMGR_PERSIST_PATH"] = str(state_dir / "regmgr_state.bin")
     env["KYTY_DIAGNOSTIC_UNHANDLED_HOST_PROVENANCE_PREFIX"] = str(run_dir / "fault_provenance")
     env["KYTY_DIAGNOSTIC_HOST_DISPLAY_WINDOW"] = hex(display_window)
     env["KYTY_PS5_STARTUP_CACHE_DIR"] = str(CACHE)
     env["KYTY_PS5_STARTUP_CACHE_BUILD_ID"] = build_id
-    env["KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE"] = str(boot.token_file)
+    if boot.token_file is not None:
+        env["KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE"] = str(boot.token_file)
+    else:
+        env.pop("KYTY_PS5_ENVELOPE_PROVIDER_TOKEN_FILE", None)
     env["KYTY_PS5_ENVELOPE_PROVIDER_PORT"] = boot.config.get("provider", "port").strip()
     env["KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS"] = boot.config.get("provider", "timeout_ms").strip()
     if readbacks:
@@ -829,13 +847,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--show-services", action="store_true")
     parser.add_argument("--readbacks", action="store_true")
+    parser.add_argument("--state-dir", type=Path)
     args = parser.parse_args()
     boot = Boot()
-    if boot.token_file is None:
+    offline_replay = boot.config.getboolean("provider", "offline_replay", fallback=False)
+    if offline_replay:
+        key = boot.environment.get("KYTY_PS5_OFFLINE_REPLAY_HMAC_KEY_HEX", "")
+        if (boot.token_file is not None or len(key) != 64 or
+                any(character not in "0123456789abcdefABCDEF" for character in key) or
+                not any(character != "0" for character in key)):
+            raise RuntimeError("offline replay requires an in-memory key and no provider token file")
+    elif boot.token_file is None:
         raise RuntimeError(f"[provider] token_file is not set in {CONFIG}")
     readbacks = args.readbacks or boot.config.getboolean("boot", "readbacks")
     show_services = args.show_services or boot.config.getboolean("boot", "show_services")
-    required = [boot.exe, boot.exe.parent / "libwinpthread-1.dll", boot.token_file, *boot.firmware_paths]
+    required = [boot.exe, boot.exe.parent / "libwinpthread-1.dll", *boot.firmware_paths]
+    if boot.token_file is not None:
+        required.append(boot.token_file)
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise FileNotFoundError("missing Kyty boot input: " + ", ".join(missing))
@@ -847,6 +875,7 @@ def main():
     stamp = time.strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(2)
     scope = "boot_" + secrets.token_hex(6)
     run_dir = boot.runs / stamp
+    state_dir = console_state_dir(boot, args.state_dir, run_dir)
     run_dir.mkdir(parents=True)
     log = run_dir / "kyty.log"
     binary_sha256 = sha256(boot.exe)
@@ -854,7 +883,8 @@ def main():
     display = DisplayBroker(reporter.begin_expected_shutdown)
     display.start()
     try:
-        env = environment(boot, run_dir, scope, binary_sha256, readbacks, show_services, display.hwnd)
+        env = environment(boot, run_dir, state_dir, scope, binary_sha256, readbacks, show_services,
+                          display.hwnd)
         manifest = {
             "created_host_unix": int(time.time()),
             "binary": str(boot.exe),
@@ -863,6 +893,7 @@ def main():
             "firmware_root": str(boot.firmware_root),
             "boot_profile_sha256": sha256(PROFILE),
             "scope": scope,
+            "console_state_dir": str(state_dir),
             "log": str(log),
             "host_console_log": str(run_dir / "host_console.log"),
             "error_report_log": str(run_dir / "error_report.log"),
@@ -884,6 +915,8 @@ def main():
             "immutable_metadata_cache": str(CACHE),
             "envelope_provider_timeout_ms": int(env["KYTY_PS5_ENVELOPE_PROVIDER_TIMEOUT_MS"]),
         }
+        if offline_replay:
+            manifest["offline_replay"] = True
         (run_dir / "boot.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         print(f"Boot directory: {run_dir}")
         print(f"Binary SHA-256: {manifest['binary_sha256']}")

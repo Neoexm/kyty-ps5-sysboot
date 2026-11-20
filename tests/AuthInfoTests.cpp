@@ -664,8 +664,82 @@ void CheckObservations() {
   std::filesystem::remove(path);
 }
 
+void CheckCaptureCatalogue() {
+  const auto first = MakeFixture(19, 0x3800000000000034ull);
+  const auto second = MakeFixture(47, 0x4800000010000011ull);
+  const auto base = std::filesystem::absolute(std::filesystem::temp_directory_path() /
+      ("kyty_auth_catalogue_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
+  std::filesystem::create_directory(base);
+  const auto first_path = base / "first.authinfo";
+  const auto second_path = base / "second.authinfo";
+  WriteFile(first_path, first.envelope.data(), first.envelope.size());
+  WriteFile(second_path, second.envelope.data(), second.envelope.size());
+  CaptureCatalogue root;
+  std::string reason;
+  Check(root.Add(first.self_sha256, first.envelope_sha256, first_path, &reason) &&
+        root.Add(second.self_sha256, second.envelope_sha256, second_path, &reason) &&
+        root.Size() == 2,
+        "catalogue accepts two pinned source images");
+  Check(!root.Add(first.self_sha256, first.envelope_sha256, first_path, &reason) &&
+        !root.Add(Changed(first.self_sha256), first.envelope_sha256,
+                  "relative.authinfo", &reason),
+        "catalogue rejects duplicates and relative source paths");
+  std::vector<uint8_t> first_wire(kCaptureCatalogueCapacity);
+  size_t first_size = 0;
+  Check(root.Encode(first_wire.data(), first_wire.size(), &first_size, &reason) &&
+        first_size > 0,
+        "encode the root catalogue");
+  CaptureCatalogue child;
+  Check(child.Decode(first_wire.data(), first_size, &reason) && child.Size() == 2,
+        "decode the child catalogue");
+  std::vector<uint8_t> second_wire(kCaptureCatalogueCapacity);
+  size_t second_size = 0;
+  Check(child.Encode(second_wire.data(), second_wire.size(), &second_size, &reason),
+        "relay the child catalogue to a grandchild");
+  CaptureCatalogue grandchild;
+  Check(grandchild.Decode(second_wire.data(), second_size, &reason) &&
+        grandchild.Size() == 2,
+        "decode the grandchild catalogue");
+  ImageIdentity target {};
+  target.authority_id = second.authority_id;
+  target.self_sha256 = second.self_sha256;
+  target.elf_sha256 = second.elf_sha256;
+  Capture loaded;
+  Check(grandchild.Load(target, &loaded, &reason) == CaptureLoadResult::Verified &&
+        loaded.record == second.record &&
+        loaded.envelope_sha256 == second.envelope_sha256,
+        "grandchild selects the other image's exact full capture");
+  auto changed_target = target;
+  changed_target.self_sha256 = Changed(target.self_sha256);
+  Check(grandchild.Load(changed_target, &loaded, &reason) == CaptureLoadResult::Absent &&
+        loaded.version == 0,
+        "unknown SELF stays absent");
+  changed_target = target;
+  changed_target.elf_sha256 = Changed(target.elf_sha256);
+  Check(grandchild.Load(changed_target, &loaded, &reason) == CaptureLoadResult::Rejected &&
+        loaded.version == 0,
+        "ELF mismatch fails closed");
+  changed_target = target;
+  ++changed_target.authority_id;
+  Check(grandchild.Load(changed_target, &loaded, &reason) == CaptureLoadResult::Rejected &&
+        loaded.version == 0,
+        "authority mismatch fails closed");
+  auto damaged = second.envelope;
+  damaged.back() ^= 1;
+  WriteFile(second_path, damaged.data(), damaged.size());
+  Check(grandchild.Load(target, &loaded, &reason) == CaptureLoadResult::Rejected &&
+        loaded.version == 0,
+        "changed envelope fails its external integrity pin");
+  Check(!grandchild.Decode(second_wire.data(), second_size - 1, &reason) &&
+        grandchild.Size() == 0,
+        "truncated handoff catalogue is cleared");
+  std::filesystem::remove_all(base);
+  std::printf("AuthInfoTests: capture_catalogue generations=2 exact=pass mismatch=reject wire=verified\n");
+}
+
 int main(int argc, char **argv) {
   CheckObservations();
+  CheckCaptureCatalogue();
   static_assert(sizeof(Capture) == 0x220);
   static_assert(!std::is_trivially_destructible_v<Capture>);
   static_assert(std::is_copy_constructible_v<Capture>);

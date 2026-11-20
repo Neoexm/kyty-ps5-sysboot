@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -36,11 +37,12 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
-	auto* bytes = static_cast<const uint8_t*>(source);
+	auto* bytes   = static_cast<const uint8_t*>(source);
+	auto& staging = GetUtilityBuffer(MemoryUsage::Upload);
 	while (size != 0) {
-		const auto chunk  = std::min(size, m_staging_buffer.Size());
-		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
-		buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
+		const auto chunk  = std::min(size, staging.Size());
+		const auto offset = staging.Copy(bytes, chunk, 4);
+		buffer.CopyFrom(m_scheduler.Current(), staging, offset, buffer.Offset(address),
 		                chunk, vk::AccessFlagBits::eHostWrite);
 		bytes += chunk;
 		address += chunk;
@@ -82,8 +84,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		for (uint64_t i = 0; i < size_pages; ++i) {
 			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
 		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		if (m_bda_pagetable_buffer) {
+			WriteDataBuffer(*m_bda_pagetable_buffer, table_offset,
+			                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		}
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -91,8 +95,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(buffer.Size() > m_total_used_memory);
 		m_total_used_memory -= buffer.Size();
 		m_lru_cache.Free(buffer.lru_id);
-		m_bda_pagetable_buffer.Fill(table_offset,
-		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		if (m_bda_pagetable_buffer) {
+			m_bda_pagetable_buffer->Fill(table_offset,
+			                             size_pages * sizeof(vk::DeviceAddress), 0);
+		}
 		buffer.is_deleted = true;
 	}
 }
@@ -184,6 +190,43 @@ uint64_t BufferCache::CrossProcessGeneration(uint64_t vaddr, uint64_t size) cons
 	return generation;
 }
 
+struct CrossProcessHashJob {
+	uint64_t page = 0;
+	uint64_t hash = 0;
+	bool     read = false;
+};
+
+// Hashes straight from the backing view and takes the address-space locks once per run of pages instead of copying each page out.
+static void HashCrossProcessPages(std::vector<CrossProcessHashJob>& jobs) {
+	constexpr size_t chunk_pages = 64;
+	for (size_t i = 0; i < jobs.size();) {
+		size_t n = 1;
+		while (n < chunk_pages && i + n < jobs.size() &&
+		       jobs[i + n].page == jobs[i].page + n * TRACKER_PAGE_SIZE) {
+			n++;
+		}
+		auto* chunk = jobs.data() + i;
+		i += n;
+		if (Libs::LibKernel::Memory::TryVisitSparseBackingPages(
+		        chunk->page, n, TRACKER_PAGE_SIZE,
+		        [](void* context, uint64_t index, const uint8_t* bytes) {
+			        auto& job = static_cast<CrossProcessHashJob*>(context)[index];
+			        job.hash  = XXH3_64bits(bytes, TRACKER_PAGE_SIZE);
+			        job.read  = true;
+		        },
+		        chunk)) {
+			continue;
+		}
+		std::array<uint8_t, TRACKER_PAGE_SIZE> bytes {};
+		for (size_t k = 0; k < n; k++) {
+			if (Libs::LibKernel::Memory::TryReadSparseBacking(chunk[k].page, bytes.data(), bytes.size())) {
+				chunk[k].hash = XXH3_64bits(bytes.data(), bytes.size());
+				chunk[k].read = true;
+			}
+		}
+	}
+}
+
 BufferCache::CrossProcessValidation
 BufferCache::ValidateCrossProcessMemory(uint64_t vaddr, uint64_t size, bool force) {
 	static std::atomic_uint64_t changes       = 0;
@@ -198,6 +241,13 @@ BufferCache::ValidateCrossProcessMemory(uint64_t vaddr, uint64_t size, bool forc
 	const bool audit          = std::getenv("KYTY_DIAGNOSTIC_SHARED_REFRESH") != nullptr;
 	result.intersects         = true;
 	uint64_t        last_page = UINT64_MAX;
+	static const bool timing  = std::getenv("KYTY_DIAGNOSTIC_GPU_SLICE_TIMING") != nullptr;
+	const auto      t_begin   = timing ? Common::Timer::QueryPerformanceCounter() : 0;
+	uint64_t        visited   = 0;
+	uint64_t        gpu_pages = 0;
+	uint64_t        changed   = 0;
+	std::vector<CrossProcessHashJob> jobs;
+	std::vector<std::pair<CrossProcessPage*, bool>> job_states;
 	std::lock_guard lock(m_cross_process_page_mutex);
 	for (const auto& range: ranges) {
 		const auto begin = Common::AlignDown(range.address, TRACKER_PAGE_SIZE);
@@ -207,11 +257,13 @@ BufferCache::ValidateCrossProcessMemory(uint64_t vaddr, uint64_t size, bool forc
 				continue;
 			}
 			last_page   = page;
+			visited++;
 			auto& state = m_cross_process_pages[page];
 			if (state.valid) {
 				result.generation = std::max(result.generation, state.generation);
 			}
 			const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE);
+			gpu_pages += gpu_modified ? 1 : 0;
 			if (state.pending_cpu_refresh && !gpu_modified) {
 				state.pending_cpu_refresh = false;
 				m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
@@ -226,55 +278,74 @@ BufferCache::ValidateCrossProcessMemory(uint64_t vaddr, uint64_t size, bool forc
 				result.gpu_conflict |= gpu_modified;
 				continue;
 			}
-			std::array<uint8_t, TRACKER_PAGE_SIZE> bytes {};
-			if (!Libs::LibKernel::Memory::TryReadSparseBacking(page, bytes.data(), bytes.size())) {
-				bool registered = false;
-				{
-					std::shared_lock range_lock(m_cross_process_mutex);
-					registered = m_cross_process_ranges.Intersects(page, TRACKER_PAGE_SIZE);
-				}
-				if (!registered) {
-					m_cross_process_pages.erase(page);
-					continue;
-				}
-				const auto ordinal = read_failures.fetch_add(1) + 1;
-				if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
-					LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_READ_FAILED addr=0x%016" PRIx64
-					     " epoch=%" PRIu64 " ordinal=%" PRIu64 "\n",
-					     page, m_cross_process_epoch, ordinal);
-				}
+			jobs.push_back({page});
+			job_states.emplace_back(&state, gpu_modified);
+		}
+	}
+	HashCrossProcessPages(jobs);
+	for (size_t i = 0; i < jobs.size(); i++) {
+		const auto page               = jobs[i].page;
+		auto& state                   = *job_states[i].first;
+		const bool gpu_modified       = job_states[i].second;
+		if (!jobs[i].read) {
+			bool registered = false;
+			{
+				std::shared_lock range_lock(m_cross_process_mutex);
+				registered = m_cross_process_ranges.Intersects(page, TRACKER_PAGE_SIZE);
+			}
+			if (!registered) {
+				m_cross_process_pages.erase(page);
 				continue;
 			}
-			const auto hash       = XXH3_64bits(bytes.data(), bytes.size());
-			state.validated_epoch = m_cross_process_epoch;
-			if (state.valid && state.hash == hash) {
-				result.gpu_conflict |= gpu_modified;
-				continue;
+			const auto ordinal = read_failures.fetch_add(1) + 1;
+			if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
+				LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_READ_FAILED addr=0x%016" PRIx64
+				     " epoch=%" PRIu64 " ordinal=%" PRIu64 "\n",
+				     page, m_cross_process_epoch, ordinal);
 			}
-			const bool first  = !state.valid;
-			state.hash        = hash;
-			state.valid       = true;
-			state.generation  = ++m_cross_process_generation;
-			result.generation = std::max(result.generation, state.generation);
-			if (gpu_modified) {
-				state.pending_cpu_refresh = true;
-				result.gpu_conflict       = true;
-				const auto ordinal        = conflicts.fetch_add(1) + 1;
-				if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
-					LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_GPU_CONFLICT addr=0x%016" PRIx64
-					     " generation=%" PRIu64 " ordinal=%" PRIu64 "\n",
-					     page, state.generation, ordinal);
-				}
-				continue;
+			continue;
+		}
+		const auto hash       = jobs[i].hash;
+		state.validated_epoch = m_cross_process_epoch;
+		if (state.valid && state.hash == hash) {
+			result.gpu_conflict |= gpu_modified;
+			continue;
+		}
+		const bool first  = !state.valid;
+		changed++;
+		state.hash        = hash;
+		state.valid       = true;
+		state.generation  = ++m_cross_process_generation;
+		result.generation = std::max(result.generation, state.generation);
+		if (gpu_modified) {
+			state.pending_cpu_refresh = true;
+			result.gpu_conflict       = true;
+			const auto ordinal        = conflicts.fetch_add(1) + 1;
+			if (ordinal <= 32 || (ordinal & (ordinal - 1)) == 0) {
+				LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_GPU_CONFLICT addr=0x%016" PRIx64
+				     " generation=%" PRIu64 " ordinal=%" PRIu64 "\n",
+				     page, state.generation, ordinal);
 			}
-			state.pending_cpu_refresh = false;
-			m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
-			const auto ordinal = changes.fetch_add(1) + 1;
-			if (audit && (ordinal <= 128 || (ordinal & (ordinal - 1)) == 0)) {
-				LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_CHANGED addr=0x%016" PRIx64
-				     " first=%d generation=%" PRIu64 " epoch=%" PRIu64 " ordinal=%" PRIu64 "\n",
-				     page, first ? 1 : 0, state.generation, m_cross_process_epoch, ordinal);
-			}
+			continue;
+		}
+		state.pending_cpu_refresh = false;
+		m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
+		const auto ordinal = changes.fetch_add(1) + 1;
+		if (audit && (ordinal <= 128 || (ordinal & (ordinal - 1)) == 0)) {
+			LOGF("FIRST_FRAME_AUDIT SHARED_REFRESH_CHANGED addr=0x%016" PRIx64
+			     " first=%d generation=%" PRIu64 " epoch=%" PRIu64 " ordinal=%" PRIu64 "\n",
+			     page, first ? 1 : 0, state.generation, m_cross_process_epoch, ordinal);
+		}
+	}
+	if (timing) {
+		static std::atomic_uint logged = 0;
+		const auto us = (Common::Timer::QueryPerformanceCounter() - t_begin) * 1000000 /
+		                Common::Timer::QueryPerformanceFrequency();
+		if (us >= 500 && logged.fetch_add(1) < 4000) {
+			LOGF("FIRST_FRAME_AUDIT GPU_SLICE_TIMING xproc_validate us=%" PRIu64 " visited=%" PRIu64
+			     " hashed=%zu changed=%" PRIu64 " gpu_pages=%" PRIu64 " force=%d addr=0x%016" PRIx64
+			     " size=0x%" PRIx64 "\n",
+			     us, visited, jobs.size(), changed, gpu_pages, force ? 1 : 0, vaddr, size);
 		}
 	}
 	return result;
@@ -338,16 +409,17 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	auto& ring            = GetUtilityBuffer(MemoryUsage::Download);
+	auto [mapped, offset] = ring.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
 		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
 		mapped = temporary->Mapped().data();
 	} else {
-		m_download_buffer.Commit();
+		ring.Commit();
 	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
+	const auto& download = temporary ? *temporary : ring;
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
@@ -379,9 +451,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
+	auto publish = [this, &ring, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		(owner ? *owner : ring).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
@@ -401,20 +473,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
-    : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
+    : m_graphics(graphics), m_scheduler(scheduler),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
       m_memory_tracker(page_manager),
-      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
-      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
-	                     "BDA Page Table Buffer");
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -682,15 +746,16 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 
-	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
+	auto& staging              = GetUtilityBuffer(MemoryUsage::Upload);
+	auto [mapped, base_offset] = staging.Map(total_size, 4);
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
 			copy.srcOffset += base_offset;
 		}
-		m_staging_buffer.Commit();
-		return m_staging_buffer.Handle();
+		staging.Commit();
+		return staging.Handle();
 	}
 
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
@@ -720,11 +785,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		auto& stream          = GetUtilityBuffer(MemoryUsage::Stream);
+		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
-			m_stream_buffer.Commit();
-			return {&m_stream_buffer, offset};
+			stream.Commit();
+			return {&stream, offset};
 		}
 	}
 
@@ -761,12 +827,13 @@ BufferCache::ImageBufferSource BufferCache::ObtainBufferForImage(uint64_t vaddr,
 		return {buffer, offset, validation.generation, validation.intersects, true};
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
+	auto& ring                   = GetUtilityBuffer(MemoryUsage::Upload);
+	auto [staging, stage_offset] = ring.Map(size, 16);
 	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset, validation.generation, validation.intersects,
+	ring.Commit();
+	return {&ring, stage_offset, validation.generation, validation.intersects,
 	        validation.gpu_conflict};
 }
 
@@ -910,8 +977,48 @@ void BufferCache::RunGarbageCollector() {
 	}
 }
 
+StreamBuffer& BufferCache::GetUtilityBuffer(MemoryUsage usage) {
+	auto& utility = m_utility_buffers[static_cast<size_t>(usage)];
+	// The present thread reaches the download ring for diagnostic readback, so creation has to be once-only.
+	std::call_once(utility.once, [&] {
+		uint64_t size = 0;
+		switch (usage) {
+			case MemoryUsage::Upload: size = 512 * MiB; break;
+			case MemoryUsage::Stream: size = 64 * MiB; break;
+			case MemoryUsage::Download: size = 64 * MiB; break;
+			case MemoryUsage::DeviceLocal: size = 128 * MiB; break;
+		}
+		EXIT_IF(size == 0);
+		utility.buffer = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, usage, size);
+	});
+	return *utility.buffer;
+}
+
+void BufferCache::EnsureBdaResources() {
+	if (m_bda_pagetable_buffer) {
+		return;
+	}
+	m_fault_manager = std::make_unique<FaultManager>(m_graphics, m_scheduler, *this);
+	m_fault_manager->GetFaultBuffer()->Fill(0, m_fault_manager->GetFaultBuffer()->Size(), 0);
+	m_bda_pagetable_buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, BDA_PAGETABLE_SIZE);
+	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer->Handle(), "BDA Page Table Buffer");
+	m_bda_pagetable_buffer->Fill(0, BDA_PAGETABLE_SIZE, 0);
+	std::vector<vk::DeviceAddress> addresses;
+	for (const auto& [vaddr, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		PageTable::PageRange pages {};
+		EXIT_IF(!PageTable::TryGetPageRange(vaddr, buffer.Size(), pages));
+		addresses.clear();
+		for (uint64_t i = 0; i < pages.last_exclusive - pages.first; ++i) {
+			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
+		}
+		WriteDataBuffer(*m_bda_pagetable_buffer, PageIndex(vaddr) * sizeof(vk::DeviceAddress),
+		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+	}
+}
+
 void BufferCache::ProcessFaultBuffer() {
-	m_fault_manager.ProcessFaultBuffer();
+	m_fault_manager->ProcessFaultBuffer();
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

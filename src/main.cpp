@@ -19,6 +19,7 @@
 #include <magic_enum.hpp>
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
+#include <timeapi.h>
 #endif
 
 using namespace Common;
@@ -508,6 +509,14 @@ static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 int wmain(int argc, wchar_t* argv[]) {
+	// Guest IPMI, semaphore and pthread waits poll with 1 ms sleeps; at the default 15.6 ms tick every round trip costs a full tick per side.
+	// Windowless exec children count as invisible, and Windows 11 drops their resolution request unless they opt out of timer throttling.
+	PROCESS_POWER_THROTTLING_STATE throttling {};
+	throttling.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+	throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+	throttling.StateMask   = 0;
+	SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+	timeBeginPeriod(1);
 	if (std::getenv("KYTY_DIAGNOSTIC_STATIC_EXEC_LOAD_ONLY") != nullptr) {
 		MEMORY_BASIC_INFORMATION info {};
 		VirtualQuery(reinterpret_cast<void*>(0x400000), &info, sizeof(info));

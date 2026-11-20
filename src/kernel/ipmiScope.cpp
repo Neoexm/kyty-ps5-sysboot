@@ -20,7 +20,7 @@ namespace Libs::LibKernel::IpmiScope {
 namespace {
 
 constexpr uint32_t kMagic   = 0x49504D49; // IPMI, versioned host-only layout
-constexpr uint32_t kVersion = 13;
+constexpr uint32_t kVersion = 14;
 // host table sizes; ShellCore alone makes well over 64 servers at init
 constexpr size_t kSlots      = 512;
 constexpr size_t kNameLength = 96;
@@ -97,6 +97,7 @@ struct SharedDirectory {
 	std::array<KernelPacket, kRequests>  packets {};
 	uint32_t                             next_packet  = 1;
 	uint32_t                             next_message = 1;
+	uint64_t                             reaped_ms    = 0;
 	std::array<KernelMessage, kMessages> messages {};
 };
 static_assert(sizeof(ServiceRecord) == 120);
@@ -195,7 +196,11 @@ bool OwnerAlive(const ServiceRecord& record) {
 uint64_t CurrentCreationTime() {
 	return ProcessCreationTime(GetCurrentProcess());
 }
-void ReapExited(SharedDirectory* dir) {
+// Every poll from every process runs under the one named mutex, and a full pass probes each owner process, so pollers share one pass per 50 ms; paths that create state or authorize a peer pass force.
+void ReapExited(SharedDirectory* dir, bool force) {
+	const uint64_t now = GetTickCount64();
+	if (!force && now - dir->reaped_ms < 50) return;
+	dir->reaped_ms = now;
 	// one probe per owner process per pass
 	struct Probe {
 		uint32_t host_pid;
@@ -283,7 +288,7 @@ bool Register(const std::string& service, uint32_t guest_pid, uint32_t* assigned
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return false;
 	auto* dir = State().entries;
-	ReapExited(dir);
+	ReapExited(dir, true);
 	for (const auto& row: dir->services) {
 		if (row.id != 0 && service == row.name) {
 			if (duplicate) *duplicate = true;
@@ -326,7 +331,7 @@ bool Lookup(const std::string& service, uint32_t* service_id, uint32_t* owner_gu
 	if (!Attach(scope)) return false;
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return false;
-	ReapExited(State().entries);
+	ReapExited(State().entries, false);
 	for (const auto& row: State().entries->services) {
 		if (row.id == 0 || service != row.name) continue;
 		*service_id      = row.id;
@@ -360,7 +365,7 @@ bool OpenClient(const std::string& service, uint32_t guest_pid, uint32_t* client
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return false;
 	auto* dir = State().entries;
-	ReapExited(dir);
+	ReapExited(dir, true);
 	uint32_t matching = 0;
 	for (const auto& service_row: dir->services) {
 		if (service_row.id && service == service_row.name) {
@@ -426,7 +431,7 @@ ClientStatus QueryClient(uint32_t client_id, uint32_t* server_id, uint32_t* owne
 	const auto birth = CurrentCreationTime();
 	if (!birth) return ClientStatus::Unavailable;
 	auto* dir = State().entries;
-	ReapExited(dir);
+	ReapExited(dir, false);
 	for (const auto& client: dir->clients) {
 		if (client.id != client_id || client.host_pid != GetCurrentProcessId()) continue;
 		if (!client.host_creation_time) return ClientStatus::Unavailable;
@@ -460,7 +465,7 @@ bool InspectPeerClient(uint32_t server_id, uint32_t client_id, uint32_t* guest_p
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return false;
 	auto* dir = State().entries;
-	if (reap_exited) ReapExited(dir);
+	if (reap_exited) ReapExited(dir, true);
 	bool owns_server = false;
 	for (const auto& server: dir->services) {
 		if (server.id == server_id && server.host_pid == GetCurrentProcessId() &&
@@ -503,7 +508,7 @@ bool Unregister(uint32_t server_id) {
 				if (client.id && client.service_id == server_id) clients.push_back(client.id);
 			}
 			server = {};
-			ReapExited(State().entries);
+			ReapExited(State().entries, true);
 			for (const auto client: clients)
 				SignalKernelWaiter(scope, 'e', client);
 			return true;
@@ -561,7 +566,7 @@ bool QueueRequest(uint32_t client_id, const uint8_t* bytes, size_t length, uint3
 		NamedLock lock(State().mutex);
 		if (!lock.acquired || !HeaderReady(State().entries)) return false;
 		auto* dir = State().entries;
-		ReapExited(dir);
+		ReapExited(dir, true);
 		for (const auto& client: dir->clients) {
 			if (client.id == client_id && client.host_pid == GetCurrentProcessId() &&
 			    client.host_creation_time == CurrentCreationTime()) {
@@ -724,7 +729,7 @@ bool QueueServerEvent(uint32_t server_id, uint32_t type, uint32_t* request_id, b
 		NamedLock lock(State().mutex);
 		if (!lock.acquired || !HeaderReady(State().entries)) return false;
 		auto* dir = State().entries;
-		ReapExited(dir);
+		ReapExited(dir, true);
 		bool owns_server = false;
 		for (const auto& server: dir->services) {
 			if (server.id == server_id && server.host_pid == GetCurrentProcessId() &&
@@ -773,7 +778,7 @@ bool TryReceive(uint32_t server_id, uint32_t* request_id, uint32_t* client_id,
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return false;
 	auto* dir = State().entries;
-	ReapExited(dir);
+	ReapExited(dir, false);
 	bool owns_server = false;
 	for (const auto& server: dir->services) {
 		if (server.id == server_id && server.host_pid == GetCurrentProcessId() &&
@@ -830,7 +835,7 @@ bool Reply(uint32_t server_id, uint32_t request_id, const uint8_t* bytes, size_t
 		NamedLock lock(State().mutex);
 		if (!lock.acquired || !HeaderReady(State().entries)) return false;
 		auto* dir = State().entries;
-		ReapExited(dir);
+		ReapExited(dir, false);
 		bool owns_server = false;
 		for (const auto& server: dir->services) {
 			if (server.id == server_id && server.host_pid == GetCurrentProcessId() &&
@@ -872,7 +877,7 @@ bool TryReadReply(uint32_t client_id, uint32_t request_id, std::vector<uint8_t>*
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return false;
 	auto* dir = State().entries;
-	ReapExited(dir);
+	ReapExited(dir, false);
 	bool owns_client = false;
 	for (const auto& client: dir->clients) {
 		if (client.id == client_id && client.host_pid == GetCurrentProcessId() &&
@@ -930,7 +935,7 @@ bool IsReceivedRequest(uint32_t server_id, uint32_t client_id, uint32_t request_
 	if (!Attach(scope)) return false;
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return false;
-	ReapExited(State().entries);
+	ReapExited(State().entries, false);
 	bool owned = false;
 	for (const auto& server: State().entries->services) {
 		if (server.id == server_id && server.host_pid == GetCurrentProcessId() &&
@@ -989,7 +994,7 @@ EventStatus PollClientEvent(uint32_t client_id, uint32_t index, uint64_t desired
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return EventStatus::Unavailable;
 	auto* dir = State().entries;
-	ReapExited(dir);
+	ReapExited(dir, false);
 	for (auto& client: dir->clients) {
 		if (client.id != client_id || client.host_pid != GetCurrentProcessId() ||
 		    client.host_creation_time != CurrentCreationTime())
@@ -1029,7 +1034,7 @@ EventStatus SetClientEvent(uint32_t server_id, uint32_t client_id, uint32_t inde
 		NamedLock lock(State().mutex);
 		if (!lock.acquired || !HeaderReady(State().entries)) return EventStatus::Unavailable;
 		auto* dir = State().entries;
-		ReapExited(dir);
+		ReapExited(dir, false);
 		const auto server = std::find_if(
 		    dir->services.begin(), dir->services.end(), [server_id](const ServiceRecord& row) {
 			    return row.id == server_id && row.host_pid == GetCurrentProcessId() &&
@@ -1068,7 +1073,7 @@ EventStatus ResetClientEvents(uint32_t client_id, uint32_t event_count, uint32_t
 		NamedLock lock(State().mutex);
 		if (!lock.acquired || !HeaderReady(State().entries)) return EventStatus::Unavailable;
 		auto* dir = State().entries;
-		ReapExited(dir);
+		ReapExited(dir, false);
 		for (auto& client: dir->clients) {
 			if (client.id != client_id || client.host_pid != GetCurrentProcessId() ||
 			    client.host_creation_time != CurrentCreationTime())
@@ -1100,7 +1105,7 @@ EventStatus CancelClientEvents(uint32_t client_id) {
 		NamedLock lock(State().mutex);
 		if (!lock.acquired || !HeaderReady(State().entries)) return EventStatus::Unavailable;
 		auto* dir = State().entries;
-		ReapExited(dir);
+		ReapExited(dir, false);
 		for (auto& client: dir->clients) {
 			if (client.id != client_id || client.host_pid != GetCurrentProcessId() ||
 			    client.host_creation_time != CurrentCreationTime())
@@ -1131,7 +1136,7 @@ MessageStatus QueueUserMessage(uint32_t server_id, uint32_t client_id, uint32_t 
 		NamedLock lock(State().mutex);
 		if (!lock.acquired || !HeaderReady(State().entries)) return MessageStatus::Unavailable;
 		auto* dir = State().entries;
-		ReapExited(dir);
+		ReapExited(dir, false);
 		const auto server = std::find_if(
 		    dir->services.begin(), dir->services.end(), [server_id](const ServiceRecord& row) {
 			    return row.id == server_id && row.host_pid == GetCurrentProcessId() &&
@@ -1197,7 +1202,7 @@ FetchStatus ReadUserMessage(uint32_t client_id, uint32_t index, size_t capacity,
 	NamedLock lock(State().mutex);
 	if (!lock.acquired || !HeaderReady(State().entries)) return FetchStatus::Unavailable;
 	auto* dir = State().entries;
-	ReapExited(dir);
+	ReapExited(dir, false);
 	bool owns_client = false;
 	for (const auto& client: dir->clients) {
 		if (client.id == client_id && client.host_pid == GetCurrentProcessId() &&

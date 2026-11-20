@@ -26,6 +26,7 @@ namespace Libs::LibKernel::EventQueue {
 LIB_NAME("libkernel", "libkernel");
 
 constexpr uint16_t EV_ADD     = 0x01;
+constexpr uint16_t EV_ENABLE  = 0x04;
 constexpr uint16_t EV_ONESHOT = 0x10;
 constexpr uint16_t EV_CLEAR   = 0x20;
 constexpr uint16_t EV_ERROR   = 0x4000;
@@ -539,7 +540,8 @@ int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t f
 }
 
 int KernelAddNativeNotificationEvent(KernelEqueue eq, const KernelEvent& original) {
-	if (original.filter != KERNEL_EVFILT_NOTIFY || original.flags != EV_ADD ||
+	if (original.filter != KERNEL_EVFILT_NOTIFY ||
+	    (original.flags != EV_ADD && original.flags != (EV_ADD | EV_ENABLE)) ||
 	    original.fflags != 0 || original.data < 0 || original.data > 255)
 		return KERNEL_ERROR_ENOSYS;
 	KernelEqueueEvent event {};

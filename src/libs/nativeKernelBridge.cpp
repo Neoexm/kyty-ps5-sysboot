@@ -4784,7 +4784,11 @@ Reply NativeKeventChanges(const SyscallRequest& request) {
 		bool        modeled = false;
 		if (change.filter == KERNEL_EVFILT_NOTIFY) {
 			modeled =
-			    change.flags == 1 && change.fflags == 0 && change.data >= 0 && change.data <= 255;
+			    (change.flags == 1 || change.flags == 0x5) && change.fflags == 0 &&
+			    change.data >= 0 && change.data <= 255;
+		} else if (change.filter == KERNEL_EVFILT_TIMER) {
+			modeled = change.ident <= INT32_MAX && change.flags == 0x5 && change.fflags == 0 &&
+			          change.data > 0 && change.data <= UINT32_MAX / 1000;
 		} else if (change.filter == KERNEL_EVFILT_USER) {
 			modeled = change.ident <= INT32_MAX && change.flags == 0x21 && change.fflags == 0;
 		} else if (change.filter == KERNEL_EVFILT_READ && change.flags == 1 && change.fflags == 0 &&
@@ -4814,10 +4818,12 @@ Reply NativeKeventChanges(const SyscallRequest& request) {
 		     change.fflags, change.data, reinterpret_cast<uintptr_t>(change.udata));
 		if (change.filter == KERNEL_EVFILT_NOTIFY) {
 			rc = KernelAddNativeNotificationEvent(queue, change);
+		} else if (change.filter == KERNEL_EVFILT_TIMER) {
+			rc = KernelAddTimerEvent(queue, static_cast<int>(change.ident),
+			                         static_cast<LibKernel::KernelUseconds>(change.data * 1000),
+			                         change.udata);
 		} else if (change.filter == KERNEL_EVFILT_USER) {
 			rc = KernelAddOriginalNativeUserEvent(queue, change);
-		} else if (LibKernel::FileSystem::GetDescriptorFlags(static_cast<int>(change.ident)) < 0) {
-			rc = LibKernel::KERNEL_ERROR_EBADF;
 		} else {
 			rc = KernelAddReadEvent(queue, static_cast<int>(change.ident), 0, change.udata);
 		}
@@ -4995,6 +5001,7 @@ Reply SysAvNativeKevent(const SyscallRequest& request) {
 			return {-1, Libs::Posix::POSIX_EFAULT};
 		}
 		if (first.filter == LibKernel::EventQueue::KERNEL_EVFILT_READ ||
+		    first.filter == LibKernel::EventQueue::KERNEL_EVFILT_TIMER ||
 		    first.filter == LibKernel::EventQueue::KERNEL_EVFILT_NOTIFY ||
 		    (first.filter == LibKernel::EventQueue::KERNEL_EVFILT_USER && first.flags == 0x21)) {
 			return NativeKeventChanges(request);
@@ -6106,11 +6113,16 @@ Reply DispatchSyscall(const SyscallRequest& request) {
 		case 0x262: result = AppBudgetGetPtype(request); break;
 		case 0xc: result = GuestChdir(request); break;
 		case 0x3d: result = GuestChroot(request); break;
-		case 0x16b:
-			result = std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr
-			             ? MiniSyscoreKevent(request)
-			             : SysAvNativeKevent(request);
+		case 0x16b: {
+			std::string process_name;
+			const bool mini_syscore =
+			    std::getenv("KYTY_DIAGNOSTIC_MINI_SYSCORE_NATIVE_TRAPS") != nullptr &&
+			    LibKernel::Process::FindNameByPid(LibKernel::Process::GetPid(), &process_name) &&
+			    (process_name == "mini-syscore.elf" || process_name == "SceSysCore" ||
+			     process_name == "SceSysCore.elf");
+			result = mini_syscore ? MiniSyscoreKevent(request) : SysAvNativeKevent(request);
 			break;
+		}
 		case 0x5d: result = SysAvGuestSocketSelect(request); break;
 		case 0x1d: result = SysAvGuestSocketRecvfrom(request); break;
 		case 0x85: result = SysAvGuestSocketSendto(request); break;

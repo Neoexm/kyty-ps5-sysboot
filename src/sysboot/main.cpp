@@ -51,8 +51,7 @@ constexpr char psnow_observation_sha256[] =
     "3a899ca1e3334410138c2986a9085cc032ca202bbc78cf47a1edf82e1ab9f65c";
 constexpr uint64_t error_object_limit = 4 * 1024 * 1024;
 
-const wchar_t idle_hint[] = L"File > Boot sys starts the PS5 system.\nSet the PS5 IP address under "
-                            L"File > Preferences first.";
+const wchar_t idle_hint[] = L"File > Boot sys starts the saved PS5 system.\nNo PS5 connection is needed.";
 
 struct Settings {
 	std::wstring ip;
@@ -76,6 +75,8 @@ bool              g_running              = false;
 bool              g_quit                 = false;
 bool              g_log_opened_for_error = false;
 std::wstring      g_status               = idle_hint;
+
+void ResetConsoleState(HWND owner);
 
 std::wstring Wide(const std::string& s) {
 	if (s.empty()) return {};
@@ -111,6 +112,10 @@ fs::path ExeDir() {
 	const DWORD  n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
 	buffer.resize(n);
 	return fs::path(buffer).parent_path();
+}
+
+fs::path ConsoleStateDir() {
+	return L"D:\\PS5_Backups\\13.60_2026-11-20\\kyty_console_state\\npmanager_native_replay_20261120_1455";
 }
 
 std::wstring IniPath() {
@@ -155,9 +160,6 @@ void SaveSettings(const Settings& s) {
 			CloseHandle(file);
 		}
 	}
-	WritePrivateProfileStringW(L"console", L"ip", s.ip.c_str(), ini.c_str());
-	WritePrivateProfileStringW(L"console", L"port", std::to_wstring(s.port).c_str(), ini.c_str());
-	WritePrivateProfileStringW(L"console", L"token_file", s.token_file.c_str(), ini.c_str());
 	WritePrivateProfileStringW(L"paths", L"repo", s.repo.c_str(), ini.c_str());
 	WritePrivateProfileStringW(L"boot", L"readbacks", s.readbacks ? L"yes" : L"no", ini.c_str());
 	WritePrivateProfileStringW(L"boot", L"show_services", s.show_services ? L"yes" : L"no",
@@ -576,7 +578,7 @@ struct CiLess {
 using PVirtualAlloc2 = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
 
 // Mirrors start_kyty_ps5.py main() and launch(), with the bridge's envelope provider served in-process.
-bool BootSys(const Settings& settings, std::wstring* failure) {
+[[maybe_unused]] bool BootSysLive(const Settings& settings, std::wstring* failure) {
 	auto fail = [&](std::wstring text) {
 		*failure = std::move(text);
 		return false;
@@ -1002,6 +1004,177 @@ bool BootSys(const Settings& settings, std::wstring* failure) {
 	return true;
 }
 
+bool BootSysOffline(const Settings& settings, std::wstring* failure) {
+	auto fail = [&](std::wstring text) {
+		*failure = std::move(text);
+		return false;
+	};
+	const fs::path exe_dir = ExeDir();
+	fs::path repo;
+	if (!settings.repo.empty()) {
+		repo = settings.repo;
+		if (!IsRepo(repo))
+			return fail(L"The repository folder in Preferences does not contain the firmware and boot profile:\n" +
+			            repo.wstring());
+	} else {
+		for (fs::path dir = exe_dir;; dir = dir.parent_path()) {
+			if (IsRepo(dir)) {
+				repo = dir;
+				break;
+			}
+			if (dir == dir.parent_path()) break;
+		}
+		if (repo.empty())
+			return fail(L"Could not find the project folder. Set it under File > Preferences.");
+	}
+	const fs::path profile = repo / "scripts/boot_profile_offline_completed.json";
+	const fs::path store = L"D:\\PS5_Backups\\13.60_2026-11-20\\preupdate_rnps_replay_store_20261120_derived";
+	const fs::path runner = repo / "scripts/start_kyty_ps5_tokenless_replay.py";
+	const fs::path launcher = repo / "scripts/start_kyty_ps5_offline_visual.py";
+	const fs::path emulator = exe_dir / "kyty_emulator.exe";
+	const fs::path state_dir = ConsoleStateDir();
+	for (const fs::path& path: {profile, runner, launcher, emulator, exe_dir / "libwinpthread-1.dll"}) {
+		std::error_code ec;
+		if (!fs::is_regular_file(path, ec)) return fail(L"Missing offline boot file:\n" + path.wstring());
+	}
+	if (!fs::is_directory(store)) return fail(L"Missing saved console replay data:\n" + store.wstring());
+	if (!EmulatorPids().empty()) return fail(L"Kyty is already running. Stop it before starting another boot.");
+	std::wstring python(32768, L'\0');
+	const DWORD python_length =
+	    SearchPathW(nullptr, L"python.exe", nullptr, static_cast<DWORD>(python.size()), python.data(), nullptr);
+	if (python_length == 0 || python_length >= python.size())
+		return fail(L"Python was not found. Install Python or add python.exe to PATH.");
+	python.resize(python_length);
+	const fs::path log_root = state_dir.parent_path() / "launcher_logs";
+	std::error_code ec;
+	fs::create_directories(log_root, ec);
+	if (ec) return fail(L"Could not create launcher log folder:\n" + log_root.wstring());
+	const fs::path log_path = log_root /
+	    (L"gui_" + Wide(Timestamp("%Y%m%d_%H%M%S")) + L"_" +
+	     std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()) + L".log");
+	SECURITY_ATTRIBUTES inherit {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+	HANDLE output = CreateFileW(log_path.c_str(), FILE_APPEND_DATA,
+	                            FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit, CREATE_NEW,
+	                            FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (output == INVALID_HANDLE_VALUE)
+		return fail(L"Could not create launcher log:\n" + log_path.wstring());
+	HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+	                           &inherit, OPEN_EXISTING, 0, nullptr);
+	if (input == INVALID_HANDLE_VALUE) {
+		CloseHandle(output);
+		return fail(L"Could not open NUL for offline boot.");
+	}
+	std::wstring command = L"\"" + python + L"\" \"" + runner.wstring() +
+	    L"\" --project \"" + repo.wstring() + L"\" --profile \"" + profile.wstring() +
+	    L"\" --emulator \"" + emulator.wstring() + L"\" --store \"" + store.wstring() +
+	    L"\" --proxy-port 0 --runtime-store-root \"" +
+	    (state_dir.parent_path() / "replay_runtime_stores").wstring() +
+	    L"\" --launcher-source \"" + launcher.wstring() +
+	    L"\" --timeout 100 --max-bytes 268435456 --diagnostic-virtual-usb-pad --state-dir \"" +
+	    state_dir.wstring() + L"\" --host-window-hwnd " +
+	    std::to_wstring(reinterpret_cast<uintptr_t>(g_main));
+	if (settings.readbacks) command += L" --readbacks";
+	if (settings.show_services) command += L" --show-services";
+	STARTUPINFOW startup {};
+	startup.cb = sizeof(startup);
+	startup.dwFlags = STARTF_USESTDHANDLES;
+	startup.hStdInput = input;
+	startup.hStdOutput = output;
+	startup.hStdError = output;
+	HANDLE job = CreateJobObjectW(nullptr, nullptr);
+	if (job == nullptr) {
+		CloseHandle(input);
+		CloseHandle(output);
+		return fail(L"Could not create offline boot job.");
+	}
+	JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+	limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+	if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+		CloseHandle(input);
+		CloseHandle(output);
+		CloseHandle(job);
+		return fail(L"Could not configure offline boot job.");
+	}
+	PROCESS_INFORMATION process {};
+	const bool created = CreateProcessW(python.c_str(), command.data(), nullptr, nullptr, TRUE,
+	                                   CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, repo.c_str(),
+	                                   &startup, &process) != FALSE;
+	CloseHandle(input);
+	CloseHandle(output);
+	if (!created) {
+		const DWORD error = GetLastError();
+		CloseHandle(job);
+		return fail(L"Could not start offline boot: Windows error " + std::to_wstring(error));
+	}
+	if (!AssignProcessToJobObject(job, process.hProcess)) {
+		TerminateProcess(process.hProcess, 1);
+		CloseHandle(process.hThread);
+		CloseHandle(process.hProcess);
+		CloseHandle(job);
+		return fail(L"Could not attach offline boot to its stop job.");
+	}
+	if (ResumeThread(process.hThread) != 1) {
+		TerminateJobObject(job, 1);
+		CloseHandle(process.hThread);
+		CloseHandle(process.hProcess);
+		CloseHandle(job);
+		return fail(L"Could not resume offline boot.");
+	}
+	Log(L"Offline boot started. Saved state: " + state_dir.wstring());
+	Log(L"Launcher log: " + log_path.wstring());
+	Post(wm_app_status, L"Kyty is running offline. File > Stop sys stops it.");
+	uint64_t read_offset = 0;
+	std::string partial;
+	auto poll_output = [&] {
+		std::ifstream stream(log_path, std::ios::binary);
+		if (!stream) return;
+		stream.seekg(static_cast<std::streamoff>(read_offset));
+		const std::string chunk(std::istreambuf_iterator<char>(stream), {});
+		read_offset += chunk.size();
+		partial += chunk;
+		for (size_t newline = partial.find('\n'); newline != std::string::npos;
+		     newline = partial.find('\n')) {
+			std::string line = partial.substr(0, newline);
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			if (!line.empty()) Log(Wide(line));
+			partial.erase(0, newline + 1);
+		}
+	};
+	DWORD exit_code = 0;
+	for (;;) {
+		const DWORD wait = WaitForSingleObject(process.hProcess, 500);
+		poll_output();
+		if (g_stop) {
+			TerminateJobObject(job, 0xC000013A);
+			WaitForSingleObject(process.hProcess, 5000);
+			exit_code = 130;
+			break;
+		}
+		if (wait == WAIT_OBJECT_0) {
+			if (!GetExitCodeProcess(process.hProcess, &exit_code)) exit_code = 1;
+			break;
+		}
+		if (wait != WAIT_TIMEOUT) {
+			exit_code = 1;
+			break;
+		}
+	}
+	poll_output();
+	if (!partial.empty()) Log(Wide(partial));
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	CloseHandle(job);
+	if (exit_code == 130) {
+		Log(L"Offline boot stopped.");
+		return true;
+	}
+	if (exit_code != 0)
+		return fail(L"Offline boot stopped with exit code " + std::to_wstring(exit_code) +
+		            L". See launcher log:\n" + log_path.wstring());
+	Log(L"Offline boot completed.");
+	return true;
+}
+
 void AppendLog(const std::wstring& text) {
 	std::wstring line = text;
 	for (size_t at = line.find(L'\n'); at != std::wstring::npos; at = line.find(L'\n', at + 2))
@@ -1061,37 +1234,24 @@ std::wstring DialogText(HWND dialog, int id) {
 INT_PTR CALLBACK PreferencesProc(HWND dialog, UINT message, WPARAM wparam, LPARAM /*lparam*/) {
 	switch (message) {
 		case WM_INITDIALOG:
-			SetDlgItemTextW(dialog, IDC_IP, g_settings.ip.c_str());
-			SetDlgItemInt(dialog, IDC_PORT, g_settings.port, FALSE);
-			SetDlgItemTextW(dialog, IDC_TOKEN, g_settings.token_file.c_str());
 			SetDlgItemTextW(dialog, IDC_REPO, g_settings.repo.c_str());
 			CheckDlgButton(dialog, IDC_READBACKS,
 			               g_settings.readbacks ? BST_CHECKED : BST_UNCHECKED);
 			CheckDlgButton(dialog, IDC_SHOW_SERVICES,
 			               g_settings.show_services ? BST_CHECKED : BST_UNCHECKED);
+			EnableWindow(GetDlgItem(dialog, IDC_RESET_STATE),
+			             !g_running && EmulatorPids().empty());
 			return TRUE;
 		case WM_COMMAND:
 			switch (LOWORD(wparam)) {
-				case IDC_TOKEN_BROWSE:
+				case IDC_RESET_STATE: ResetConsoleState(dialog); return TRUE;
 				case IDC_REPO_BROWSE: {
 					std::wstring path;
-					if (Browse(dialog, LOWORD(wparam) == IDC_REPO_BROWSE, &path))
-						SetDlgItemTextW(dialog,
-						                LOWORD(wparam) == IDC_REPO_BROWSE ? IDC_REPO : IDC_TOKEN,
-						                path.c_str());
+					if (Browse(dialog, true, &path))
+						SetDlgItemTextW(dialog, IDC_REPO, path.c_str());
 					return TRUE;
 				}
 				case IDOK: {
-					BOOL       valid = FALSE;
-					const UINT port  = GetDlgItemInt(dialog, IDC_PORT, &valid, FALSE);
-					if (!valid || port == 0 || port > 65535) {
-						MessageBoxW(dialog, L"The payload port must be a number from 1 to 65535.",
-						            L"Preferences", MB_ICONWARNING);
-						return TRUE;
-					}
-					g_settings.ip         = DialogText(dialog, IDC_IP);
-					g_settings.port       = static_cast<uint16_t>(port);
-					g_settings.token_file = DialogText(dialog, IDC_TOKEN);
 					g_settings.repo       = DialogText(dialog, IDC_REPO);
 					g_settings.readbacks = IsDlgButtonChecked(dialog, IDC_READBACKS) == BST_CHECKED;
 					g_settings.show_services =
@@ -1160,9 +1320,60 @@ void StartBoot() {
 	AppendLog(L"Boot sys");
 	g_worker = std::thread([settings = g_settings] {
 		std::wstring failure;
-		if (!BootSys(settings, &failure)) Post(wm_app_fail, failure);
+		if (!BootSysOffline(settings, &failure)) Post(wm_app_fail, failure);
 		Post(wm_app_done, {});
 	});
+}
+
+void ResetConsoleState(HWND owner) {
+	if (g_running || !EmulatorPids().empty()) {
+		MessageBoxW(owner, L"Stop Kyty before resetting the saved console state.",
+		            L"Reset console state", MB_ICONWARNING);
+		return;
+	}
+	const fs::path state = ConsoleStateDir();
+	const fs::path root = state.parent_path();
+	std::error_code ec;
+	const fs::path resolved_root = fs::weakly_canonical(root, ec);
+	if (ec || !resolved_root.is_absolute()) {
+		MessageBoxW(owner, L"Saved state folder is unavailable.", L"Reset console state",
+		            MB_ICONERROR);
+		return;
+	}
+	const fs::path resolved_state = fs::weakly_canonical(state, ec);
+	if (ec || resolved_state.parent_path() != resolved_root) {
+		MessageBoxW(owner, L"Saved state path failed its safety check.",
+		            L"Reset console state", MB_ICONERROR);
+		return;
+	}
+	if (!fs::is_directory(state, ec)) {
+		MessageBoxW(owner, L"There is no saved console state to reset.",
+		            L"Reset console state", MB_OK);
+		return;
+	}
+	const fs::path archive = root /
+	    (state.filename().wstring() + L".archive." + Wide(Timestamp("%Y%m%d_%H%M%S")) + L"." +
+	     std::to_wstring(GetTickCount64()));
+	const fs::path resolved_archive = fs::weakly_canonical(archive, ec);
+	if (ec || resolved_archive.parent_path() != resolved_root || fs::exists(archive, ec)) {
+		MessageBoxW(owner, L"Could not select a safe archive path for saved state.",
+		            L"Reset console state", MB_ICONERROR);
+		return;
+	}
+	fs::rename(state, archive, ec);
+	if (ec) {
+		MessageBoxW(owner, L"Could not archive saved state. Nothing was reset.",
+		            L"Reset console state", MB_ICONERROR);
+		return;
+	}
+	fs::create_directory(state, ec);
+	Log(L"Saved console state archived at " + archive.wstring());
+	if (ec)
+		MessageBoxW(owner, (L"Saved state was archived, but a new folder could not be created:\n" +
+		                     archive.wstring()).c_str(), L"Reset console state", MB_ICONERROR);
+	else
+		MessageBoxW(owner, L"Saved console state was reset. The previous state is archived.",
+		            L"Reset console state", MB_OK);
 }
 
 LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -1205,6 +1416,8 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
 			HMENU menu = reinterpret_cast<HMENU>(wparam);
 			EnableMenuItem(menu, IDM_BOOT, MF_BYCOMMAND | (g_running ? MF_GRAYED : MF_ENABLED));
 			EnableMenuItem(menu, IDM_STOP, MF_BYCOMMAND | (g_running ? MF_ENABLED : MF_GRAYED));
+			EnableMenuItem(menu, IDM_RESET_STATE,
+			               MF_BYCOMMAND | (g_running || !EmulatorPids().empty() ? MF_GRAYED : MF_ENABLED));
 			CheckMenuItem(menu, IDM_LOG,
 			              MF_BYCOMMAND | (IsWindowVisible(g_log) ? MF_CHECKED : MF_UNCHECKED));
 			return 0;
@@ -1218,6 +1431,7 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
 						g_stop = true;
 					}
 					return 0;
+				case IDM_RESET_STATE: ResetConsoleState(window); return 0;
 				case IDM_PREFERENCES:
 					DialogBoxParamW(g_instance, MAKEINTRESOURCEW(IDD_PREFERENCES), window,
 					                PreferencesProc, 0);
@@ -1257,6 +1471,7 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wparam, LPARAM lpara
 			if (g_worker.joinable()) g_worker.join();
 			g_running = false;
 			g_status  = idle_hint;
+			SetWindowTextW(window, L"Kyty PS5");
 			InvalidateRect(window, nullptr, TRUE);
 			if (g_quit) DestroyWindow(window);
 			return 0;

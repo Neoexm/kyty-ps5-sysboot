@@ -15,8 +15,10 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs {
@@ -151,6 +153,36 @@ static int32_t JsonNotInitialized(const char* function) {
 	return JSON_ERROR_NOINIT;
 }
 
+// c_str hands the guest a pointer into the host heap; IPMI copyin accepts spans inside the ranges handed out.
+static std::mutex                  g_cstr_mutex;
+static std::map<uintptr_t, size_t> g_cstr_ranges;
+
+static void JsonExposeCStr(const std::string* text) {
+	const auto      start = reinterpret_cast<uintptr_t>(text->c_str());
+	const auto      end   = start + text->size() + 1;
+	std::lock_guard lock(g_cstr_mutex);
+	auto            it = g_cstr_ranges.upper_bound(start);
+	if (it != g_cstr_ranges.begin() && std::prev(it)->first + std::prev(it)->second > start) --it;
+	while (it != g_cstr_ranges.end() && it->first < end) it = g_cstr_ranges.erase(it);
+	g_cstr_ranges.emplace(start, end - start);
+}
+
+static void JsonForgetCStr(const std::string* text) {
+	if (text == nullptr) return;
+	std::lock_guard lock(g_cstr_mutex);
+	g_cstr_ranges.erase(reinterpret_cast<uintptr_t>(text->c_str()));
+}
+
+bool ContainsCString(const void* pointer, uint64_t size) {
+	const auto      address = reinterpret_cast<uintptr_t>(pointer);
+	std::lock_guard lock(g_cstr_mutex);
+	auto            it = g_cstr_ranges.upper_bound(address);
+	if (it == g_cstr_ranges.begin()) return false;
+	--it;
+	const auto offset = address - it->first;
+	return offset < it->second && size <= it->second - offset;
+}
+
 static std::string* JsonStringImpl(JsonString* self) {
 	if (self == nullptr) {
 		return nullptr;
@@ -181,6 +213,33 @@ static const std::vector<JsonValue*>* JsonArrayImpl(const JsonArray* self) {
 	return (self != nullptr && self->impl != nullptr ? self->impl : &empty);
 }
 
+// Objects reached through a JsonValue's union are Kyty-heap allocations. A guest that bitwise-copies
+// a value and then destroys one copy leaves the other with a dangling object pointer whose type still
+// reads Object, so dereferencing self->object->impl walks a freed std::map. Track the ones we allocate
+// so a stale handle resolves to an empty object instead of faulting the whole emulator.
+static std::mutex                             g_live_objects_mutex;
+static std::unordered_set<const JsonObject*>  g_live_objects;
+
+static JsonObject* JsonObjectTrack(JsonObject* self) {
+	if (self != nullptr) {
+		std::scoped_lock lock(g_live_objects_mutex);
+		g_live_objects.insert(self);
+	}
+	return self;
+}
+
+static void JsonObjectForget(const JsonObject* self) {
+	if (self != nullptr) {
+		std::scoped_lock lock(g_live_objects_mutex);
+		g_live_objects.erase(self);
+	}
+}
+
+static bool JsonObjectIsLive(const JsonObject* self) {
+	std::scoped_lock lock(g_live_objects_mutex);
+	return g_live_objects.find(self) != g_live_objects.end();
+}
+
 static std::map<std::string, JsonValue*>* JsonObjectImpl(JsonObject* self) {
 	if (self == nullptr) {
 		return nullptr;
@@ -194,6 +253,12 @@ static std::map<std::string, JsonValue*>* JsonObjectImpl(JsonObject* self) {
 static const std::map<std::string, JsonValue*>* JsonObjectImpl(const JsonObject* self) {
 	static const std::map<std::string, JsonValue*> empty;
 	return (self != nullptr && self->impl != nullptr ? self->impl : &empty);
+}
+
+// For dereferences of a JsonValue's object field, where a dangling handle is possible.
+static const std::map<std::string, JsonValue*>* JsonValueObjectImpl(const JsonObject* self) {
+	static const std::map<std::string, JsonValue*> empty;
+	return JsonObjectIsLive(self) ? JsonObjectImpl(self) : &empty;
 }
 
 static JsonValue* JsonStaticNullValue() {
@@ -213,7 +278,7 @@ static JsonArray* JsonStaticArray() {
 
 static JsonObject* JsonStaticObject() {
 	static JsonObject object {new std::map<std::string, JsonValue*>};
-	return &object;
+	return JsonObjectTrack(&object);
 }
 
 static void JsonValueInit(JsonValue* self) {
@@ -247,7 +312,7 @@ static JsonArray* JsonArrayNew() {
 static JsonObject* JsonObjectNew() {
 	auto* object = new JsonObject {};
 	object->impl = new std::map<std::string, JsonValue*>;
-	return object;
+	return JsonObjectTrack(object);
 }
 
 // Callers only insert keys that are absent from impl.
@@ -314,6 +379,7 @@ static void JsonValueDelete(JsonValue* self) {
 
 static void JsonStringDelete(JsonString* self) {
 	if (self != nullptr) {
+		JsonForgetCStr(self->impl);
 		delete self->impl;
 		delete self;
 	}
@@ -356,6 +422,7 @@ static void JsonValueClear(JsonValue* self) {
 			break;
 		case JsonValueTypeObject:
 			JsonObjectDestroy(self->object);
+			JsonObjectForget(self->object);
 			delete self->object;
 			break;
 		default: break;
@@ -372,6 +439,31 @@ static void JsonValueCopy(JsonValue* dst, const JsonValue* src) {
 		return;
 	}
 
+	// Native set() keeps a container of the same type and assigns into it, so a String/Array/Object pointer taken with refer*() stays valid across the set (SystemLogger2 relies on this).
+	if (dst->type == src->type) {
+		switch (src->type) {
+			case JsonValueTypeString: {
+				std::string text = *JsonStringImpl(src->string);
+				JsonForgetCStr(dst->string->impl);
+				*JsonStringImpl(dst->string) = std::move(text);
+				return;
+			}
+			case JsonValueTypeArray: {
+				auto* impl = JsonArrayCopy(src->array, dst);
+				JsonArrayDestroy(dst->array);
+				dst->array->impl = impl;
+				return;
+			}
+			case JsonValueTypeObject: {
+				auto* impl = JsonObjectCopy(src->object, dst);
+				JsonObjectDestroy(dst->object);
+				dst->object->impl = impl;
+				return;
+			}
+			default: break;
+		}
+	}
+
 	JsonValueClear(dst);
 	dst->type = src->type;
 	switch (src->type) {
@@ -381,7 +473,9 @@ static void JsonValueCopy(JsonValue* dst, const JsonValue* src) {
 		case JsonValueTypeReal: dst->real = src->real; break;
 		case JsonValueTypeString: dst->string = JsonStringNew(*JsonStringImpl(src->string)); break;
 		case JsonValueTypeArray: dst->array = new JsonArray {JsonArrayCopy(src->array, dst)}; break;
-		case JsonValueTypeObject: dst->object = new JsonObject {JsonObjectCopy(src->object, dst)}; break;
+		case JsonValueTypeObject:
+			dst->object = JsonObjectTrack(new JsonObject {JsonObjectCopy(src->object, dst)});
+			break;
 		default: dst->uinteger = 0; break;
 	}
 }
@@ -613,7 +707,7 @@ static int32_t JsonSerializeValue(const JsonValue* value, JsonString* chunk,
 				return result;
 			}
 			bool first = true;
-			for (const auto& item: *JsonObjectImpl(value->object)) {
+			for (const auto& item: *JsonValueObjectImpl(value->object)) {
 				if (!first) {
 					chunk->impl->push_back(',');
 				}
@@ -640,6 +734,7 @@ static int32_t JsonSerialize(const JsonValue* self, JsonString* dst, JsonSeriali
 	JsonString              chunk {new std::string};
 	const JsonSerializeSink sink {dst, callback, context};
 	const int32_t           result = JsonSerializeValue(self, &chunk, &sink);
+	JsonForgetCStr(chunk.impl);
 	delete chunk.impl;
 	return result;
 }
@@ -884,7 +979,7 @@ static JsonValue* KYTY_SYSV_ABI JsonValueObjectCtor(JsonValue* self, const JsonO
 	JsonValueInit(self);
 	if (self != nullptr) {
 		self->type   = JsonValueTypeObject;
-		self->object = new JsonObject {JsonObjectCopy(value, self)};
+		self->object = JsonObjectTrack(new JsonObject {JsonObjectCopy(value, self)});
 	}
 	return self;
 }
@@ -905,10 +1000,15 @@ static void KYTY_SYSV_ABI JsonValueSetObject(JsonValue* self, const JsonObject* 
 
 	if (self != nullptr) {
 		// The source may be this value's object or one of its descendants.
-		auto* object = new JsonObject {JsonObjectCopy(value, self)};
-		JsonValueClear(self);
-		self->type   = JsonValueTypeObject;
-		self->object = object;
+		auto* impl = JsonObjectCopy(value, self);
+		if (self->type == JsonValueTypeObject) {
+			JsonObjectDestroy(self->object);
+		} else {
+			JsonValueClear(self);
+			self->type   = JsonValueTypeObject;
+			self->object = JsonObjectTrack(new JsonObject {});
+		}
+		self->object->impl = impl;
 	}
 }
 
@@ -917,10 +1017,15 @@ static void KYTY_SYSV_ABI JsonValueSetArray(JsonValue* self, const JsonArray* va
 
 	if (self != nullptr && value->impl != nullptr) {
 		// The source may be this value's array or one of its descendants.
-		auto* array = new JsonArray {JsonArrayCopy(value, self)};
-		JsonValueClear(self);
-		self->type  = JsonValueTypeArray;
-		self->array = array;
+		auto* impl = JsonArrayCopy(value, self);
+		if (self->type == JsonValueTypeArray) {
+			JsonArrayDestroy(self->array);
+		} else {
+			JsonValueClear(self);
+			self->type  = JsonValueTypeArray;
+			self->array = new JsonArray {};
+		}
+		self->array->impl = impl;
 	}
 }
 
@@ -1131,7 +1236,7 @@ static const JsonValue* KYTY_SYSV_ABI JsonValueGetValue(const JsonValue*  self,
 		if (self == nullptr || self->type != JsonValueTypeObject) {
 			branch = "wrong_parent_type";
 		} else {
-			const auto* impl = JsonObjectImpl(self->object);
+			const auto* impl = JsonValueObjectImpl(self->object);
 			object_count     = impl->size();
 			const auto it    = impl->find(*key->impl);
 			if (it != impl->end()) {
@@ -1160,7 +1265,7 @@ static JsonValue* KYTY_SYSV_ABI JsonValueReferValueKey(JsonValue* self, const Js
 	if (self == nullptr || self->type != JsonValueTypeObject) {
 		return nullptr;
 	}
-	const auto* impl = JsonObjectImpl(self->object);
+	const auto* impl = JsonValueObjectImpl(self->object);
 	const auto  it   = impl->find(*JsonStringImpl(key));
 	return (it != impl->end() ? it->second : nullptr);
 }
@@ -1169,7 +1274,7 @@ static JsonValue* KYTY_SYSV_ABI JsonValueReferValueIndex(JsonValue* self, uint64
 	PRINT_NAME();
 
 	if (self->type == JsonValueTypeObject) {
-		const auto* impl = JsonObjectImpl(self->object);
+		const auto* impl = JsonValueObjectImpl(self->object);
 		if (index < impl->size()) {
 			return std::next(impl->begin(), static_cast<ptrdiff_t>(index))->second;
 		}
@@ -1279,6 +1384,7 @@ static void KYTY_SYSV_ABI JsonStringDtor(JsonString* self) {
 	PRINT_NAME();
 
 	if (self != nullptr) {
+		JsonForgetCStr(self->impl);
 		delete self->impl;
 		self->impl = nullptr;
 	}
@@ -1297,7 +1403,9 @@ static JsonString* KYTY_SYSV_ABI JsonStringAssign(JsonString* self, const JsonSt
 static const char* KYTY_SYSV_ABI JsonStringCStr(const JsonString* self) {
 	PRINT_NAME();
 
-	return JsonStringImpl(self)->c_str();
+	const auto* impl = JsonStringImpl(self);
+	JsonExposeCStr(impl);
+	return impl->c_str();
 }
 
 static size_t KYTY_SYSV_ABI JsonStringLength(const JsonString* self) {
@@ -1867,6 +1975,7 @@ static void KYTY_SYSV_ABI JsonObjectPairDtor(JsonObjectPair* self) {
 	                             : 0);
 	if (self != nullptr) {
 		JsonValueClear(&self->value);
+		JsonForgetCStr(self->key.impl);
 		delete self->key.impl;
 		self->key.impl = nullptr;
 		self->owner    = nullptr;
@@ -1990,7 +2099,7 @@ static int32_t JsonParse(JsonValue* dst, JsonParseRead read, void* context, cons
 	JsonValueClear(&parsed);
 	size_t root_count = 0;
 	if (dst->type == JsonValueTypeArray) root_count = JsonArrayImpl(dst->array)->size();
-	if (dst->type == JsonValueTypeObject) root_count = JsonObjectImpl(dst->object)->size();
+	if (dst->type == JsonValueTypeObject) root_count = JsonValueObjectImpl(dst->object)->size();
 	const auto trace = g_json_parse_trace.fetch_add(1, std::memory_order_relaxed);
 	if (trace < 64) {
 		LOGF("JSON2_PARSE_BOUNDARY provider=hle trace=%u bytes=%" PRIu64
@@ -2157,7 +2266,7 @@ static int32_t KYTY_SYSV_ABI JsonValueCount(const JsonValue* self) {
 
 	switch (self->type) {
 		case JsonValueTypeArray: return static_cast<int32_t>(JsonArrayImpl(self->array)->size());
-		case JsonValueTypeObject: return static_cast<int32_t>(JsonObjectImpl(self->object)->size());
+		case JsonValueTypeObject: return static_cast<int32_t>(JsonValueObjectImpl(self->object)->size());
 		default: return 0;
 	}
 }

@@ -141,6 +141,10 @@ int KYTY_SYSV_ABI HttpSetRecvTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetCookieEnabled(int id, int enable);
 int KYTY_SYSV_ABI HttpSetAutoRedirect(int id, int enable);
 int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable);
+int KYTY_SYSV_ABI HttpSetSocketCreationCallback(int id, void* cbfunc, void* user_arg);
+int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int id, void* cbfunc, void* user_arg);
+int KYTY_SYSV_ABI HttpCookieImport(int http_ctx_id, const void* buffer, size_t size);
+int KYTY_SYSV_ABI HttpCookieExport(int http_ctx_id, void* buffer, size_t size, size_t* export_size);
 
 } // namespace Http
 

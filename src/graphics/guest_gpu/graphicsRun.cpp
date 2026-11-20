@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -474,6 +475,7 @@ void GuestGpu::Enqueue(Submission submission) {
 			     submission.constant_commands.size(), m_submission_count);
 		}
 	}
+	submission.enqueue_qpc = Common::Timer::QueryPerformanceCounter();
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -550,9 +552,19 @@ void GuestGpu::ThreadRun(void* data) {
 			return;
 		}
 
+		static const bool slice_timing = std::getenv("KYTY_DIAGNOSTIC_GPU_SLICE_TIMING") != nullptr;
+		static const auto qpc_per_us   = Common::Timer::QueryPerformanceFrequency() / 1000000;
+		static std::atomic_uint slice_log_count = 0;
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			const auto command_begin = slice_timing ? Common::Timer::QueryPerformanceCounter() : 0;
 			command();
+			if (slice_timing) {
+				const auto us = (Common::Timer::QueryPerformanceCounter() - command_begin) / qpc_per_us;
+				if (us >= 2000 && slice_log_count.fetch_add(1) < 6000) {
+					LOGF("FIRST_FRAME_AUDIT GPU_SLICE_TIMING command us=%" PRIu64 "\n", us);
+				}
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -573,7 +585,19 @@ void GuestGpu::ThreadRun(void* data) {
 			     submission.started ? 1u : 0u, submission.commands.size(),
 			     submission.constant_commands.size(), gpu->m_submit_id);
 		}
-		const bool complete = gpu->Process(submission);
+		const bool first_slice = !submission.started;
+		const auto slice_begin = slice_timing ? Common::Timer::QueryPerformanceCounter() : 0;
+		const bool complete    = gpu->Process(submission);
+		if (slice_timing) {
+			const auto us      = (Common::Timer::QueryPerformanceCounter() - slice_begin) / qpc_per_us;
+			const auto wait_us = first_slice ? (slice_begin - submission.enqueue_qpc) / qpc_per_us : 0;
+			if ((us >= 2000 || wait_us >= 20000) && slice_log_count.fetch_add(1) < 20000) {
+				LOGF("FIRST_FRAME_AUDIT GPU_SLICE_TIMING queue=%u type=%u first=%u complete=%u us=%" PRIu64
+				     " queued_us=%" PRIu64 " draw_dw=%zu submit=%" PRIu64 "\n",
+				     submission.queue_id, static_cast<unsigned>(submission.type), first_slice ? 1u : 0u,
+				     complete ? 1u : 0u, us, wait_us, submission.commands.size(), gpu->m_submit_id);
+			}
+		}
 		if (audit_slice) {
 			LOGF("FIRST_FRAME_AUDIT GPU_QUEUE_END queue=%u type=%u complete=%u command_complete=%u "
 			     "constant_complete=%u serial=%" PRIu64 "\n",
@@ -1411,11 +1435,17 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		case 0x0000001a:
 		case 0x0000001b:
 		case 0x00000038:
-		case 0x0000003a:
-			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
-			     ", index 0x%08" PRIx32 "\n",
-			     event_type, event_index);
+		case 0x0000003a: {
+			// these fire on every submit; one line per type is enough
+			static std::atomic<uint64_t> warned_types = 0;
+			const uint64_t bit = 1ull << event_type;
+			if ((warned_types.fetch_or(bit) & bit) == 0) {
+				LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
+				     ", index 0x%08" PRIx32 "\n",
+				     event_type, event_index);
+			}
 			break;
+		}
 		case 0x00000039: {
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64

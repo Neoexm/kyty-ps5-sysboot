@@ -165,16 +165,61 @@ void CheckCompositorSockets() {
   exchange(listeners[0], addresses[0], listeners[1], ExchangeMode::FullCommand3000);
   exchange(listeners[1], addresses[1], listeners[0], ExchangeMode::FilteredCommand3000);
   exchange(listeners[2], addresses[2], listeners[0], ExchangeMode::FilteredCommand3000);
+  const auto redis_address = address("/system_tmp/redis.sock");
+  const int redis_listener = Net::Socket(1, 1, 0);
+  Check(redis_listener >= 0, "create Redis's local socket");
+  const int redis_reuse = 1;
+  const int redis_reuse_result = Net::Setsockopt(redis_listener, 0xffff, 4, &redis_reuse,
+                                                sizeof(redis_reuse));
+  int redis_reuse_readback = 0;
+  uint32_t redis_reuse_size = sizeof(redis_reuse_readback);
+  Check(redis_reuse_result == 0 &&
+            Net::Getsockopt(redis_listener, 0xffff, 4, &redis_reuse_readback,
+                            &redis_reuse_size) == 0 &&
+            redis_reuse_size == sizeof(redis_reuse_readback) && redis_reuse_readback == 1 &&
+            Net::Ioctl(redis_listener, 0x80049301u, policy_input) == 0 &&
+            Net::Bind(redis_listener, redis_address.data(), redis_address.size()) == 0 &&
+            Net::Listen(redis_listener, 4) == 0,
+        "Redis's original local socket creation, reuse option, bind and listen sequence");
+  const int redis_duplicate = Net::Socket(1, 1, 0);
+  Check(redis_duplicate >= 0 &&
+            Net::Bind(redis_duplicate, redis_address.data(), redis_address.size()) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EADDRINUSE &&
+            Net::SocketClose(redis_duplicate) == 0,
+        "Redis's original local socket name has one owner within the boot scope");
+  const int redis_writer = Net::Socket(1, 1, 0);
+  Check(redis_writer >= 0 && Net::Connect(redis_writer, redis_address.data(), redis_address.size()) == 0 &&
+            ready(redis_listener, 2000000) == 1 && ready(listeners[0], 0) == 0,
+        "Redis's local socket does not alias a compositor endpoint");
+  const int redis_reader = Net::Accept(redis_listener, nullptr, nullptr);
+  constexpr char redis_request[] = "PING\r\n";
+  std::array<char, sizeof(redis_request) - 1> redis_copied {};
+  Check(redis_reader >= 0 &&
+            Net::Send(redis_writer, redis_request, redis_copied.size(), 0) == redis_copied.size() &&
+            ready(redis_reader, 2000000) == 1 &&
+            Net::Recv(redis_reader, redis_copied.data(), redis_copied.size(), 0) == redis_copied.size() &&
+            std::memcmp(redis_copied.data(), redis_request, redis_copied.size()) == 0 &&
+            Net::SocketClose(redis_reader) == 0 && Net::SocketClose(redis_writer) == 0,
+        "Redis's original local socket accepts and transfers bytes");
   const auto other_scope = scope + "b";
   Check(_putenv_s(keys[1], other_scope.c_str()) == 0, "select independent local socket namespace");
   const int absent = Net::Socket(1, 1, 0);
   Check(absent >= 0 && Net::Connect(absent, addresses[0].data(), addresses[0].size()) == -1 &&
             ready(listeners[0], 0) == 0 && Net::SocketClose(absent) == 0,
         "same guest name cannot connect across isolated socket scopes");
+  const int absent_redis = Net::Socket(1, 1, 0);
+  Check(absent_redis >= 0 &&
+            Net::Connect(absent_redis, redis_address.data(), redis_address.size()) == -1 &&
+            ready(redis_listener, 0) == 0 && Net::SocketClose(absent_redis) == 0,
+        "Redis's guest name cannot cross boot scopes");
   const int scoped = listen(addresses[0]);
   exchange(scoped, addresses[0], listeners[0], ExchangeMode::WrongCommand3000);
   Check(Net::SocketClose(scoped) == 0 && _putenv_s(keys[1], scope.c_str()) == 0,
         "close independent namespace endpoint and restore the original scope");
+  Check(Net::SocketClose(redis_listener) == 0, "close Redis's local socket owner");
+  const int redis_rebound = listen(redis_address);
+  Check(Net::SocketClose(redis_rebound) == 0,
+        "Redis's scoped local socket can bind after its original owner closes");
   const int invalid = Net::Socket(1, 1, 0);
   Check(invalid >= 0, "create socket for unsupported address checks");
   for (const char* path: {"/system_tmp/UnknownSocket", "/system_tmp/GnmCompositorRestricted/extra",
@@ -212,7 +257,7 @@ void CheckCompositorSockets() {
   char temp_path[MAX_PATH] {};
   Check(GetTempPathA(MAX_PATH, temp_path) != 0, "locate scoped host fixture cleanup");
   for (const auto& fixture_scope: {scope, other_scope}) {
-    for (const char* endpoint: {"gnm", "spp", "gnmr"}) {
+    for (const char* endpoint: {"gnm", "spp", "gnmr", "redis"}) {
       const auto path = std::filesystem::path(temp_path) /
           ("kyty_ps5_" + fixture_scope + "_" + endpoint + ".sock.policy");
       std::error_code ec;
@@ -223,6 +268,6 @@ void CheckCompositorSockets() {
   for (size_t i = 0; i < keys.size(); ++i) {
     Check(_putenv_s(keys[i], saved[i].c_str()) == 0, "restore local socket fixture environment");
   }
-  std::printf("CompositorSocketTests: gnm_spp_restricted=pass separate_names=pass separate_scopes=pass bidirectional_bytes=pass command3000_semantics=pass duplicate_bind=pass cleanup_rebind=pass listener_read_events=pass host_fixture_only=1\n");
+  std::printf("CompositorSocketTests: gnm_spp_restricted=pass redis=pass separate_names=pass separate_scopes=pass bidirectional_bytes=pass command3000_semantics=pass duplicate_bind=pass cleanup_rebind=pass listener_read_events=pass host_fixture_only=1\n");
 #endif
 }

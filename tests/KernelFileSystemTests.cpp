@@ -127,8 +127,11 @@ int KYTY_SYSV_ABI KernelGetResourceOne(int32_t budget, uint32_t kind, void* entr
 }
 
 namespace Libs::NativeSyscallGuards {
+void Register(Loader::SymbolDatabase* symbols);
 int KYTY_SYSV_ABI KernelGetBudget(int64_t* out);
 int KYTY_SYSV_ABI KernelSetBudget(int id);
+int64_t KYTY_SYSV_ABI NativeKqueue(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+int64_t KYTY_SYSV_ABI NativeKevent(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 }
 
 namespace Libs::Jemspace {
@@ -4079,6 +4082,11 @@ int main(int argc, char** argv) {
   if (libc_child >= 0) return libc_child;
   const int exec_fatal_signal_child = RunGuestExecFatalSignalChild(argc, argv);
   if (exec_fatal_signal_child >= 0) return exec_fatal_signal_child;
+  if (argc == 2 && std::strcmp(argv[1], "--guest-exec-auth-catalogue-only") == 0) {
+    CheckGuestExecAuthInfoSlotRejection();
+    CheckRootOriginalSelfFromApp0();
+    return 0;
+  }
   const int child = RunTmpfsChild(argc, argv);
   if (child >= 0) return child;
   const int registry_child = RunRegistryTrapChild(argc, argv);
@@ -4115,6 +4123,12 @@ int main(int argc, char** argv) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
+  if (argc == 2 && std::strcmp(argv[1], "--root-auth-capture-only") == 0) {
+    CheckRootOriginalSelfFromApp0();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: root full AuthInfo capture case passed\n");
+    return 0;
+  }
   const bool guest_wait7_frontier_only =
       argc == 2 && std::strcmp(argv[1], "--guest-wait7-frontier-only") == 0;
   const bool auth_info_scope_only =
@@ -4812,6 +4826,13 @@ int main(int argc, char** argv) {
     std::printf("KernelFileSystemTests: local socket policy cases passed\n");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--factory-storage-view-only") == 0) {
+    CheckFactoryStorageView(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    return 0;
+  }
   if ((argc == 2 && std::strcmp(argv[1], "--captured-directory-only") == 0) ||
       (argc == 4 && std::strcmp(argv[1], "--captured-storage-audit") == 0)) {
     if (argc == 2) {
@@ -4976,6 +4997,16 @@ int main(int argc, char** argv) {
       graphics.reset();
       subsystems.Destroy();
       std::printf("KernelFileSystemTests: POSIX open cases passed\n");
+      return 0;
+    }
+  }
+  if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--posix-fcntl-only") == 0)) {
+    CheckPosixFcntlDescriptorFlags();
+    if (argc == 2) {
+      FileSystem::Shutdown();
+      graphics.reset();
+      subsystems.Destroy();
+      std::printf("KernelFileSystemTests: POSIX fcntl descriptor cases passed\n");
       return 0;
     }
   }
